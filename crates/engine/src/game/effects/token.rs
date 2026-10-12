@@ -3970,23 +3970,34 @@ fn heartwood_ability() -> AbilityDefinition {
 /// text, so the printed reminder parenthetical never becomes ability text.
 fn jace_token_abilities() -> Vec<AbilityDefinition> {
     vec![
-        AbilityDefinition::new(
-            AbilityKind::Activated,
+        loyalty_ability(
+            -1,
             Effect::Surveil {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        )
-        .cost(AbilityCost::Loyalty { amount: -1 }),
-        AbilityDefinition::new(
-            AbilityKind::Activated,
+        ),
+        loyalty_ability(
+            -3,
             Effect::Draw {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        )
-        .cost(AbilityCost::Loyalty { amount: -3 }),
+        ),
     ]
+}
+
+/// CR 606.1 + CR 606.3: an engine-defined loyalty ability — a loyalty cost plus
+/// the sorcery-speed restriction ("during a main phase of their turn when the
+/// stack is empty"). The loyalty gate (`planeswalker::can_activate_loyalty_ability`)
+/// enforces only the once-per-turn cap itself and delegates timing to
+/// `activation_restrictions`, so a loyalty ability built without
+/// `sorcery_speed()` could be activated at instant speed. This mirrors the
+/// parser's loyalty-line path (`apply_loyalty_restrictions`).
+fn loyalty_ability(amount: i32, effect: Effect) -> AbilityDefinition {
+    AbilityDefinition::new(AbilityKind::Activated, effect)
+        .cost(AbilityCost::Loyalty { amount })
+        .sorcery_speed()
 }
 
 /// CR 111.10: Predefined token abilities keyed by subtype.
