@@ -25,6 +25,7 @@ use phase_ai::duel_suite::compare::{
     compare as compare_reports, emit_gate_verdict, load_report, render_error_markdown,
     CompareOptions,
 };
+use phase_ai::duel_suite::decklist::{load_decklist, to_player_deck_list};
 use phase_ai::duel_suite::run::{
     resolve_matchup, run_suite, AttributionMode, ReportSink, SuiteOptions,
 };
@@ -219,9 +220,16 @@ fn main() {
             );
         }
         Mode::Single => {
+            let setup = match resolve_single_setup(&db, &cli.single_decks()) {
+                Ok(setup) => setup,
+                Err(message) => {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+            };
             run_single(
                 &db,
-                &cli.matchup,
+                &setup,
                 cli.batch,
                 base_seed,
                 cli.difficulty,
@@ -249,7 +257,11 @@ struct CliOptions {
     seed: Option<u64>,
     difficulty: AiDifficulty,
     baseline_difficulty: AiDifficulty,
-    matchup: String,
+    /// `--matchup NAME`; `None` means the default preset (or the decklist files).
+    matchup: Option<String>,
+    /// `--p0-deck PATH` / `--p1-deck PATH`: decklist files for a single-mode duel.
+    p0_deck: Option<PathBuf>,
+    p1_deck: Option<PathBuf>,
     games: Option<usize>,
     output: Option<PathBuf>,
     suite_filter: Option<String>,
@@ -275,7 +287,9 @@ impl Default for CliOptions {
             seed: None,
             difficulty: AiDifficulty::Medium,
             baseline_difficulty: AiDifficulty::Medium,
-            matchup: "red-vs-green".to_string(),
+            matchup: None,
+            p0_deck: None,
+            p1_deck: None,
             games: None,
             output: None,
             suite_filter: None,
@@ -428,7 +442,9 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                     take_value(&mut args, "--baseline-difficulty")?,
                 )?;
             }
-            "--matchup" => cli.matchup = take_value(&mut args, "--matchup")?.clone(),
+            "--matchup" => cli.matchup = Some(take_value(&mut args, "--matchup")?.clone()),
+            "--p0-deck" => cli.p0_deck = Some(PathBuf::from(take_value(&mut args, "--p0-deck")?)),
+            "--p1-deck" => cli.p1_deck = Some(PathBuf::from(take_value(&mut args, "--p1-deck")?)),
             "--suite" => select_mode(&mut cli.mode, &mut mode_flag, Mode::Suite, "--suite")?,
             "--commander-suite" => select_mode(
                 &mut cli.mode,
@@ -482,7 +498,106 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             }
         }
     }
+    // The two decklist flags name one duel together; half of it is a mistake,
+    // and so is naming a registered matchup at the same time.
+    match (&cli.p0_deck, &cli.p1_deck) {
+        (Some(_), Some(_)) if cli.matchup.is_some() => {
+            return Err("--matchup cannot be combined with --p0-deck/--p1-deck".to_string());
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--p0-deck and --p1-deck must be given together".to_string());
+        }
+        _ => {}
+    }
     Ok(cli)
+}
+
+/// The decks a single-mode run plays: a registered matchup or two decklist files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SingleDecks {
+    Matchup(String),
+    Files { p0: PathBuf, p1: PathBuf },
+}
+
+impl CliOptions {
+    fn single_decks(&self) -> SingleDecks {
+        match (&self.p0_deck, &self.p1_deck) {
+            (Some(p0), Some(p1)) => SingleDecks::Files {
+                p0: p0.clone(),
+                p1: p1.clone(),
+            },
+            // `parse_cli` refuses a lone deck flag.
+            _ => SingleDecks::Matchup(
+                self.matchup
+                    .clone()
+                    .unwrap_or_else(|| "red-vs-green".to_string()),
+            ),
+        }
+    }
+}
+
+/// A resolved single-mode duel: the payload, seat labels, and the id printed in
+/// the batch summary.
+struct SingleSetup {
+    payload: DeckPayload,
+    p0_label: String,
+    p1_label: String,
+    id: String,
+}
+
+fn resolve_single_setup(db: &CardDatabase, decks: &SingleDecks) -> Result<SingleSetup, String> {
+    match decks {
+        SingleDecks::Matchup(matchup) => {
+            let spec = find_matchup(matchup).ok_or_else(|| {
+                format!("Unknown matchup '{matchup}'. Use --list-matchups to see options.")
+            })?;
+            let (payload, p0_label, p1_label) = resolve_matchup(db, spec)
+                .map_err(|reason| format!("Failed to resolve matchup '{matchup}': {reason}"))?;
+            // Registered matchups are 60-card constructed decks; a short count
+            // means a name stopped resolving.
+            validate_deck(&payload.player, 60, &p0_label);
+            validate_deck(&payload.opponent, 60, &p1_label);
+            Ok(SingleSetup {
+                payload,
+                p0_label,
+                p1_label,
+                id: matchup.clone(),
+            })
+        }
+        SingleDecks::Files { p0, p1 } => {
+            let seat = |path: &PathBuf| -> Result<(PlayerDeckList, String), String> {
+                let deck = load_decklist(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let list = to_player_deck_list(db, &deck)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let label = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                Ok((list, label))
+            };
+            let (player, p0_label) = seat(p0)?;
+            let (opponent, p1_label) = seat(p1)?;
+            let payload = resolve_deck_list(
+                db,
+                &DeckList {
+                    player,
+                    opponent,
+                    ..Default::default()
+                },
+            );
+            for (resolved, label) in [(&payload.player, &p0_label), (&payload.opponent, &p1_label)]
+            {
+                let cards: u32 = resolved.main_deck.iter().map(|e| e.count).sum();
+                eprintln!("{label}: {cards} cards resolved");
+            }
+            Ok(SingleSetup {
+                id: format!("{p0_label} vs {p1_label}"),
+                payload,
+                p0_label,
+                p1_label,
+            })
+        }
+    }
 }
 
 /// The data root: the positional argument, else `PHASE_CARDS_PATH`.
@@ -508,27 +623,18 @@ fn duel_budget(game_timeout: Option<Duration>) -> GameBudget {
 
 fn run_single(
     db: &CardDatabase,
-    matchup: &str,
+    setup: &SingleSetup,
     batch: Option<usize>,
     base_seed: u64,
     difficulty: AiDifficulty,
     verbose: bool,
 ) {
-    let Some(spec) = find_matchup(matchup) else {
-        eprintln!("Unknown matchup '{matchup}'. Use --list-matchups to see options.");
-        std::process::exit(1);
-    };
-
-    let (payload, p0_label, p1_label) = match resolve_matchup(db, spec) {
-        Ok(v) => v,
-        Err(reason) => {
-            eprintln!("Failed to resolve matchup '{matchup}': {reason}");
-            std::process::exit(1);
-        }
-    };
-
-    validate_deck(&payload.player, 60, &p0_label);
-    validate_deck(&payload.opponent, 60, &p1_label);
+    let SingleSetup {
+        payload,
+        p0_label,
+        p1_label,
+        id: matchup,
+    } = setup;
 
     let game_count = batch.unwrap_or(1);
     let is_batch = batch.is_some();
@@ -547,7 +653,7 @@ fn run_single(
         }
 
         let start = Instant::now();
-        let (winner, turns) = run_game(db, &payload, game_seed, difficulty, verbose, is_batch);
+        let (winner, turns) = run_game(db, payload, game_seed, difficulty, verbose, is_batch);
         let elapsed = start.elapsed().as_millis();
 
         match winner {
@@ -1749,6 +1855,10 @@ fn print_usage() {
         "  --baseline-difficulty LEVEL Baseline seats for --commander-suite (default: Medium)"
     );
     eprintln!("  --matchup NAME     Deck matchup (default: red-vs-green)");
+    eprintln!("  --p0-deck PATH     Decklist file for P0 (with --p1-deck, instead of --matchup)");
+    eprintln!("  --p1-deck PATH     Decklist file for P1. Lines: '<count> <card name>',");
+    eprintln!("                     '//' or '#' comments, Deck/Sideboard headers. Any deck");
+    eprintln!("                     size; every name must resolve in card-data.json.");
     eprintln!("  --list-matchups    Show available matchups");
     eprintln!();
     eprintln!("Suite mode:");
@@ -1988,6 +2098,48 @@ mod tests {
         let err = parse_cli(&args(&["client/public", "stray"])).expect_err("rejects");
         assert!(err.contains("stray"), "{err}");
         assert!(err.contains("client/public"), "{err}");
+    }
+
+    #[test]
+    fn decklist_files_select_a_file_duel_instead_of_a_matchup() {
+        let cli = parse_cli(&args(&[
+            "client/public",
+            "--p0-deck",
+            "a.txt",
+            "--p1-deck",
+            "b.txt",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            cli.single_decks(),
+            SingleDecks::Files {
+                p0: PathBuf::from("a.txt"),
+                p1: PathBuf::from("b.txt"),
+            }
+        );
+        assert_eq!(
+            parse_cli(&args(&["client/public"])).unwrap().single_decks(),
+            SingleDecks::Matchup("red-vs-green".to_string()),
+            "no deck flags keeps the default preset"
+        );
+    }
+
+    #[test]
+    fn a_lone_or_conflicting_decklist_flag_is_rejected() {
+        for list in [
+            &["--p0-deck", "a.txt"][..],
+            &["--p1-deck", "b.txt"][..],
+            &[
+                "--p0-deck",
+                "a.txt",
+                "--p1-deck",
+                "b.txt",
+                "--matchup",
+                "red-mirror",
+            ][..],
+        ] {
+            assert!(parse_cli(&args(list)).is_err(), "{list:?} must be rejected");
+        }
     }
 
     #[test]

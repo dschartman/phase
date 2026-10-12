@@ -42,6 +42,7 @@ rtk cargo run --release --bin ai-duel -- client/public --commander-suite --games
 | `--difficulty LEVEL` | `VeryEasy\|Easy\|Medium\|Hard\|VeryHard` | Medium |
 | `--matchup NAME` | Deck matchup preset | red-vs-green |
 | `--list-matchups` | Show available matchups | - |
+| `--p0-deck PATH` / `--p1-deck PATH` | Play two decklist files instead of a `--matchup` preset (both required; any deck size) | - |
 | `--verbose` | Print every action (full trace) | off |
 | `--suite` | Run every registered `MatchupSpec` in measurement mode | off |
 | `--games N` | Games per matchup/suite cell | 10 for suite, 4 for commander suite |
@@ -139,6 +140,14 @@ Use `--matchup NAME` to select a preset. Use `--list-matchups` to see all option
 | `prowess-mirror` | Mono-Red Prowess | Mono-Red Prowess | Mirror match |
 
 ### Changing Decks
+
+For a one-off duel between two lists (a sealed or draft pool, a brew), skip the
+registry and pass decklist files: `--p0-deck a.txt --p1-deck b.txt`. Lines are
+`<count> <card name>` (`4x` and an Arena ` (SET) 123` suffix are accepted), with
+`//` / `#` comments and `Deck` / `Sideboard` headers. Every name must resolve in
+`card-data.json`; unresolved names are listed and the run stops. Deck size is
+not checked, so 40-card limited decks run as-is. Parser:
+`crates/phase-ai/src/duel_suite/decklist.rs`.
 
 To add new matchups, add a `MatchupSpec` in `duel_suite/spec.rs`. Use an inline
 builder only for small stable decks; prefer snapshot decks for real metagame
