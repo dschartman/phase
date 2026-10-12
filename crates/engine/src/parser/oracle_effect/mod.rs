@@ -19608,7 +19608,15 @@ fn lower_clause_ast(
             clause
         }
         ClauseAst::SubjectPredicate { subject, predicate } => {
-            lower_subject_predicate_ast(*subject, *predicate, ctx, original_clause)
+            // CR 608.2c: while this clause's predicate is lowered, its own player
+            // subject is the antecedent of "they" ("Target opponent sacrifices a
+            // creature … among creatures they control"). Restored afterward so it
+            // never leaks into a sibling clause.
+            let antecedent = subject_player_antecedent(&subject);
+            let outer = std::mem::replace(&mut ctx.clause_subject_player, antecedent);
+            let clause = lower_subject_predicate_ast(*subject, *predicate, ctx, original_clause);
+            ctx.clause_subject_player = outer;
+            clause
         }
         ClauseAst::Conditional {
             guard,
@@ -27146,12 +27154,24 @@ fn lower_subject_predicate_ast(
                     let moved_object_is_resolution_pick = match &clause.effect {
                         Effect::ChangeZone { origin, target, .. }
                         | Effect::ChangeZoneAll { origin, target, .. } => {
-                            lower::change_zone_target_choice_timing(
-                                *origin,
-                                target,
-                                clause.multi_target.is_some(),
-                                &pred_lower,
-                            ) == crate::types::ability::TargetChoiceTiming::Resolution
+                            // CR 115.1 + CR 608.2d: the subject player picks a
+                            // disjunctive type phrase ("a creature or
+                            // planeswalker they control" — Blot Out) at
+                            // resolution when every leg is such a pick.
+                            let legs: Vec<&TargetFilter> = match target {
+                                TargetFilter::Or { filters } if !filters.is_empty() => {
+                                    filters.iter().collect()
+                                }
+                                single => vec![single],
+                            };
+                            legs.into_iter().all(|leg| {
+                                lower::change_zone_target_choice_timing(
+                                    *origin,
+                                    leg,
+                                    clause.multi_target.is_some(),
+                                    &pred_lower,
+                                ) == crate::types::ability::TargetChoiceTiming::Resolution
+                            })
                         }
                         Effect::PutAtLibraryPosition { .. } => {
                             !nom_primitives::scan_contains(&pred_lower, "target ")
@@ -27170,25 +27190,30 @@ fn lower_subject_predicate_ast(
                     // Stack ChangeZone card slot.
                     //
                     // CR 115.10a (issue #6505, review follow-up): the battlefield
-                    // resolution-pick leg's anaphoric "they control" lowered to
-                    // the default `ControllerRef::You`
-                    // (oracle_target::parse_controller_suffix, no scope pinned),
-                    // so rewrite ONLY this moved-object leg's `You` scope to
-                    // `ScopedPlayer` here. The runtime `scoped_player` stamp then
-                    // binds the chooser to the target player. Gated on the "they
-                    // control" anaphor so a "you control" caster leg (also `You`)
-                    // is never mis-rebound; Relic's "their graveyard" leg is
-                    // already `Owned{ScopedPlayer}` and needs no rewrite.
+                    // resolution-pick leg's anaphoric "they control" binds to
+                    // this clause's player subject (`ctx.clause_subject_player`,
+                    // `TargetPlayer` / `TargetOpponent`; the interim `You` when no
+                    // antecedent applies), so rewrite ONLY this moved-object
+                    // leg's binding of that anaphor to `ScopedPlayer` here. The
+                    // runtime `scoped_player` stamp then binds the chooser to the
+                    // target player. Gated on the "they control" anaphor so a
+                    // "you control" caster leg (`You`) is never mis-rebound;
+                    // Relic's "their graveyard" leg is already
+                    // `Owned{ScopedPlayer}` and needs no rewrite.
                     let moved_object_is_they_control_pick = moved_object_is_resolution_pick
                         && scan_contains_phrase(&pred_lower, "they control");
                     if moved_object_is_they_control_pick {
+                        let they_binding = ctx
+                            .clause_subject_player
+                            .clone()
+                            .unwrap_or(ControllerRef::You);
                         match &mut clause.effect {
                             Effect::ChangeZone { target, .. }
                             | Effect::ChangeZoneAll { target, .. }
                             | Effect::PutAtLibraryPosition { target, .. } => {
                                 rebind_controller_scope(
                                     target,
-                                    ControllerRef::You,
+                                    they_binding,
                                     ControllerRef::ScopedPlayer,
                                 );
                             }
@@ -27977,6 +28002,37 @@ fn player_filter_as_controller_ref(filter: &TargetFilter) -> Option<ControllerRe
         // (resolved from combat state, no target slot) at resolution time.
         TargetFilter::DefendingPlayer => Some(ControllerRef::DefendingPlayer),
         _ => None,
+    }
+}
+
+/// CR 608.2c + CR 115.1 + CR 508.5: the antecedent a clause's own player
+/// subject offers the pronoun "they" in its predicate. Only a single player
+/// whose runtime referent is definite qualifies: a targeted player (CR 115.1;
+/// `TargetPlayer` / `TargetOpponent`, read from the ability's player target at
+/// resolution) or the defending player (CR 508.5, read from combat). Iterating
+/// and class subjects ("each opponent") have their own antecedent writer, and
+/// anaphoric or event-bound subjects keep their existing readings, so they
+/// return `None`.
+fn subject_player_antecedent(subject: &SubjectPhraseAst) -> Option<ControllerRef> {
+    let filter = subject.target.as_ref().or(subject.affected.as_ref())?;
+    let controller = player_filter_as_controller_ref(filter)?;
+    match sacrifice_subject_controller(controller, subject.target.is_some()) {
+        definite @ (ControllerRef::TargetPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::DefendingPlayer) => Some(definite),
+        ControllerRef::You
+        | ControllerRef::Opponent
+        | ControllerRef::ScopedPlayer
+        | ControllerRef::ParentTargetController
+        | ControllerRef::EventTargetController
+        | ControllerRef::ParentTargetOwner
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::SourceChosenPlayer
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::EnchantedPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. }
+        | ControllerRef::DeclaredPlayer { .. } => None,
     }
 }
 

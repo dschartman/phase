@@ -185,6 +185,19 @@ fn break_under_pressure_ranks_the_target_opponents_permanents() {
         .id();
     let mut runner = scenario.build();
 
+    // CR 115.1 + CR 601.2c: binding "they" to the target opponent must not
+    // surface a second player slot; the cast driver would answer a duplicate
+    // slot with the same player intent and hide it.
+    let spell_def = runner.state().objects[&spell].abilities[0].clone();
+    let resolved = engine::game::ability_utils::build_resolved_from_def(&spell_def, spell, P0);
+    assert_eq!(
+        engine::game::ability_utils::build_target_slots(runner.state(), &resolved)
+            .expect("target slots build")
+            .len(),
+        1,
+        "Break Under Pressure announces exactly one target: the opponent"
+    );
+
     let outcome = runner.cast(spell).target_player(P1).resolve();
 
     // Reach guard: the spell resolved through its life-gain rider.
@@ -232,4 +245,88 @@ fn villainous_wrath_counts_the_target_opponents_creatures() {
     );
     outcome.assert_life_delta(P1, -3);
     outcome.assert_life_delta(P0, 0);
+}
+
+const IMPERIAL_EDICT: &str =
+    "Target opponent chooses a creature they control. Destroy that creature.";
+
+/// CR 608.2c + CR 115.1: in "Target opponent chooses a creature they control",
+/// the eligible creatures are the target opponent's. The caster's own creature
+/// is never destroyed.
+#[test]
+fn imperial_edict_destroys_a_creature_the_target_opponent_controls() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Imperial Edict", false, IMPERIAL_EDICT)
+        .id();
+    let caster_creature = scenario.add_creature(P0, "P0 Bear", 2, 2).id();
+    let their_creature = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_player(P1).resolve();
+    if let WaitingFor::EffectZoneChoice { cards, .. } = outcome.final_waiting_for() {
+        assert!(
+            !cards.contains(&caster_creature),
+            "the caster's creature must not be offered; got {cards:?}"
+        );
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![their_creature],
+            })
+            .expect("choose the opponent's creature");
+    }
+
+    assert_eq!(
+        runner.state().objects[&their_creature].zone,
+        Zone::Graveyard,
+        "the target opponent's creature is destroyed"
+    );
+    assert_eq!(
+        runner.state().objects[&caster_creature].zone,
+        Zone::Battlefield,
+        "the caster's creature survives"
+    );
+}
+
+const BLOT_OUT: &str = "Target opponent exiles a creature or planeswalker they control with the greatest mana value among creatures and planeswalkers they control.";
+
+/// CR 608.2c + CR 115.1: both "they control" phrases in Blot Out name the
+/// target opponent. The opponent exiles their own greatest mana value creature;
+/// the caster's bigger creature is neither eligible nor the ranking reference.
+#[test]
+fn blot_out_exiles_the_target_opponents_greatest_mana_value_permanent() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Blot Out", true, BLOT_OUT)
+        .id();
+    let caster_big = scenario
+        .add_creature(P0, "P0 Five-Drop", 5, 5)
+        .with_mana_cost(generic_cost(5))
+        .id();
+    let their_small = scenario
+        .add_creature(P1, "P1 One-Drop", 1, 1)
+        .with_mana_cost(generic_cost(1))
+        .id();
+    let their_big = scenario
+        .add_creature(P1, "P1 Three-Drop", 3, 3)
+        .with_mana_cost(generic_cost(3))
+        .id();
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_player(P1).resolve();
+    if let WaitingFor::EffectZoneChoice { player, cards, .. } = outcome.final_waiting_for() {
+        assert_eq!(*player, P1, "the target opponent makes the choice");
+        assert_eq!(cards, &vec![their_big], "only the greatest is eligible");
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![their_big],
+            })
+            .expect("choose the opponent's greatest creature");
+    }
+
+    assert_eq!(runner.state().objects[&their_big].zone, Zone::Exile);
+    assert_eq!(runner.state().objects[&their_small].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&caster_big].zone, Zone::Battlefield);
 }
