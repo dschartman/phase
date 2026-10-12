@@ -13238,11 +13238,17 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
             return (filter, rest);
         }
 
+        // CR 102.3: "one or more [of] your opponents" — the partitive "of" is the
+        // same opponent set (Fblthp, Impossibly Lost: "one or more of your
+        // opponents are dealt combat damage").
         if let Ok((rest, filter)) = alt((
             value(
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                 alt((
-                    tag::<_, _, OracleError<'_>>("your opponents"),
+                    preceded(
+                        opt(tag::<_, _, OracleError<'_>>("of ")),
+                        tag("your opponents"),
+                    ),
                     tag("opponents"),
                 )),
             ),
@@ -15688,8 +15694,19 @@ fn try_parse_event(
                         | (DamageChannel::Excess, DamageKindFilter::Any, None)
                         | (DamageChannel::Excess, DamageKindFilter::NoncombatOnly, None)
                 );
-                if !previously_covered && !remaining.trim().is_empty() {
+                // CR 603.2: a "during your turn" / "during an opponent's turn"
+                // restriction on the damage event narrows which events match
+                // (Fblthp, Impossibly Lost: "are dealt combat damage during your
+                // turn"). It is a modeled tail, so it counts as consumed for the
+                // unmodeled-tail guard below; same leading-tail peel the
+                // `BecomesTapped` arm uses.
+                let turn_constraint = parse_leading_turn_constraint(remaining);
+                if turn_constraint.is_none() && !previously_covered && !remaining.trim().is_empty()
+                {
                     return None;
+                }
+                if let Some(constraint) = turn_constraint {
+                    def.constraint = Some(constraint);
                 }
                 def.mode = match channel {
                     DamageChannel::Total => TriggerMode::DamageReceived,

@@ -132,3 +132,76 @@ fn fblthp_wins_when_the_draws_empty_the_library() {
         runner.state().waiting_for
     );
 }
+
+/// Three players: `active` attacks P2 with a 2/2 while P0 controls Fblthp.
+/// Returns P0's hand delta and Fblthp's zone after combat.
+fn three_player_combat(active: PlayerId) -> (usize, Zone) {
+    use engine::game::combat::AttackTarget;
+    use engine::types::actions::GameAction;
+
+    let p2 = PlayerId(2);
+    let mut scenario = GameScenario::new_n_player(3, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    for i in 0..5 {
+        scenario.add_card_to_library_top(P0, &format!("Library Card {i}"));
+    }
+    let fblthp = scenario
+        .add_creature_from_oracle(P0, "Fblthp, Impossibly Lost", 1, 1, FBLTHP)
+        .as_legendary()
+        .id();
+    let attacker = scenario.add_creature(active, "Bear", 2, 2).id();
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = active;
+        state.priority_player = active;
+        state.waiting_for = WaitingFor::Priority { player: active };
+    }
+    let hand_before = hand_len(&runner, P0);
+    let p2_life_before = runner.life(p2);
+
+    for _ in 0..32 {
+        match &runner.state().waiting_for {
+            WaitingFor::DeclareAttackers { .. } => break,
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority reaches declare attackers");
+            }
+            other => panic!("expected priority or declare attackers, got {other:?}"),
+        }
+    }
+    runner
+        .declare_attackers(&[(attacker, AttackTarget::Player(p2))])
+        .expect("attack P2");
+    let _ = runner.combat_damage();
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        runner.life(p2),
+        p2_life_before - 2,
+        "precondition: P2, an opponent of P0, was dealt 2 combat damage"
+    );
+    (
+        hand_len(&runner, P0) - hand_before,
+        runner.state().objects[&fblthp].zone,
+    )
+}
+
+/// CR 102.3 + CR 603.2: in a three-player game, combat damage to P2 during
+/// P0's own turn fires the trigger.
+#[test]
+fn fblthp_triggers_on_damage_to_any_opponent_during_your_turn() {
+    let (drawn, zone) = three_player_combat(P0);
+    assert_eq!(drawn, 2, "draw two cards");
+    assert_eq!(zone, Zone::Library);
+}
+
+/// CR 603.2: the same damage to P2 during P1's turn is not a trigger event for
+/// "during your turn", so Fblthp does nothing.
+#[test]
+fn fblthp_does_not_trigger_during_another_players_turn() {
+    let (drawn, zone) = three_player_combat(P1);
+    assert_eq!(drawn, 0, "no trigger on another player's turn");
+    assert_eq!(zone, Zone::Battlefield);
+}
