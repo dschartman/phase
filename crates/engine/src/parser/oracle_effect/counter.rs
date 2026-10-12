@@ -136,11 +136,30 @@ fn anaphor_is_chain_created_demonstrative(anaphor_lower: &str) -> bool {
     .is_some()
 }
 
+/// CR 608.2c: the distributive plural pronoun "each of them" — the same
+/// referent set as bare "them", placed on each member (Snarl Song: "Create two
+/// … Fractal creature tokens. Put X +1/+1 counters on each of them"). A word
+/// boundary after "them" keeps "each of themselves" out.
+fn is_distributive_them(text: &str) -> bool {
+    nom_on_lower(text, text, |i| {
+        value(
+            (),
+            preceded(
+                tag("each of "),
+                terminated(tag("them"), alt((eof, peek(tag(" "))))),
+            ),
+        )
+        .parse(i)
+    })
+    .is_some()
+}
+
 pub(super) fn counter_anaphor_created_token_binding(
     anaphor_lower: &str,
     ctx: &ParseContext,
 ) -> Option<TargetFilter> {
-    let it_pronoun = is_it_pronoun(anaphor_lower);
+    // "each of them" binds like the bare plural pronoun it distributes over.
+    let it_pronoun = is_it_pronoun(anaphor_lower) || is_distributive_them(anaphor_lower);
     let demonstrative = anaphor_is_chain_created_demonstrative(anaphor_lower);
     if !it_pronoun && !demonstrative {
         return None;

@@ -2774,6 +2774,28 @@ fn parse_for_each_clause_expr_with_parser(
 
     let clause = clause.trim().trim_end_matches('.');
 
+    // CR 107.1 + CR 107.1a: "for each/every N <things>" with a group size N ≥ 2
+    // counts complete groups of N (Recursive Recruitment: "for every three cards
+    // in your graveyard"). Only integers exist, so a partial group counts for
+    // nothing: the count of <things> divided by N, rounded down. A group size of
+    // 1 ("for each 1 life you lost") is the plain per-unit count and stays on
+    // the paths below.
+    if let Ok((things, group_size)) = terminated(
+        nom_primitives::parse_number,
+        tag::<_, _, OracleError<'_>>(" "),
+    )
+    .parse(clause)
+    {
+        if group_size >= 2 {
+            let per_thing = parse_for_each_clause_expr_with_parser(things, parse_clause)?;
+            return Some(QuantityExpr::DivideRounded {
+                inner: Box::new(per_thing),
+                divisor: group_size,
+                rounding: RoundingMode::Down,
+            });
+        }
+    }
+
     if let Some(expr) = parse_other_spells_cast_this_turn_for_each(clause) {
         return Some(expr);
     }
@@ -7959,6 +7981,49 @@ mod tests {
                 })
             ),
             "expected bare Ref{{ZoneCardCount{{Hand,..}}}}, got {result:?}"
+        );
+    }
+
+    /// CR 107.1a: "for each/every N <things>" with N ≥ 2 counts complete groups
+    /// of N — the per-thing count divided by N, rounded down — for both digit and
+    /// word group sizes.
+    #[test]
+    fn for_each_group_of_n_divides_rounded_down() {
+        for (clause, group) in [
+            ("three cards in your graveyard", 3),
+            ("2 cards in your hand", 2),
+        ] {
+            let result = parse_for_each_clause_expr(clause);
+            let Some(QuantityExpr::DivideRounded {
+                inner,
+                divisor,
+                rounding,
+            }) = result
+            else {
+                panic!("expected DivideRounded for {clause:?}, got {result:?}");
+            };
+            assert_eq!(divisor, group);
+            assert_eq!(rounding, RoundingMode::Down);
+            assert!(
+                matches!(
+                    *inner,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ZoneCardCount { .. }
+                    }
+                ),
+                "inner must be the plain per-thing count, got {inner:?}"
+            );
+        }
+    }
+
+    /// A group size of 1 ("for each 1 life you lost") is the per-unit count and
+    /// must not be wrapped in a division.
+    #[test]
+    fn for_each_group_of_one_is_not_divided() {
+        let result = parse_for_each_clause_expr("1 card in your hand");
+        assert!(
+            !matches!(result, Some(QuantityExpr::DivideRounded { .. })),
+            "got {result:?}"
         );
     }
 
