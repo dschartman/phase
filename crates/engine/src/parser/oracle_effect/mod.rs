@@ -20009,7 +20009,15 @@ fn lower_clause_ast(
             clause
         }
         ClauseAst::SubjectPredicate { subject, predicate } => {
-            lower_subject_predicate_ast(*subject, *predicate, ctx, original_clause)
+            // CR 608.2c: while this clause's predicate is lowered, its own player
+            // subject is the antecedent of "they" ("Target opponent sacrifices a
+            // creature … among creatures they control"). Restored afterward so it
+            // never leaks into a sibling clause.
+            let antecedent = predicate_they_antecedent(&subject);
+            let outer = std::mem::replace(&mut ctx.clause_subject_player, antecedent);
+            let clause = lower_subject_predicate_ast(*subject, *predicate, ctx, original_clause);
+            ctx.clause_subject_player = outer;
+            clause
         }
         ClauseAst::Conditional {
             guard,
@@ -28547,6 +28555,37 @@ fn player_filter_as_controller_ref(filter: &TargetFilter) -> Option<ControllerRe
         // (resolved from combat state, no target slot) at resolution time.
         TargetFilter::DefendingPlayer => Some(ControllerRef::DefendingPlayer),
         _ => None,
+    }
+}
+
+/// CR 608.2c + CR 115.1 + CR 508.5: the antecedent a clause's own player
+/// subject offers the pronoun "they" in its predicate. Only a single player
+/// whose runtime referent is definite qualifies: a targeted player (CR 115.1;
+/// `TargetPlayer` / `TargetOpponent`, read from the ability's player target at
+/// resolution) or the defending player (CR 508.5, read from combat). Iterating
+/// and class subjects ("each opponent") have their own antecedent writer, and
+/// anaphoric or event-bound subjects keep their existing readings, so they
+/// return `None`.
+fn predicate_they_antecedent(subject: &SubjectPhraseAst) -> Option<ControllerRef> {
+    let filter = subject.target.as_ref().or(subject.affected.as_ref())?;
+    let controller = player_filter_as_controller_ref(filter)?;
+    match sacrifice_subject_controller(controller, subject.target.is_some()) {
+        definite @ (ControllerRef::TargetPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::DefendingPlayer) => Some(definite),
+        ControllerRef::You
+        | ControllerRef::Opponent
+        | ControllerRef::ScopedPlayer
+        | ControllerRef::ParentTargetController
+        | ControllerRef::EventTargetController
+        | ControllerRef::ParentTargetOwner
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::SourceChosenPlayer
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::EnchantedPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. }
+        | ControllerRef::DeclaredPlayer { .. } => None,
     }
 }
 

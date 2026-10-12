@@ -18,6 +18,10 @@ use crate::types::zones::Zone;
 /// `None` means no antecedent is in scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PlayerAntecedents {
+    /// CR 608.2c: the single player the enclosing clause's own SUBJECT names
+    /// ("TARGET OPPONENT sacrifices … among creatures THEY control"), the
+    /// nearest antecedent of "they" in that clause's predicate.
+    pub clause_subject: Option<ControllerRef>,
     /// CR 608.2c + CR 115.1a: the player the effect chain itself declared, the
     /// nearer antecedent of "that player" than `third_person`.
     pub declared_that_player: Option<ControllerRef>,
@@ -83,9 +87,12 @@ pub(crate) fn bind_controller_phrase(
             .declared_that_player
             .clone()
             .or_else(|| antecedents.third_person.clone()),
+        // CR 608.2c: "they" in a predicate first names that clause's own
+        // player subject, then a chain-declared player, then the scope.
         ControllerSubject::Anaphoric(PlayerAnaphor::They) => antecedents
-            .declared_they
+            .clause_subject
             .clone()
+            .or_else(|| antecedents.declared_they.clone())
             .or_else(|| antecedents.third_person.clone()),
         ControllerSubject::Anaphoric(PlayerAnaphor::ItsController) => {
             antecedents.object_controller.clone()
@@ -726,6 +733,15 @@ pub(crate) struct ParseContext {
     /// the chain; `None` on every standalone parse, which keeps `relative_player_scope`
     /// (then `You`) as the reading.
     pub declared_player_scope: Option<ControllerRef>,
+    /// CR 608.2c: the player named by the SUBJECT of the subject-predicate
+    /// clause currently being lowered, the antecedent `player_antecedents`
+    /// offers the pronoun "they" in that clause's predicate. Written only by
+    /// `lower_clause_ast` for the duration of one subject-predicate lowering, and
+    /// only for a single player whose runtime referent is definite (a targeted
+    /// player or the defending player); read only by `player_antecedents`, so it
+    /// changes how a controller phrase binds and nothing else. `None` on every
+    /// other parse. Never serialized.
+    pub clause_subject_player: Option<ControllerRef>,
     /// The group a damage clause minted for the player it announces itself, so its own
     /// continuations ("... and 1 damage to each creature that player controls") can name it.
     /// The chunk loop takes it onto the clause.
@@ -921,6 +937,7 @@ impl ParseContext {
     /// accepting player only in that player's own frame.
     pub(crate) fn player_antecedents(&self) -> PlayerAntecedents {
         PlayerAntecedents {
+            clause_subject: self.clause_subject_player.clone(),
             declared_that_player: self.declared_player_scope.clone(),
             declared_they: self
                 .declared_player_scope
