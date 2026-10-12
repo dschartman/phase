@@ -84500,3 +84500,106 @@ fn count_slot_preserves_derived_readings() {
         "P10: {false_cure}"
     );
 }
+
+/// Every `controller` reachable under a quantity (`qty`) node of the parsed
+/// abilities and triggers, in document order. Serialized so the walk covers
+/// filter properties, aggregates, and counts without enumerating AST shapes.
+fn nested_quantity_controllers(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<String> {
+    fn walk(value: &serde_json::Value, under_qty: bool, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    if key == "controller" && under_qty {
+                        if let serde_json::Value::String(s) = inner {
+                            out.push(s.clone());
+                        }
+                    }
+                    walk(inner, under_qty || key == "qty", out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for inner in items {
+                    walk(inner, under_qty, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &serde_json::to_value(&parsed.abilities).expect("abilities serialize"),
+        false,
+        &mut out,
+    );
+    walk(
+        &serde_json::to_value(&parsed.triggers).expect("triggers serialize"),
+        false,
+        &mut out,
+    );
+    out
+}
+
+/// SHAPE. CR 608.2c + CR 115.1 + CR 508.5: in a clause whose subject is a
+/// single player ("target opponent", "target player", "defending player"), the
+/// pronoun "they" in the predicate's "<set> they control" names that player.
+/// Without an antecedent the controller phrase fell back to the interim `You`
+/// default, so the population was the caster's permanents (Break Under
+/// Pressure, Villainous Wrath, Witch-king, Bringer of Ruin). Controls: an "each
+/// opponent" subject keeps its iterating `ScopedPlayer`, and an explicit "you
+/// control" keeps `You`.
+#[test]
+fn they_control_in_predicate_binds_to_singular_player_subject() {
+    let cases: [(&str, &str, &[&str], &str); 5] = [
+        (
+            "Target opponent sacrifices a creature with the greatest power among creatures they control.",
+            "Probe Edict",
+            &["Instant"],
+            "TargetOpponent",
+        ),
+        (
+            "Target player loses life equal to the number of creatures they control.",
+            "Probe Drain",
+            &["Sorcery"],
+            "TargetPlayer",
+        ),
+        (
+            "Whenever this creature attacks, defending player sacrifices a creature with the least power among creatures they control.",
+            "Probe Raider",
+            &["Creature"],
+            "DefendingPlayer",
+        ),
+        (
+            "Each opponent sacrifices a creature with the greatest power among creatures they control.",
+            "Probe Mass Edict",
+            &["Sorcery"],
+            "ScopedPlayer",
+        ),
+        (
+            "Target opponent loses life equal to the number of creatures you control.",
+            "Probe Caster Count",
+            &["Sorcery"],
+            "You",
+        ),
+    ];
+    for (text, name, types, expected) in cases {
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let parsed = parse_oracle_text(text, name, &[], &types, &[]);
+        assert!(
+            !card_face_has_unimplemented_parts(&CardFace {
+                abilities: parsed.abilities.clone(),
+                triggers: parsed.triggers.clone(),
+                ..Default::default()
+            }),
+            "reach-guard: {text:?} must parse without an Unimplemented node"
+        );
+        let controllers = nested_quantity_controllers(&parsed);
+        assert!(
+            !controllers.is_empty(),
+            "reach-guard: {text:?} must carry a quantity over a controlled population"
+        );
+        assert!(
+            controllers.iter().all(|c| c == expected),
+            "{text:?}: every nested quantity controller must be {expected}, got {controllers:?}"
+        );
+    }
+}
