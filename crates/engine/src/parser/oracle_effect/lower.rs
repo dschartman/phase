@@ -5595,7 +5595,7 @@ fn parse_flip_win_quantifier(input: &str) -> OracleResult<'_, ()> {
     Ok((input, ()))
 }
 
-/// CR 107.1: Parse an anchored `for each <clause>` multiplier for an effect's
+/// CR 107.1: Parse an anchored `for each|every <clause>` multiplier for an effect's
 /// count. The multiplier scales the base count by an integer per-each quantity
 /// (the game uses only integers), so this is plain count templating, not the
 /// CR 609.3 "do as much as possible" rule.
@@ -5619,7 +5619,9 @@ pub(super) fn parse_for_each_multiplier_prefix(text: &str) -> Option<QuantityExp
             multispace1,
         ))
         .parse(rest)?;
-        let (rest, _) = tag("for each ").parse(rest)?;
+        // "for every" is the same distributive marker as "for each"
+        // (Recursive Recruitment: "for every three cards in your graveyard").
+        let (rest, _) = alt((tag("for each "), tag("for every "))).parse(rest)?;
         Ok((rest, ()))
     })?;
     let clause_lower = for_each_clause.to_lowercase();
