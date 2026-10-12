@@ -8,6 +8,7 @@
 
 pub mod attribution;
 pub mod compare;
+pub mod decklist;
 pub mod harvest;
 pub mod inline_decks;
 pub mod perf;
