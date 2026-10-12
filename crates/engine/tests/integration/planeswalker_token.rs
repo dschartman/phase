@@ -293,3 +293,124 @@ fn jace_token_loyalty_abilities_respect_once_per_turn() {
 
     assert!(enumerated_ability_indices(&runner, jace).is_empty());
 }
+
+/// Drives `runner` to a priority window held by `holder` during `phase` of
+/// `active`'s turn, with the stack empty.
+fn give_priority(
+    runner: &mut GameRunner,
+    phase: Phase,
+    active: engine::types::player::PlayerId,
+    holder: engine::types::player::PlayerId,
+) {
+    let state = runner.state_mut();
+    state.phase = phase;
+    state.active_player = active;
+    state.priority_player = holder;
+    state.waiting_for = engine::types::game_state::WaitingFor::Priority { player: holder };
+    assert!(
+        state.stack.is_empty(),
+        "reach-guard: the stack starts empty"
+    );
+}
+
+/// CR 606.3: a loyalty ability may be activated only "during a main phase of
+/// their turn" with the stack empty. The Jace token's `[−1]` is offered in the
+/// controller's main phase (positive control) and is neither offered nor
+/// accepted in the controller's upkeep or beginning of combat, or in the
+/// opponent's main phase.
+#[test]
+fn jace_token_loyalty_abilities_are_main_phase_own_turn_only() {
+    use engine::game::scenario::P1;
+
+    let illegal_windows = [
+        (Phase::Upkeep, P0, "the controller's upkeep"),
+        (
+            Phase::BeginCombat,
+            P0,
+            "the controller's beginning of combat",
+        ),
+        (Phase::PreCombatMain, P1, "the opponent's main phase"),
+    ];
+    for (phase, active, label) in illegal_windows {
+        let mut runner = debug_runner();
+        let (jace, _) = create_preset(
+            &mut runner,
+            JACE_TOKEN_PRESET_ID,
+            vec![(CounterType::Loyalty, 3)],
+        );
+        // Positive control in the same runner: offered in P0's own main phase.
+        give_priority(&mut runner, Phase::PreCombatMain, P0, P0);
+        assert_eq!(
+            enumerated_ability_indices(&runner, jace),
+            vec![0, 1],
+            "reach-guard: both loyalty abilities are offered in the controller's main phase"
+        );
+
+        give_priority(&mut runner, phase, active, P0);
+        assert!(
+            enumerated_ability_indices(&runner, jace).is_empty(),
+            "CR 606.3: no loyalty ability may be offered in {label}"
+        );
+        assert!(
+            runner
+                .act(GameAction::ActivateAbility {
+                    source_id: jace,
+                    ability_index: 0,
+                })
+                .is_err(),
+            "CR 606.3: activating [−1] in {label} must be rejected"
+        );
+        assert_eq!(
+            runner.state().objects[&jace].loyalty,
+            Some(3),
+            "no loyalty may be paid for a rejected activation in {label}"
+        );
+    }
+}
+
+/// CR 606.3: "...when the stack is empty". With one Jace token's `[−1]` on the
+/// stack, a second Jace token's loyalty abilities are not offered to the same
+/// player even though it is their main phase and they hold priority.
+#[test]
+fn jace_token_loyalty_abilities_require_an_empty_stack() {
+    let mut runner = debug_runner();
+    let (first, _) = create_preset(
+        &mut runner,
+        JACE_TOKEN_PRESET_ID,
+        vec![(CounterType::Loyalty, 3)],
+    );
+    let (second, _) = create_preset(
+        &mut runner,
+        JACE_TOKEN_PRESET_ID,
+        vec![(CounterType::Loyalty, 3)],
+    );
+    assert_eq!(
+        enumerated_ability_indices(&runner, second),
+        vec![0, 1],
+        "reach-guard: the second token's abilities are offered while the stack is empty"
+    );
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: first,
+            ability_index: 0,
+        })
+        .expect("activating the first token's [−1] must succeed");
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "reach-guard: the first token's [−1] is on the stack"
+    );
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            engine::types::game_state::WaitingFor::Priority { player } if player == P0
+        ),
+        "reach-guard: the activating player holds priority with the ability on the stack"
+    );
+
+    assert!(
+        enumerated_ability_indices(&runner, second).is_empty(),
+        "CR 606.3: no loyalty ability may be offered while the stack is non-empty"
+    );
+}

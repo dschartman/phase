@@ -6288,6 +6288,58 @@ mod tests {
         assert!(predefined_token_abilities("Chandra").is_empty());
     }
 
+    /// CR 606.3: every loyalty ability in the predefined-token registry carries
+    /// the sorcery-speed restriction the loyalty gate delegates timing to
+    /// (`planeswalker::can_activate_loyalty_ability`), the same restriction the
+    /// parser's loyalty-line path installs.
+    #[test]
+    fn predefined_token_loyalty_abilities_are_sorcery_speed() {
+        const REGISTRY_SUBTYPES: &[&str] = &[
+            "Treasure",
+            "Food",
+            "Gold",
+            "Clue",
+            "Blood",
+            "Powerstone",
+            "Map",
+            "Spawn",
+            "Lander",
+            "Mutagen",
+            "Junk",
+            "Incubator",
+            "Shard",
+            "Heartwood",
+            "Jace",
+        ];
+        let loyalty_abilities: Vec<(&str, AbilityDefinition)> = REGISTRY_SUBTYPES
+            .iter()
+            .flat_map(|subtype| {
+                predefined_token_abilities(subtype)
+                    .into_iter()
+                    .map(move |ability| (*subtype, ability))
+            })
+            .filter(|(_, ability)| {
+                ability
+                    .cost
+                    .as_ref()
+                    .is_some_and(crate::types::ability::is_loyalty_ability_cost)
+            })
+            .collect();
+        assert!(
+            !loyalty_abilities.is_empty(),
+            "reach-guard: the registry holds at least one loyalty ability"
+        );
+        for (subtype, ability) in loyalty_abilities {
+            assert!(
+                ability
+                    .activation_restrictions
+                    .contains(&ActivationRestriction::AsSorcery),
+                "{subtype} token loyalty ability {:?} must be sorcery speed (CR 606.3)",
+                ability.cost
+            );
+        }
+    }
+
     #[test]
     fn catalog_pest_dies_trigger_uses_battlefield_lki_zone() {
         let preset = crate::game::token_presets::known_token_preset_by_id(
