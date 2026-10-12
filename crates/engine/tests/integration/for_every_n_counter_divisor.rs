@@ -11,11 +11,11 @@
 //! count is observed on the created tokens, from both the hand (the rider is
 //! gated off) and the graveyard via flashback (CR 702.34a).
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameScenario, P0};
 use engine::parser::parse_oracle_text;
-use engine::types::ability::{Effect, QuantityExpr, RoundingMode};
+use engine::types::ability::{Effect, QuantityExpr, RoundingMode, TargetFilter};
 use engine::types::counter::CounterType;
-use engine::types::game_state::CastingVariant;
+use engine::types::game_state::{CastingVariant, GameState};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -25,13 +25,19 @@ const RECURSIVE_RECRUITMENT: &str = "Create two 2/2 colorless Wizard Soldier cre
     each of them for every three cards in your graveyard.\nFlashback {6}{U}{B} (You may \
     cast this card from your graveyard for its flashback cost. Then exile it.)";
 
-fn cadets(runner: &GameRunner) -> Vec<ObjectId> {
-    runner
-        .state()
+/// The +1/+1 counter count on each Cadet token on the battlefield.
+fn cadet_counters(state: &GameState) -> Vec<u32> {
+    state
         .battlefield
         .iter()
-        .copied()
-        .filter(|id| runner.state().objects[id].name == "Cadet")
+        .filter(|id| state.objects[*id].name == "Cadet")
+        .map(|id| {
+            state.objects[id]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0)
+        })
         .collect()
 }
 
@@ -52,7 +58,7 @@ fn recruitment_cost() -> ManaCost {
 }
 
 /// SHAPE: the rider's count is the graveyard count divided by three, rounded
-/// down, and the rider is no longer `Unimplemented`.
+/// down, it lands on the created tokens, and it is no longer `Unimplemented`.
 #[test]
 fn for_every_three_cards_parses_to_divide_rounded_down() {
     let parsed = parse_oracle_text(
@@ -64,9 +70,13 @@ fn for_every_three_cards_parses_to_divide_rounded_down() {
     );
     let spell = parsed.abilities.first().expect("spell ability");
     let rider = spell.sub_ability.as_ref().expect("counter rider");
-    let Effect::PutCounter { count, .. } = rider.effect.as_ref() else {
-        panic!("rider must be PutCounter, got {:?}", rider.effect);
+    let (Effect::PutCounter { count, target, .. } | Effect::PutCounterAll { count, target, .. }) =
+        rider.effect.as_ref()
+    else {
+        panic!("rider must place counters, got {:?}", rider.effect);
     };
+    // CR 608.2c: "each of them" after "Create two … tokens" is the created tokens.
+    assert_eq!(*target, TargetFilter::LastCreated);
     let QuantityExpr::DivideRounded {
         divisor, rounding, ..
     } = count
@@ -99,21 +109,11 @@ fn flashback_puts_one_counter_per_three_graveyard_cards_on_each_cadet() {
         .cast(spell)
         .casting_variant(CastingVariant::Flashback)
         .resolve();
-    drop(outcome);
-
-    let cadets = cadets(&runner);
-    assert_eq!(cadets.len(), 2, "two Cadet tokens are created");
-    for cadet in cadets {
-        assert_eq!(
-            runner.state().objects[&cadet]
-                .counters
-                .get(&CounterType::Plus1Plus1)
-                .copied()
-                .unwrap_or(0),
-            2,
-            "floor(8 / 3) = 2 counters on each Cadet"
-        );
-    }
+    assert_eq!(
+        cadet_counters(outcome.state()),
+        vec![2, 2],
+        "two Cadets, floor(8 / 3) = 2 counters on each"
+    );
 }
 
 /// Reach guard for the gate: cast from hand, the "cast from a graveyard" rider
@@ -133,17 +133,38 @@ fn cast_from_hand_puts_no_counters() {
     let mut runner = scenario.build();
 
     let outcome = runner.cast(spell).resolve();
-    drop(outcome);
+    assert_eq!(
+        cadet_counters(outcome.state()),
+        vec![0, 0],
+        "two Cadets; the rider only applies when cast from a graveyard"
+    );
+}
 
-    let cadets = cadets(&runner);
-    assert_eq!(cadets.len(), 2, "two Cadet tokens are created");
-    for cadet in cadets {
-        assert!(
-            runner.state().objects[&cadet]
-                .counters
-                .get(&CounterType::Plus1Plus1)
-                .is_none(),
-            "the rider only applies when cast from a graveyard"
-        );
-    }
+/// CR 608.2c + CR 111.1: "Create two … tokens. Put two +1/+1 counters on each of
+/// them." — "each of them" names the tokens the previous instruction created.
+/// With 0/0 tokens the counters are what keep them alive (CR 704.5f), so this
+/// fails loudly if the anaphor binds to nothing.
+#[test]
+fn each_of_them_after_create_tokens_places_counters_on_the_tokens() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Fractal Sorcery",
+            false,
+            "Create two 0/0 green and blue Fractal creature tokens named Cadet. \
+             Put two +1/+1 counters on each of them.",
+        )
+        .with_mana_cost(recruitment_cost())
+        .id();
+    scenario.with_mana_pool(P0, mana(&[(ManaType::Blue, 3), (ManaType::Black, 1)]));
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).resolve();
+    assert_eq!(
+        cadet_counters(outcome.state()),
+        vec![2, 2],
+        "both 0/0 tokens survive with two counters each"
+    );
 }

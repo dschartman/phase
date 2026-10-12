@@ -19553,6 +19553,43 @@ fn trigger_opponents_are_dealt_combat_damage_uses_valid_target() {
     );
 }
 
+/// CR 102.3 + CR 603.2: the partitive "one or more of your opponents" names the
+/// same opponent set, and a trailing "during <whose> turn" restricts the damage
+/// trigger instead of being dropped.
+#[test]
+fn trigger_one_or_more_of_your_opponents_dealt_damage_with_turn_restriction() {
+    for (line, kind, constraint) in [
+        (
+            "Whenever one or more of your opponents are dealt damage, draw a card.",
+            DamageKindFilter::Any,
+            None,
+        ),
+        (
+            "When one or more of your opponents are dealt combat damage during your turn, draw two cards.",
+            DamageKindFilter::CombatOnly,
+            Some(TriggerConstraint::OnlyDuringYourTurn),
+        ),
+        (
+            "Whenever one or more opponents are dealt noncombat damage during an opponent's turn, draw a card.",
+            DamageKindFilter::NoncombatOnly,
+            Some(TriggerConstraint::OnlyDuringOpponentsTurn),
+        ),
+    ] {
+        let def = parse_trigger_line(line, "Test Card");
+        assert_eq!(def.mode, TriggerMode::DamageReceived, "{line}");
+        assert_eq!(def.damage_kind, kind, "{line}");
+        assert!(def.batched, "{line}");
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            )),
+            "{line}"
+        );
+        assert_eq!(def.constraint, constraint, "{line}");
+    }
+}
+
 #[test]
 fn mindblade_render_intervening_if_warrior_source_parsed() {
     // CR 603.4 + CR 120.1: the "if any of that damage was dealt by a
