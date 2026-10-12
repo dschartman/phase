@@ -1456,3 +1456,87 @@ fn accepting_body_anaphors_outside_its_own_operands_are_not_seeded() {
     );
     assert_eq!(scoped_player_refs(&body), 0, "{body:?}");
 }
+
+const VILLAINOUS_WRATH: &str = "Target opponent loses life equal to the number of creatures they control. Then destroy all creatures.";
+
+fn generic_cost(generic: u32) -> engine::types::mana::ManaCost {
+    engine::types::mana::ManaCost::Cost {
+        shards: vec![],
+        generic,
+    }
+}
+
+/// CR 608.2c + CR 115.1: in "Target opponent sacrifices a creature or
+/// planeswalker with the greatest mana value among creatures and planeswalkers
+/// they control", "they" is the targeted opponent. The ranked population is
+/// the opponent's permanents, so the opponent sacrifices their own greatest
+/// mana value creature even though the caster controls a bigger one.
+#[test]
+fn break_under_pressure_ranks_the_target_opponents_permanents() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Break Under Pressure", true, BREAK_UNDER_PRESSURE)
+        .id();
+    let caster_big = scenario
+        .add_creature(P0, "P0 Five-Drop", 5, 5)
+        .with_mana_cost(generic_cost(5))
+        .id();
+    let their_small = scenario
+        .add_creature(P1, "P1 One-Drop", 1, 1)
+        .with_mana_cost(generic_cost(1))
+        .id();
+    let their_big = scenario
+        .add_creature(P1, "P1 Three-Drop", 3, 3)
+        .with_mana_cost(generic_cost(3))
+        .id();
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_player(P1).resolve();
+
+    // Reach guard: the spell resolved through its life-gain rider.
+    outcome.assert_life_delta(P0, 2);
+    assert_eq!(
+        outcome.zone_of(their_big),
+        Zone::Graveyard,
+        "the opponent sacrifices their greatest mana value creature"
+    );
+    assert_eq!(outcome.zone_of(their_small), Zone::Battlefield);
+    assert_eq!(outcome.zone_of(caster_big), Zone::Battlefield);
+}
+
+/// CR 608.2c + CR 115.1 + CR 119.3: "Target opponent loses life equal to the
+/// number of creatures they control" counts the targeted opponent's creatures,
+/// not the caster's.
+#[test]
+fn villainous_wrath_counts_the_target_opponents_creatures() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Villainous Wrath", false, VILLAINOUS_WRATH)
+        .id();
+    scenario.add_creature(P0, "P0 Bear", 2, 2);
+    for name in ["P1 Bear A", "P1 Bear B", "P1 Bear C"] {
+        scenario.add_creature(P1, name, 2, 2);
+    }
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_player(P1).resolve();
+
+    // Reach guard: the "Then destroy all creatures" rider ran.
+    assert_eq!(
+        outcome
+            .state()
+            .battlefield
+            .iter()
+            .filter(|id| outcome.state().objects[*id]
+                .card_types
+                .core_types
+                .contains(&engine::types::card_type::CoreType::Creature))
+            .count(),
+        0,
+        "every creature is destroyed after the life loss"
+    );
+    outcome.assert_life_delta(P1, -3);
+    outcome.assert_life_delta(P0, 0);
+}
