@@ -4987,6 +4987,21 @@ pub(crate) fn softmax_select_pairs(
     softmax_select_index(scored, temperature, rng).map(|index| scored[index].0.clone())
 }
 
+/// The highest-scored row, ties broken by action key (issue #4878) so the pick
+/// never depends on score-vector order.
+fn argmax_index(scored: &[(GameAction, f64)]) -> Option<usize> {
+    scored
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp_stable(&right.0))
+        })
+        .map(|(index, _)| index)
+}
+
 /// The canonical selector's chosen vector index. Kept private to the tactical
 /// layer so diagnostics can identify duplicate rows without comparing actions.
 fn softmax_select_index(
@@ -5000,6 +5015,11 @@ fn softmax_select_index(
     if scored.len() == 1 {
         return Some(0);
     }
+    // Temperature 0 is softmax's zero-temperature limit: always the top score.
+    // No shipped preset uses it; it is the measurement knob for argmax runs.
+    if temperature <= 0.0 {
+        return argmax_index(scored);
+    }
 
     // Numerical stability: subtract max score
     let max_score = scored.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
@@ -5011,18 +5031,8 @@ fn softmax_select_index(
 
     let total: f64 = weights.iter().sum();
     if total <= 0.0 || !total.is_finite() {
-        // Fallback: pick the highest-scored action (tie-break by action key —
-        // issue #4878).
-        return scored
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| {
-                left.1
-                    .partial_cmp(&right.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| left.0.cmp_stable(&right.0))
-            })
-            .map(|(index, _)| index);
+        // Fallback: pick the highest-scored action.
+        return argmax_index(scored);
     }
 
     let threshold: f64 = rng.random::<f64>() * total;

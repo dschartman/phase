@@ -86,17 +86,6 @@ pub fn ranked_receipt(
         .iter()
         .map(|(_, score)| *score)
         .fold(f64::NEG_INFINITY, f64::max);
-    let weights: Vec<f64> = scored
-        .iter()
-        .map(|(_, score)| ((*score - max_score) / temperature).exp())
-        .collect();
-    let total: f64 = weights.iter().sum();
-    let probabilities = (total.is_finite() && total > 0.0).then(|| {
-        weights
-            .iter()
-            .map(|weight| *weight / total)
-            .collect::<Vec<_>>()
-    });
 
     let mut order: Vec<usize> = (0..scored.len()).collect();
     order.sort_by(|left, right| {
@@ -107,7 +96,31 @@ pub fn ranked_receipt(
         ranks[index] = position + 1;
     }
 
+    // Temperature 0 is the selector's argmax limit: all weight on rank 1.
+    let argmax = temperature <= 0.0;
+    let weights: Vec<f64> = if argmax {
+        ranks
+            .iter()
+            .map(|rank| if *rank == 1 { 1.0 } else { 0.0 })
+            .collect()
+    } else {
+        scored
+            .iter()
+            .map(|(_, score)| ((*score - max_score) / temperature).exp())
+            .collect()
+    };
+    let total: f64 = weights.iter().sum();
+    let probabilities = (total.is_finite() && total > 0.0).then(|| {
+        weights
+            .iter()
+            .map(|weight| *weight / total)
+            .collect::<Vec<_>>()
+    });
+
     let selection_explanation = match selected_index {
+        Some(index) if argmax && ranks[index] == 1 => {
+            "Argmax selected the top-ranked action (temperature 0).".to_string()
+        }
         Some(index) if ranks[index] == 1 => format!(
             "Softmax sampled the top-ranked action ({:.1}%) at temperature {temperature:.2}.",
             probabilities.as_ref().map_or(0.0, |items| items[index] * 100.0),
