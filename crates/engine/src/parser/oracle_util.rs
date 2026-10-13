@@ -3356,6 +3356,50 @@ mod tests {
         );
     }
 
+    /// CR 201.5c + CR 205.3j: a legendary card's short name that is also a
+    /// planeswalker type names the card itself in subject and object positions,
+    /// while a type-adjective occurrence ("a Gideon planeswalker") stays a type
+    /// reference. A creature-subtype first word ("Goblin Piledriver") is never
+    /// a short name.
+    #[test]
+    fn normalize_planeswalker_type_short_name() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Put a +1/+1 counter on Liliana. Activate only as a sorcery.",
+                "Liliana the Repentant",
+            ),
+            "Put a +1/+1 counter on ~. Activate only as a sorcery."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "[\u{2212}7]: Sorin deals 13 damage to any target.",
+                "Sorin the Mirthless",
+            ),
+            "[\u{2212}7]: ~ deals 13 damage to any target."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever Gideon attacks, you may sacrifice a Gideon planeswalker.",
+                "Gideon the Oathless",
+            ),
+            "Whenever ~ attacks, you may sacrifice a Gideon planeswalker.",
+            "the type-adjective occurrence stays a planeswalker type"
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Goblin Piledriver gets +2/+0 for each other attacking Goblin.",
+                "Goblin Piledriver",
+            ),
+            "~ gets +2/+0 for each other attacking Goblin.",
+            "a creature-subtype first word is not a short name"
+        );
+        assert_eq!(
+            normalize_card_name_refs("Tap an untapped Myr you control.", "Myr Turbine"),
+            "Tap an untapped Myr you control.",
+            "a creature-subtype first word stays literal with no full-name match"
+        );
+    }
+
     #[test]
     fn normalize_first_word_short_name_preserves_plural_subtype() {
         assert_eq!(

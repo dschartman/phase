@@ -1973,3 +1973,4 @@ mod declared_player_gate_arms;
 mod declared_player_object_controller;
 mod exile_origin_target_acquisition;
 mod keyword_activation_cancel;
+mod legendary_short_name_self_reference;
