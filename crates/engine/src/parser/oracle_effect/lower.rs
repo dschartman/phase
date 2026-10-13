@@ -2616,13 +2616,14 @@ pub(super) fn target_choice_timing_for_parsed(
 ///    [attach it]" (Armored Skyhunter, Stonehewer Giant). The just-moved
 ///    card becomes the attaching object.
 /// 2. A non-Attach sub whose own target slot (or a nested
-///    GenericEffect/CreateDelayedTrigger inside it) is `SelfRef` — the
-///    Oracle text used a bare-"it" anaphor for the just-moved card
-///    (Emperor of Bones: "put a creature card exiled with this creature
-///    onto the battlefield […]. It gains haste. Sacrifice it at the
-///    beginning of the next end step."). The runtime forward_result branch
-///    rewrites `sub.source_id` to the moved object, so `SelfRef` in the
-///    sub naturally resolves to it.
+///    GenericEffect/CreateDelayedTrigger inside it) is the bare-"it" anaphor
+///    for the just-moved card — `ParentTarget` in a chain link (Emperor of
+///    Bones: "put a creature card exiled with this creature onto the
+///    battlefield […]. It gains haste. Sacrifice it at the beginning of the
+///    next end step."), or `SelfRef` inside a delayed-trigger body (see
+///    `MovedCardAnchorScope`). The runtime forward_result branch rewrites
+///    `sub.source_id` to the moved object. A chain-link `SelfRef` is an
+///    explicit self-reference to the source and does not anchor.
 ///
 /// Recurses through nested sub-abilities so chains of arbitrary depth
 /// (e.g. Skyhunter's Dig → Attach → PutAtLibraryPosition) are covered.
@@ -3513,11 +3514,39 @@ pub(super) fn rebind_attach_attachment_to_forwarded_source_if_anaphor_names_move
 /// Walks the sub's leaf target slot, `GenericEffect`'s grant list
 /// (each `StaticDefinition.affected`), `CreateDelayedTrigger`'s inner
 /// `AbilityDefinition`, and nested `sub_ability` / `else_ability`.
+/// Where a chained link sits relative to the zone change whose result it may
+/// anchor on, which decides what its `SelfRef` target means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MovedCardAnchorScope {
+    /// A link resolved as part of the producing ability. The anaphor "it" for
+    /// the just-moved card lowers to `ParentTarget` here, so a `SelfRef` target
+    /// is an explicit self-reference (CR 201.5) to the ability's source.
+    ChainLink,
+    /// The body of a delayed trigger the chain creates. Its "it" can lower to
+    /// `SelfRef` ("At the beginning of the next end step, shuffle it into its
+    /// owner's library"), so a `SelfRef` target still anchors here.
+    DelayedTriggerBody,
+}
+
 fn sub_targets_moved_card(sub: &AbilityDefinition) -> bool {
-    if matches!(
-        sub.effect.target_filter(),
-        Some(TargetFilter::SelfRef | TargetFilter::ParentTarget)
-    ) {
+    sub_targets_moved_card_in(sub, MovedCardAnchorScope::ChainLink)
+}
+
+fn sub_targets_moved_card_in(sub: &AbilityDefinition, scope: MovedCardAnchorScope) -> bool {
+    // CR 201.5 + CR 608.2c: in a chain link a `SelfRef` target names the
+    // ability's source ("…to the battlefield. Put a +1/+1 counter on Liliana";
+    // "…If you do, return this creature to its owner's hand"), so it must not
+    // wire `forward_result`, whose `source_id` rebind would point it at the
+    // moved card.
+    let anchors = match sub.effect.target_filter() {
+        Some(TargetFilter::ParentTarget) => true,
+        Some(TargetFilter::SelfRef) => match scope {
+            MovedCardAnchorScope::ChainLink => false,
+            MovedCardAnchorScope::DelayedTriggerBody => true,
+        },
+        _ => false,
+    };
+    if anchors {
         return true;
     }
     if let Effect::Conjure { cards, .. } = &*sub.effect {
@@ -3546,17 +3575,17 @@ fn sub_targets_moved_card(sub: &AbilityDefinition) -> bool {
         }
     }
     if let Effect::CreateDelayedTrigger { effect, .. } = &*sub.effect {
-        if sub_targets_moved_card(effect) {
+        if sub_targets_moved_card_in(effect, MovedCardAnchorScope::DelayedTriggerBody) {
             return true;
         }
     }
     if let Some(nested) = sub.sub_ability.as_ref() {
-        if sub_targets_moved_card(nested) {
+        if sub_targets_moved_card_in(nested, scope) {
             return true;
         }
     }
     if let Some(else_branch) = sub.else_ability.as_ref() {
-        if sub_targets_moved_card(else_branch) {
+        if sub_targets_moved_card_in(else_branch, scope) {
             return true;
         }
     }
