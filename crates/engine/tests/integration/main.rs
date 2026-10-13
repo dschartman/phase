@@ -2000,6 +2000,7 @@ mod decline_branch_not_graveyard_rider;
 mod event_source_lift_referent_stops;
 mod exile_origin_target_acquisition;
 mod keyword_activation_cancel;
+mod legendary_short_name_self_reference;
 mod rally_the_righteous_radiance_pump;
 mod starting_intensity_keyword;
 mod tidebinder_source_type_gate;
