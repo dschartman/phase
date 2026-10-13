@@ -253,6 +253,32 @@ mod tests {
         assert_eq!(receipt.candidates[0].probability, Some(0.5));
     }
 
+    /// Temperature 0 is the argmax limit of softmax: the receipt reports the
+    /// top-ranked row with probability 1 and every other row with 0, and says
+    /// the pick was argmax rather than a softmax sample.
+    #[test]
+    fn zero_temperature_receipt_reports_argmax() {
+        let pass = GameAction::PassPriority;
+        let choice = GameAction::ChoosePlayDraw { play_first: true };
+        let receipt = ranked_receipt(
+            &contract(vec![pass.clone(), choice.clone()]),
+            &[(pass.clone(), 1.0), (choice.clone(), 3.0)],
+            Some(1),
+            0.0,
+            choice,
+        );
+
+        assert!(receipt.candidates[1].is_top_ranked && receipt.candidates[1].is_selected);
+        assert_eq!(receipt.candidates[1].probability, Some(1.0));
+        assert_eq!(receipt.candidates[0].probability, Some(0.0));
+        assert_eq!(receipt.sampling_temperature, Some(0.0));
+        assert!(
+            receipt.selection_explanation.contains("Argmax"),
+            "{}",
+            receipt.selection_explanation
+        );
+    }
+
     #[test]
     fn nonfinite_metrics_serialize_as_null_options() {
         let pass = GameAction::PassPriority;

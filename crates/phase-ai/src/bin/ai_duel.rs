@@ -277,6 +277,22 @@ struct CliOptions {
     game_timeout: Option<Duration>,
     duel_p0: Option<String>,
     duel_p1: Option<String>,
+    /// `--temperature` / `--determinize`: single-mode overrides on the
+    /// difficulty preset's selection and hidden-information settings.
+    search_overrides: SearchOverrides,
+}
+
+/// Overrides a single-mode run applies to the difficulty preset after
+/// `create_config_for_players` and before `into_measurement`. `None` keeps the
+/// preset's value, so a run without the flags is the shipped tier unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SearchOverrides {
+    /// `AiConfig::temperature`; `0.0` selects the top-scored action (argmax).
+    temperature: Option<f64>,
+    /// `SearchConfig::determinization_samples`: the number of determinized
+    /// opponent hidden-zone worlds averaged per decision (`0` = perfect
+    /// information, the shipped default).
+    determinization_samples: Option<u32>,
 }
 
 impl Default for CliOptions {
@@ -302,6 +318,7 @@ impl Default for CliOptions {
             game_timeout: None,
             duel_p0: None,
             duel_p1: None,
+            search_overrides: SearchOverrides::default(),
         }
     }
 }
@@ -2476,6 +2493,42 @@ mod tests {
                 Some(StopReason::ActionCap)
             );
         }
+    }
+
+    /// `--temperature 0` selects argmax and `--determinize K` turns on K
+    /// determinized worlds, as overrides on the difficulty preset.
+    #[test]
+    fn selection_overrides_parse_in_single_mode() {
+        let cli = parse_cli(&args(&[
+            "--difficulty",
+            "VeryHard",
+            "--temperature",
+            "0",
+            "--determinize",
+            "4",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            cli.search_overrides,
+            SearchOverrides {
+                temperature: Some(0.0),
+                determinization_samples: Some(4),
+            }
+        );
+        let defaults = parse_cli(&args(&[])).expect("parses");
+        assert_eq!(defaults.search_overrides, SearchOverrides::default());
+    }
+
+    #[test]
+    fn selection_overrides_reject_bad_values_and_other_modes() {
+        for bad in ["-0.5", "NaN", "inf", "warm"] {
+            let err = parse_cli(&args(&["--temperature", bad])).expect_err(bad);
+            assert!(err.contains("--temperature"), "{err}");
+        }
+        let err = parse_cli(&args(&["--determinize", "x"])).expect_err("rejects");
+        assert!(err.contains("--determinize"), "{err}");
+        let err = parse_cli(&args(&["--suite", "--temperature", "0"])).expect_err("suite");
+        assert!(err.contains("single"), "{err}");
     }
 
     #[test]

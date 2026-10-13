@@ -11346,6 +11346,28 @@ mod tests {
         );
     }
 
+    /// Temperature 0 is the argmax limit of softmax: the top-scored action is
+    /// chosen on every draw, whatever its position in the score vector.
+    #[test]
+    fn zero_temperature_always_picks_the_top_score() {
+        let land = GameAction::PlayLand {
+            object_id: ObjectId(0),
+            card_id: CardId(1),
+        };
+        let scored = vec![
+            (GameAction::PassPriority, 9.99),
+            (land.clone(), 10.0),
+            (GameAction::ChoosePlayDraw { play_first: true }, -3.0),
+        ];
+        let mut rng = SmallRng::seed_from_u64(7);
+        for _ in 0..200 {
+            assert_eq!(
+                softmax_select_pairs(&scored, 0.0, &mut rng),
+                Some(land.clone())
+            );
+        }
+    }
+
     #[test]
     fn softmax_high_temp_is_more_random() {
         let scored = vec![
