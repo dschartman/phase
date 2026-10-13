@@ -19,7 +19,7 @@ use engine::types::log::{GameLogEntry, LogCategory, LogSegment};
 use engine::types::player::PlayerId;
 use phase_ai::auto_play::{driver_step, run_ai_actions, run_ai_actions_bounded, AiActionsStop};
 use phase_ai::config::{
-    create_config_for_players, AiDifficulty, Platform, ACCEPTED_DIFFICULTY_LABELS,
+    create_config_for_players, AiConfig, AiDifficulty, Platform, ACCEPTED_DIFFICULTY_LABELS,
 };
 use phase_ai::duel_suite::compare::{
     compare as compare_reports, emit_gate_verdict, load_report, render_error_markdown,
@@ -233,6 +233,7 @@ fn main() {
                 cli.batch,
                 base_seed,
                 cli.difficulty,
+                cli.search_overrides,
                 cli.verbose,
             );
         }
@@ -291,6 +292,33 @@ struct SearchOverrides {
     /// opponent hidden-zone worlds averaged per decision (`0` = perfect
     /// information, the shipped default).
     determinization_samples: Option<u32>,
+}
+
+impl SearchOverrides {
+    /// The preset with each requested override written onto it.
+    fn apply(self, mut config: AiConfig) -> AiConfig {
+        if let Some(temperature) = self.temperature {
+            config.temperature = temperature;
+        }
+        if let Some(samples) = self.determinization_samples {
+            config.search.determinization_samples = samples;
+        }
+        config
+    }
+
+    /// The overrides in effect, for the run header (empty when none).
+    fn describe(self) -> String {
+        let mut parts = Vec::new();
+        match self.temperature {
+            Some(t) if t <= 0.0 => parts.push("selection: argmax".to_string()),
+            Some(t) => parts.push(format!("temperature: {t}")),
+            None => {}
+        }
+        if let Some(k) = self.determinization_samples {
+            parts.push(format!("determinization: {k} worlds"));
+        }
+        parts.iter().map(|part| format!(", {part}")).collect()
+    }
 }
 
 impl Default for CliOptions {
@@ -501,6 +529,23 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 cli.harvest_output = Some(PathBuf::from(take_value(&mut args, "--harvest")?));
             }
             "--feed" => cli.feed = take_value(&mut args, "--feed")?.clone(),
+            "--temperature" => {
+                const EXPECTED: &str = "a finite temperature >= 0 (0 = argmax)";
+                let temperature: f64 = parse_value(&mut args, "--temperature", EXPECTED)?;
+                if !temperature.is_finite() || temperature < 0.0 {
+                    return Err(format!(
+                        "--temperature expects {EXPECTED}, got '{temperature}'"
+                    ));
+                }
+                cli.search_overrides.temperature = Some(temperature);
+            }
+            "--determinize" => {
+                cli.search_overrides.determinization_samples = Some(parse_value(
+                    &mut args,
+                    "--determinize",
+                    "a number of determinized worlds (0 = perfect information)",
+                )?);
+            }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("Unknown option: {unknown}"));
             }
@@ -514,6 +559,14 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 cli.cards_root = Some(PathBuf::from(positional));
             }
         }
+    }
+    // The overrides are wired into single-mode games only; another mode would
+    // silently run the shipped tier while the command line claims otherwise.
+    if cli.search_overrides != SearchOverrides::default() && cli.mode != Mode::Single {
+        return Err(
+            "--temperature and --determinize apply only to single mode (with or without --batch)"
+                .to_string(),
+        );
     }
     // The two decklist flags name one duel together; half of it is a mistake,
     // and so is naming a registered matchup at the same time.
@@ -644,6 +697,7 @@ fn run_single(
     batch: Option<usize>,
     base_seed: u64,
     difficulty: AiDifficulty,
+    overrides: SearchOverrides,
     verbose: bool,
 ) {
     let SingleSetup {
@@ -666,11 +720,16 @@ fn run_single(
         let game_seed = base_seed + game_idx as u64;
 
         if !is_batch {
-            eprintln!("AI Duel — seed: {game_seed}, difficulty: {difficulty:?}");
+            eprintln!(
+                "AI Duel — seed: {game_seed}, difficulty: {difficulty:?}{}",
+                overrides.describe()
+            );
         }
 
         let start = Instant::now();
-        let (winner, turns) = run_game(db, payload, game_seed, difficulty, verbose, is_batch);
+        let (winner, turns) = run_game(
+            db, payload, game_seed, difficulty, overrides, verbose, is_batch,
+        );
         let elapsed = start.elapsed().as_millis();
 
         match winner {
@@ -698,7 +757,10 @@ fn run_single(
         let n = game_count;
         let avg_turns = total_turns as f64 / n as f64;
         let avg_ms = total_duration_ms as f64 / n as f64;
-        eprintln!("\nResults ({n} games, seed: {base_seed}, difficulty: {difficulty:?}, matchup: {matchup}):");
+        eprintln!(
+            "\nResults ({n} games, seed: {base_seed}, difficulty: {difficulty:?}{}, matchup: {matchup}):",
+            overrides.describe()
+        );
         eprintln!(
             "  P0 ({p0_label}) wins: {p0_wins:>4} ({:.1}%)",
             p0_wins as f64 / n as f64 * 100.0
@@ -721,6 +783,7 @@ fn run_game(
     payload: &DeckPayload,
     seed: u64,
     difficulty: AiDifficulty,
+    overrides: SearchOverrides,
     verbose: bool,
     silent: bool,
 ) -> (Option<PlayerId>, u32) {
@@ -735,7 +798,9 @@ fn run_game(
     // Pin measurement mode for regression runs: search is bounded by
     // max_nodes only, so duel outcomes don't observe wall-clock variance
     // across hardware. Production code leaves this off to use time budgets.
-    let config = create_config_for_players(difficulty, Platform::Native, 2).into_measurement(seed);
+    let config = overrides
+        .apply(create_config_for_players(difficulty, Platform::Native, 2))
+        .into_measurement(seed);
     let ai_configs: HashMap<PlayerId, _> = [(PlayerId(0), config.clone()), (PlayerId(1), config)]
         .into_iter()
         .collect();
@@ -1873,6 +1938,8 @@ fn print_usage() {
     );
     eprintln!("  --matchup NAME     Deck matchup (default: red-vs-green)");
     eprintln!("  --p0-deck PATH     Decklist file for P0 (with --p1-deck, instead of --matchup)");
+    eprintln!("  --temperature T    Single mode: selection temperature override (0 = argmax)");
+    eprintln!("  --determinize K    Single mode: average K determinized hidden-info worlds");
     eprintln!("  --p1-deck PATH     Decklist file for P1. Lines: '<count> <card name>',");
     eprintln!("                     '//' or '#' comments, Deck/Sideboard headers. Any deck");
     eprintln!("                     size; every name must resolve in card-data.json.");

@@ -43,6 +43,8 @@ rtk cargo run --release --bin ai-duel -- client/public --commander-suite --games
 | `--matchup NAME` | Deck matchup preset | red-vs-green |
 | `--list-matchups` | Show available matchups | - |
 | `--p0-deck PATH` / `--p1-deck PATH` | Play two decklist files instead of a `--matchup` preset (both required; any deck size) | - |
+| `--temperature T` | Single mode: override the tier's softmax temperature; `0` selects the top-scored action (argmax) | tier preset |
+| `--determinize K` | Single mode: average K determinized opponent hidden-zone worlds per decision (`0` = perfect information) | `0` |
 | `--verbose` | Print every action (full trace) | off |
 | `--suite` | Run every registered `MatchupSpec` in measurement mode | off |
 | `--games N` | Games per matchup/suite cell | 10 for suite, 4 for commander suite |
