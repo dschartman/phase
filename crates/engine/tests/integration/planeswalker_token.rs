@@ -444,8 +444,8 @@ fn jace_token_loyalty_abilities_need_an_empty_stack() {
 /// CR 606.3 timing lives in the overridable restriction list: a static
 /// permission of the Teferi, Temporal Archmage emblem class ("You may activate
 /// loyalty abilities of planeswalkers you control on any player's turn any time
-/// you could cast an instant.") lets the Jace token's controller activate its
-/// abilities on the opponent's turn.
+/// you could cast an instant.") makes the Jace token's abilities legal actions
+/// for its controller on the opponent's turn.
 #[test]
 fn instant_permission_lets_jace_token_activate_on_opponents_turn() {
     let mut scenario = GameScenario::new();
