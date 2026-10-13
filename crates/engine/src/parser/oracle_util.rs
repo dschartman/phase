@@ -1586,6 +1586,16 @@ pub(crate) fn is_subtype_word(candidate_lower: &str) -> bool {
             .any(|s| s.eq_ignore_ascii_case(candidate_lower))
 }
 
+/// CR 205.3j: Test whether a case-exact word is a planeswalker type
+/// (`PLANESWALKER_SUBTYPES`). Planeswalker types name characters, so this is
+/// the name-only test for a short-name self-reference (CR 201.5c).
+fn is_planeswalker_type_name(word: &str) -> bool {
+    matches!(
+        noncreature_subtype_set(word),
+        Some(crate::types::card_type::SubtypeSet::Planeswalker)
+    )
+}
+
 /// Test whether a lowercased candidate word matches an MTG supertype.
 /// CR 205.4: Supertypes are basic, legendary, ongoing, snow, world. `tribal`
 /// was historically a type but is included here for Oracle-text coverage.
@@ -3072,7 +3082,16 @@ pub fn normalize_card_name_refs_reporting(
                 // E.g., "The Twelfth Doctor" must not replace "The" in
                 // "The first spell you cast..." — that "The" is an article,
                 // not a reference to the card.
-                if len == 1 {
+                // CR 201.5c + CR 205.3j: a planeswalker type at the head of a
+                // multi-word card name is that character's name ("Liliana the
+                // Repentant", "Sorin the Mirthless"), so a bare occurrence in
+                // the card's text is its shortened name, not a type reference.
+                // Planeswalker types are disjoint from creature types, so a
+                // descriptive creature-subtype head ("Goblin Piledriver") never
+                // takes this path.
+                let is_planeswalker_type_short_name =
+                    len == 1 && is_planeswalker_type_name(&candidate);
+                if len == 1 && !is_planeswalker_type_short_name {
                     let lower_candidate = candidate.to_lowercase();
                     // Ordered cheapest-first: small matches! sets short-circuit
                     // before the ~430-entry SUBTYPES linear scan.
@@ -3095,7 +3114,16 @@ pub fn normalize_card_name_refs_reporting(
                         continue;
                     }
                 }
-                let replaced = replace_all_words_case_sensitive(&result, &candidate, "~");
+                // A type-adjective occurrence ("a Liliana planeswalker") stays a
+                // type reference (CR 205.3j), the same per-occurrence rule the
+                // single-word and "of" short-name branches apply.
+                let replaced = if is_planeswalker_type_short_name {
+                    replace_all_words_case_sensitive_preserving_subtype_status_refs(
+                        &result, &candidate, "~",
+                    )
+                } else {
+                    replace_all_words_case_sensitive(&result, &candidate, "~")
+                };
                 if replaced != result {
                     // Guard: Don't replace subtype references like "Sliver creatures"
                     // when "Sliver" is a prefix of the card name "Sliver Hivelord".

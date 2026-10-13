@@ -4242,12 +4242,12 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     //
     // CR 608.2c: The same flag also wires sub-chains whose own clauses
     // anchor on the just-moved card via the bare-"it" anaphor
-    // (`TargetFilter::SelfRef`) — Emperor of Bones' "[…] put a creature
-    // card exiled with this creature onto the battlefield […]. It gains
-    // haste. Sacrifice it at the beginning of the next end step." The
-    // trailing GenericEffect/Pump and CreateDelayedTrigger subs target
-    // `SelfRef` so the runtime's `source_id` rewrite resolves them to the
-    // moved card instead of Emperor itself.
+    // (`ParentTarget` in a chain link, `SelfRef` inside a delayed-trigger
+    // body) — Emperor of Bones' "[…] put a creature card exiled with this
+    // creature onto the battlefield […]. It gains haste. Sacrifice it at the
+    // beginning of the next end step." The runtime's `source_id` rewrite
+    // resolves them to the moved card instead of Emperor itself. A chain-link
+    // `SelfRef` is an explicit self-reference (CR 201.5) and does not anchor.
     //
     // The `forward_result` flag makes the runtime forward the just-moved
     // card's id as the sub-ability's `source_id` (see `effects/mod.rs`
