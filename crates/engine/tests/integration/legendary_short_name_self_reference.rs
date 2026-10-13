@@ -49,7 +49,6 @@ fn liliana_the_repentant_exhaust_puts_the_counter_on_liliana() {
         .activate(liliana, index)
         .target_object(returned)
         .resolve();
-
     // Reach guard: the exhaust ability resolved its first instruction.
     assert_eq!(
         runner.state().objects[&returned].zone,
@@ -74,4 +73,65 @@ fn liliana_the_repentant_exhaust_puts_the_counter_on_liliana() {
         0,
         "the returned creature gets no counter"
     );
+}
+
+/// General Leo Cristophe (verbatim Oracle text).
+const GENERAL_LEO_CRISTOPHE: &str = "When General Leo Cristophe enters, return up to one target creature card with mana value 3 or less from your graveyard to the battlefield. Then put a +1/+1 counter on General Leo Cristophe for each creature you control.";
+
+/// CR 201.5 + CR 608.2c: after a card is returned to the battlefield, an
+/// explicit self-reference in the next instruction still names the ability's
+/// source. General Leo's counters go on General Leo, not on the returned card.
+#[test]
+fn general_leo_cristophe_puts_the_counters_on_himself() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let leo = scenario
+        .add_creature_to_hand_from_oracle(P0, "General Leo Cristophe", 2, 2, GENERAL_LEO_CRISTOPHE)
+        .id();
+    let returned = scenario
+        .add_creature_to_graveyard(P0, "Graveyard Bear", 2, 2)
+        .with_mana_cost(engine::types::mana::ManaCost::Cost {
+            shards: vec![],
+            generic: 2,
+        })
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(leo).target_object(returned).resolve();
+    // The enters trigger targets the graveyard card, then resolves.
+    for _ in 0..20 {
+        match runner.state().waiting_for.clone() {
+            engine::types::game_state::WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .act(engine::types::actions::GameAction::SelectTargets {
+                        targets: vec![engine::types::ability::TargetRef::Object(returned)],
+                    })
+                    .expect("target the graveyard creature card");
+            }
+            engine::types::game_state::WaitingFor::Priority { .. }
+                if !runner.state().stack.is_empty() =>
+            {
+                runner
+                    .act(engine::types::actions::GameAction::PassPriority)
+                    .expect("pass priority");
+            }
+            _ => break,
+        }
+    }
+
+    // Reach guard: the trigger returned the card.
+    assert_eq!(runner.state().objects[&returned].zone, Zone::Battlefield);
+    let plus_ones = |id: ObjectId| {
+        runner.state().objects[&id]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        plus_ones(leo),
+        2,
+        "one counter on General Leo for each creature you control (Leo and the bear)"
+    );
+    assert_eq!(plus_ones(returned), 0, "the returned card gets no counters");
 }
