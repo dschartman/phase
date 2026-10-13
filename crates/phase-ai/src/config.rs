@@ -1343,6 +1343,8 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
 #[derive(Debug, Clone)]
 pub struct AiConfig {
     pub difficulty: AiDifficulty,
+    /// Softmax temperature for ranked selection. `0.0` is the argmax limit
+    /// (always the top-scored action); every shipped preset is above it.
     pub temperature: f64,
     pub profile: AiProfile,
     pub play_lookahead: bool,
