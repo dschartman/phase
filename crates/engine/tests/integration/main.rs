@@ -2034,6 +2034,7 @@ mod exile_origin_target_acquisition;
 mod fold_into_aether_counter_put;
 mod issue_9886_dralnus_pet;
 mod keyword_activation_cancel;
+mod legendary_short_name_self_reference;
 mod partner_family_keyword_remainder;
 mod rally_the_righteous_radiance_pump;
 mod starting_intensity_keyword;
