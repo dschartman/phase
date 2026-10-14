@@ -284,7 +284,7 @@ fn gated_created_tokens_get_counters_when_paid() {
     assert_eq!(total_counters(&runner, soldier), 0);
 }
 
-/// T5b (guard, synthetic). CR 609.3: a declined gate creates nothing, so nothing
+/// T5b (guard, synthetic). CR 608.2c + CR 608.2d: a declined gate creates nothing, so nothing
 /// receives counters; the stale ledger entry (the Soldier) is not read.
 #[test]
 fn gated_created_tokens_decline_touches_no_stale_token() {
@@ -292,6 +292,7 @@ fn gated_created_tokens_decline_touches_no_stale_token() {
 
     let outcome = runner.cast(gated).decline_optional().resolve();
 
+    outcome.assert_zone(&[gated], Zone::Graveyard);
     assert!(tokens_named(&runner, "Cadet").is_empty(), "no Cadet exists");
     assert_eq!(
         outcome.mana_pool_total(P0),

@@ -45,27 +45,29 @@ fn is_self_ref(text: &str) -> bool {
 /// through the same resolver so ETB-self triggers like "put X counters on
 /// him" bind to `SelfRef` when the trigger subject is the source permanent.
 fn is_it_pronoun(text: &str) -> bool {
-    nom_on_lower(text, text, |i| {
-        value(
-            (),
-            alt((
-                // Bare object pronoun as the whole token or immediately followed
-                // by a space, routed through the shared recipient-pronoun
-                // combinator (single authority for the it/them/him/her set).
-                terminated(
-                    nom_primitives::parse_object_recipient_pronoun,
-                    alt((eof, peek(tag(" ")))),
-                ),
-                // Reflexive "*self" forms — a distinct set, matched here directly.
-                tag("itself"),
-                tag("himself"),
-                tag("herself"),
-                tag("themselves"),
-            )),
-        )
-        .parse(i)
-    })
-    .is_some()
+    nom_on_lower(text, text, parse_object_pronoun_anaphor).is_some()
+}
+
+/// Nom recognizer behind [`is_it_pronoun`] (lowercase input).
+fn parse_object_pronoun_anaphor(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            // Bare object pronoun as the whole token or immediately followed
+            // by a space, routed through the shared recipient-pronoun
+            // combinator (single authority for the it/them/him/her set).
+            terminated(
+                nom_primitives::parse_object_recipient_pronoun,
+                alt((eof, peek(tag(" ")))),
+            ),
+            // Reflexive "*self" forms — a distinct set, matched here directly.
+            tag("itself"),
+            tag("himself"),
+            tag("herself"),
+            tag("themselves"),
+        )),
+    )
+    .parse(input)
 }
 
 /// The demonstrative/definite half of the chain-created anaphor, WITHOUT the
@@ -89,31 +91,46 @@ pub(super) fn chain_created_demonstrative_binding(
     // non-self trigger subject re-anchors the reference to the triggering object
     // (Pip-Boy 3000), and only a chain that actually produced something can be
     // named at all.
-    let subject_allows_token = matches!(
+    (ctx.token_created_in_chain && subject_allows_chain_token(ctx))
+        .then_some(TargetFilter::LastCreated)
+}
+
+/// A demonstrative/definite/distributive anaphor under a non-self, non-`Any`
+/// trigger subject refers to that triggering object, not the created token.
+/// The single subject gate for every gated chain-created anaphor form.
+fn subject_allows_chain_token(ctx: &ParseContext) -> bool {
+    matches!(
         ctx.subject,
         None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
-    );
-    (ctx.token_created_in_chain && subject_allows_token).then_some(TargetFilter::LastCreated)
+    )
 }
 
 /// CR 608.2c: the demonstrative and definite back-reference forms.
 /// `the creature` is deliberately EXCLUDED — it legitimately binds a chosen
 /// target slot (Longstalk Brawl) and is genuinely ambiguous.
 fn anaphor_is_chain_created_demonstrative(anaphor_lower: &str) -> bool {
-    nom_on_lower(anaphor_lower, anaphor_lower, |i| {
-        value(
-            (),
-            alt((
-                tag("that creature"),
-                tag("that token"),
-                tag("that permanent"),
-                tag("the token"),
-                tag("the permanent"),
-            )),
-        )
-        .parse(i)
-    })
+    nom_on_lower(
+        anaphor_lower,
+        anaphor_lower,
+        parse_chain_created_demonstrative,
+    )
     .is_some()
+}
+
+/// Nom recognizer behind [`anaphor_is_chain_created_demonstrative`] (lowercase
+/// input).
+fn parse_chain_created_demonstrative(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("that creature"),
+            tag("that token"),
+            tag("that permanent"),
+            tag("the token"),
+            tag("the permanent"),
+        )),
+    )
+    .parse(input)
 }
 
 /// The anaphor forms that can name a chain-created token set, classified so the
@@ -132,18 +149,24 @@ enum ChainCreatedAnaphor {
 /// Classify a counter-recipient anaphor, in the order object pronoun,
 /// demonstrative, distributive plural. `None` ⇒ not a chain-created anaphor.
 fn classify_chain_created_anaphor(anaphor_lower: &str) -> Option<ChainCreatedAnaphor> {
-    if is_it_pronoun(anaphor_lower) {
-        Some(ChainCreatedAnaphor::ObjectPronoun)
-    } else if anaphor_is_chain_created_demonstrative(anaphor_lower) {
-        Some(ChainCreatedAnaphor::Demonstrative)
-    } else if nom_on_lower(anaphor_lower, anaphor_lower, parse_each_of_them).is_some() {
-        Some(ChainCreatedAnaphor::DistributivePlural)
-    } else {
-        None
-    }
+    nom_on_lower(anaphor_lower, anaphor_lower, |i| {
+        alt((
+            value(
+                ChainCreatedAnaphor::ObjectPronoun,
+                parse_object_pronoun_anaphor,
+            ),
+            value(
+                ChainCreatedAnaphor::Demonstrative,
+                parse_chain_created_demonstrative,
+            ),
+            value(ChainCreatedAnaphor::DistributivePlural, parse_each_of_them),
+        ))
+        .parse(i)
+    })
+    .map(|(anaphor, _)| anaphor)
 }
 
-/// CR 608.2c + CR 111.10 + CR 122.1: a same-chain counter anaphor placed AFTER a
+/// CR 608.2c + CR 111.1 + CR 122.1: a same-chain counter anaphor placed AFTER a
 /// token-creating clause binds to that just-created token
 /// (`TargetFilter::LastCreated`) — the anaphor's most-recent object referent —
 /// rather than the ability source (`SelfRef`) or an unbound parent target.
@@ -173,23 +196,17 @@ pub(super) fn counter_anaphor_created_token_binding(
     ctx: &ParseContext,
 ) -> Option<TargetFilter> {
     let anaphor = classify_chain_created_anaphor(anaphor_lower)?;
-    // A demonstrative/definite anaphor under a non-self, non-`Any` trigger subject
-    // refers to that triggering object, not the created token — the subject gate
-    // preserves that legacy binding.
-    let subject_allows_token = matches!(
-        ctx.subject,
-        None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
-    );
     let binds = match anaphor {
-        // The bare object pronoun has no such re-anchor, so its gate is only the
-        // token flag.
+        // The bare object pronoun has no trigger-subject re-anchor, so its gate is
+        // only the token flag.
         ChainCreatedAnaphor::ObjectPronoun => ctx.token_created_in_chain,
-        ChainCreatedAnaphor::Demonstrative => ctx.token_created_in_chain && subject_allows_token,
-        // No printed card has a typed batch subject plus an in-chain token creator
-        // before "each of them"; the gate is the conservative reading, consistent
-        // with #5949.
-        ChainCreatedAnaphor::DistributivePlural => {
-            ctx.token_created_in_chain && subject_allows_token
+        // A demonstrative/definite anaphor under a non-self, non-`Any` trigger
+        // subject refers to that triggering object, not the created token; the
+        // subject gate preserves that legacy binding. No printed card has a typed
+        // batch subject plus an in-chain token creator before "each of them"; the
+        // gate is the conservative reading for the plural, consistent with #5949.
+        ChainCreatedAnaphor::Demonstrative | ChainCreatedAnaphor::DistributivePlural => {
+            ctx.token_created_in_chain && subject_allows_chain_token(ctx)
         }
     };
     binds.then_some(TargetFilter::LastCreated)
@@ -355,7 +372,7 @@ fn resolve_counter_placement_target<'a>(
         let offset = text.len() - rem.len();
         return (TargetFilter::TriggeringSource, &text[offset..], None);
     }
-    // CR 608.2c + CR 111.10: a same-chain demonstrative/definite anaphor
+    // CR 608.2c + CR 111.1: a same-chain demonstrative/definite anaphor
     // ("that creature"/"that token"/"that permanent"/"the token"/"the permanent")
     // or the distributive plural "each of them" placed after a token-creating
     // clause binds to the just-created token(s), not the unbound parent target.

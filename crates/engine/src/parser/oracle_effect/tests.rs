@@ -46412,18 +46412,6 @@ fn counter_anaphor_after_conjure_binds_last_created() {
     }
 }
 
-/// Every node of a within-clause chain (node, sub, else), depth-first.
-fn each_of_them_chain_nodes(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
-    let mut nodes = vec![def];
-    if let Some(sub) = def.sub_ability.as_deref() {
-        nodes.extend(each_of_them_chain_nodes(sub));
-    }
-    if let Some(other) = def.else_ability.as_deref() {
-        nodes.extend(each_of_them_chain_nodes(other));
-    }
-    nodes
-}
-
 /// Every execute chain a parsed card carries (spell/activated abilities and
 /// trigger bodies).
 fn each_of_them_card_chains(
@@ -46454,7 +46442,7 @@ fn each_of_them_chain_with(
 ) -> Vec<&AbilityDefinition> {
     chains
         .iter()
-        .map(each_of_them_chain_nodes)
+        .map(chain_defs)
         .find(|nodes| nodes.iter().any(|n| pred(&n.effect)))
         .expect("a chain with the requested node")
 }
@@ -46521,7 +46509,7 @@ fn each_of_them_after_created_tokens_is_put_counter_last_created() {
     }
 }
 
-/// CR 603.12 + CR 608.2c + CR 609.3: SHAPE (U4). In a gated publisher chain the
+/// CR 608.2c: SHAPE (U4). In a gated publisher chain the
 /// "each of them" consumer reads `LastCreated` and is relinked onto the gated
 /// instruction's continuation path (`ContinuationStep`), so a declined gate
 /// cannot read a stale created-token ledger. `sub_link` is a parse-time
@@ -46585,6 +46573,7 @@ fn untargeted_choice_between_creator_and_each_of_them_stays_parent_target() {
     let text = "Create a 1/1 white Soldier creature token. Choose up to two creatures you control. Put a +1/+1 counter on each of them.";
     let chains = each_of_them_card_chains(text, "Choice After Creator", &[], &["Sorcery"]);
     let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::Token { .. }));
+    each_of_them_assert_no_unimplemented(&nodes, "Choice After Creator");
     let target = nodes
         .iter()
         .find_map(|n| match &*n.effect {
@@ -46595,7 +46584,7 @@ fn untargeted_choice_between_creator_and_each_of_them_stays_parent_target() {
     assert_eq!(target, TargetFilter::ParentTarget);
 }
 
-/// CR 608.2c + CR 122.6: SHAPE preservation (U6). A typed "each <type> you
+/// CR 608.2c: SHAPE preservation (U6). A typed "each <type> you
 /// control" recipient after a token creator in the same chain is still a
 /// battlefield scan (`PutCounterAll { Typed }`), not the created set:
 /// Biomathematician and Oracle's Gift count Fractals that existed before.
