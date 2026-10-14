@@ -46456,11 +46456,10 @@ fn each_of_them_assert_no_unimplemented(nodes: &[&AbilityDefinition], card: &str
     );
 }
 
-/// CR 608.2c + CR 111.1: SHAPE (U3). After a token-creating clause, "put ...
-/// counters on each of them" binds the created token set: Snarl Song's and
-/// Assemble the Entmoot's verbatim chains carry `PutCounter { LastCreated }`,
-/// not `ParentTarget` (unbound at runtime) and not `PutCounterAll` (invisible
-/// to the gated-publisher relink pass).
+/// CR 608.2c + CR 111.1: SHAPE (U3). The printed witnesses of the whitelisted
+/// shape (a fixed plural creation, then "put ... counters on each of them"):
+/// Snarl Song's and Assemble the Entmoot's verbatim chains carry
+/// `PutCounter { LastCreated }`, not `ParentTarget` and not `PutCounterAll`.
 #[test]
 fn each_of_them_after_created_tokens_is_put_counter_last_created() {
     const SNARL_SONG: &str = "Converge \u{2014} Create two 0/0 green and blue Fractal creature tokens. Put X +1/+1 counters on each of them and you gain X life, where X is the number of colors of mana spent to cast this spell.";
