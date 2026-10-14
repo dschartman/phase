@@ -46509,42 +46509,18 @@ fn each_of_them_after_created_tokens_is_put_counter_last_created() {
     }
 }
 
-/// CR 608.2c: SHAPE (U4). In a gated publisher chain the
-/// "each of them" consumer reads `LastCreated` and is relinked onto the gated
-/// instruction's continuation path (`ContinuationStep`), so a declined gate
-/// cannot read a stale created-token ledger. `sub_link` is a parse-time
-/// property with no behavioural twin. Synthetic text, templated on the "you may
-/// pay {N}. If you do, create ..." pattern.
+/// CR 122.1 + CR 608.2c: SHAPE (U5'). Parse time never binds the plural
+/// "each of them" to created tokens: the compound-split router in
+/// `try_parse_verb_and_target` keeps `PutCounter { ParentTarget }` whether or
+/// not a token creator is in the chain, and does not promote it to
+/// `PutCounterAll`. Only the whole-ability pass
+/// (`oracle::bind_each_of_them_to_sole_created_tokens`) rebinds it. The
+/// remainder keeps the next conjunct.
 #[test]
-fn gated_each_of_them_consumer_is_relinked() {
-    let text = "You may pay {2}. If you do, create two 1/1 white Soldier creature tokens named Cadet. Put a +1/+1 counter on each of them.";
-    let chains = each_of_them_card_chains(text, "Gated Creator", &[], &["Sorcery"]);
-    let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::Token { .. }));
-    each_of_them_assert_no_unimplemented(&nodes, "Gated Creator");
-    let put = nodes
-        .iter()
-        .find(|n| matches!(*n.effect, Effect::PutCounter { .. }))
-        .expect("the counter clause is a PutCounter");
-    let Effect::PutCounter { target, .. } = &*put.effect else {
-        unreachable!("matched above");
-    };
-    assert_eq!(*target, TargetFilter::LastCreated);
-    assert_eq!(put.sub_link, SubAbilityLink::ContinuationStep);
-}
-
-/// CR 122.1 + CR 608.2c: SHAPE (U5). The compound-split router in
-/// `try_parse_verb_and_target` agrees with the imperative router: with a token
-/// creator in the chain, "each of them" stays `PutCounter { LastCreated }`
-/// rather than promoting to `PutCounterAll`; without one it stays
-/// `PutCounter { ParentTarget }`. The remainder keeps the next conjunct.
-#[test]
-fn compound_split_routes_each_of_them_last_created_to_put_counter() {
+fn compound_split_keeps_each_of_them_parent_target_at_parse() {
     let text = "put a +1/+1 counter on each of them and tap target creature";
     let lower = text.to_lowercase();
-    for (flag, expected) in [
-        (true, TargetFilter::LastCreated),
-        (false, TargetFilter::ParentTarget),
-    ] {
+    for flag in [true, false] {
         let mut ctx = ParseContext {
             token_created_in_chain: flag,
             ..Default::default()
@@ -46557,7 +46533,7 @@ fn compound_split_routes_each_of_them_last_created_to_put_counter() {
         };
         match *inner {
             ZoneCounterImperativeAst::PutCounter { target, .. } => {
-                assert_eq!(target, expected, "flag {flag}");
+                assert_eq!(target, TargetFilter::ParentTarget, "flag {flag}");
             }
             other => panic!("flag {flag}: expected PutCounter, got {other:?}"),
         }
@@ -46574,14 +46550,25 @@ fn untargeted_choice_between_creator_and_each_of_them_stays_parent_target() {
     let chains = each_of_them_card_chains(text, "Choice After Creator", &[], &["Sorcery"]);
     let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::Token { .. }));
     each_of_them_assert_no_unimplemented(&nodes, "Choice After Creator");
-    let target = nodes
+    let put_index = nodes
         .iter()
-        .find_map(|n| match &*n.effect {
-            Effect::PutCounter { target, .. } => Some(target.clone()),
-            _ => None,
-        })
+        .position(|n| matches!(*n.effect, Effect::PutCounter { .. }))
         .expect("the counter clause is a PutCounter");
-    assert_eq!(target, TargetFilter::ParentTarget);
+    // Positive reach: the untargeted choice lowers through the typed-selection
+    // `TargetOnly` precursor, which sits before the placement.
+    assert!(
+        nodes[..put_index].iter().any(|n| matches!(
+            &*n.effect,
+            Effect::TargetOnly {
+                target: TargetFilter::Typed(_),
+            }
+        )),
+        "the chain holds the typed TargetOnly choice before the PutCounter"
+    );
+    let Effect::PutCounter { target, .. } = &*nodes[put_index].effect else {
+        unreachable!("matched above");
+    };
+    assert_eq!(*target, TargetFilter::ParentTarget);
 }
 
 /// CR 608.2c: SHAPE preservation (U6). A typed "each <type> you
@@ -46671,6 +46658,238 @@ fn tracked_set_each_of_them_without_creator_stays_parent_target() {
         )),
         "Pako's trailing +1/+1 counter on Pako stays SelfRef (positive reach)"
     );
+}
+
+/// Every definition node a parsed card carries: spell and activated chains,
+/// modal modes and trigger bodies.
+fn each_of_them_all_nodes(
+    parsed: &crate::parser::oracle::ParsedAbilities,
+) -> Vec<&AbilityDefinition> {
+    fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a AbilityDefinition>) {
+        out.push(def);
+        for child in [def.sub_ability.as_deref(), def.else_ability.as_deref()]
+            .into_iter()
+            .flatten()
+            .chain(def.mode_abilities.iter())
+        {
+            collect(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    for def in parsed
+        .abilities
+        .iter()
+        .chain(parsed.triggers.iter().filter_map(|t| t.execute.as_deref()))
+    {
+        collect(def, &mut out);
+    }
+    out
+}
+
+/// Whether the rider reads the created tokens or keeps the base reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EachOfThemReading {
+    LastCreated,
+    ParentTarget,
+}
+
+/// What a row's parse holds besides the rider, asserted exactly as the row's
+/// positive reach guard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EachOfThemParse {
+    /// The token creation parses and the card holds zero `Unimplemented`.
+    Clean,
+    /// The token creation parses and a continuation the parser does not support
+    /// is an `Unimplemented` node by design.
+    ContinuationGap,
+    /// The creation itself is an unsupported `Unimplemented` node by design (no
+    /// `Token`), so only the rider's reading is asserted.
+    CreationGap,
+}
+
+/// The one counter placement in `text`'s parse, after asserting the row's
+/// [`EachOfThemParse`] state.
+fn each_of_them_rider_target(text: &str, types: &[&str], parse: EachOfThemParse) -> TargetFilter {
+    let types: Vec<String> = types.iter().map(|t| (*t).to_string()).collect();
+    let parsed = parse_oracle_text(text, "Each Of Them Row", &[], &types, &[]);
+    let nodes = each_of_them_all_nodes(&parsed);
+    let has_token = nodes
+        .iter()
+        .any(|n| matches!(*n.effect, Effect::Token { .. }));
+    let has_gap = nodes
+        .iter()
+        .any(|n| matches!(*n.effect, Effect::Unimplemented { .. }));
+    let expected = match parse {
+        EachOfThemParse::Clean => (true, false),
+        EachOfThemParse::ContinuationGap => (true, true),
+        EachOfThemParse::CreationGap => (false, true),
+    };
+    assert_eq!(
+        (has_token, has_gap),
+        expected,
+        "{text:?}: (token creation parses, holds Unimplemented) must match {parse:?}"
+    );
+    let targets: Vec<&TargetFilter> = nodes
+        .iter()
+        .filter_map(|n| match &*n.effect {
+            Effect::PutCounter { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect();
+    let [target] = targets.as_slice() else {
+        panic!("{text:?}: expected exactly one PutCounter, got {targets:?}");
+    };
+    (*target).clone()
+}
+
+/// CR 608.2c + CR 111.1 + CR 115.10a + CR 207.2c: SHAPE (U30), through the real
+/// pipeline (`parse_oracle_text`, so the whole-ability pass runs). "each of
+/// them" reads the created tokens only when the whole spell or activated
+/// ability is two sentences, a creation of a fixed number of tokens, two or
+/// more, then "Put <counters> on each of them" (optionally "and you gain N
+/// life"), with no condition, target, option, other instruction or swallowed
+/// clause. Every other row keeps the base reading, `ParentTarget` (D12: base
+/// parity, not a CR 608.2c derivation; several of those texts most likely mean
+/// the tokens). Costs, additional costs and keyword lines are not instructions
+/// (CR 601.2h + CR 602.2b), and a loyalty ability is an activated ability
+/// (CR 606.1). Synthetic text throughout.
+#[test]
+fn each_of_them_binds_only_when_the_whole_ability_is_creation_then_rider() {
+    use EachOfThemParse::{Clean, ContinuationGap, CreationGap};
+    use EachOfThemReading::{LastCreated, ParentTarget};
+    const SORCERY: &[&str] = &["Sorcery"];
+    const CREATURE: &[&str] = &["Creature"];
+    const PLANESWALKER: &[&str] = &["Planeswalker"];
+    let rows: &[(&str, &[&str], EachOfThemParse, EachOfThemReading)] = &[
+        // The whitelisted shape.
+        ("Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", SORCERY, Clean, LastCreated),
+        ("Create two Treasure tokens. Put a +1/+1 counter on each of them.", SORCERY, Clean, LastCreated),
+        ("Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them and you gain 2 life.", SORCERY, Clean, LastCreated),
+        ("Create two 0/0 green and blue Fractal creature tokens. Put X +1/+1 counters on each of them and you gain X life, where X is the number of cards in your hand.", SORCERY, Clean, LastCreated),
+        ("{T}, Sacrifice two creatures: Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", CREATURE, Clean, LastCreated),
+        ("+1: Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", PLANESWALKER, Clean, LastCreated),
+        ("As an additional cost to cast this spell, sacrifice two creatures.\nCreate two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", SORCERY, Clean, LastCreated),
+        ("Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.\nFlashback {4}", SORCERY, Clean, LastCreated),
+        // T1: an activation instruction is a third sentence.
+        ("{T}: Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them. Activate only as a sorcery.", CREATURE, Clean, ParentTarget),
+        // T2: a head before the creation, or text after the token noun.
+        ("Then create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens as long as an opponent controls two or more creatures. Put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens under an opponent's control. Put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        // T3: the rider sentence is not consumed end to end.
+        ("Create two 1/1 white Soldier creature tokens. Then put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a number of +1/+1 counters on each of them equal to the number of creatures an opponent controls.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token if two or more creatures an opponent controls are tied for greatest power.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token as long as an opponent controls two or more creatures.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token while an opponent controls two or more creatures.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token during your turn.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token only during your turn.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token provided you control two or more creatures.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token when you do.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token except during combat.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token once each turn.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and create a Treasure token only once.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and draw a card instead.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them and you gain 2 life as long as you control two or more creatures.", SORCERY, ContinuationGap, ParentTarget),
+        ("Create two X/X green Treefolk creature tokens, where X is the amount of life you gained this turn as long as you control two or more creatures. Put a -1/-1 counter on each of them.", SORCERY, CreationGap, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them and you may draw a card.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them and tap them.", SORCERY, Clean, ParentTarget),
+        // T5: a target anywhere, here inside the tokens' P/T binder.
+        ("Create two X/X green Treefolk creature tokens, where X is the number of creatures target opponent controls. Put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        // R: a variable count, or one token.
+        ("Create X 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create X 1/1 white Soldier creature tokens, where X is the number of creatures you control. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create a 1/1 white Soldier creature token. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        // Y: an ability word the parser turns into a condition.
+        ("Delirium \u{2014} Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Threshold \u{2014} Create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        // K: a triggered ability (CR 113.3c); T0: a modal mode (CR 700.2).
+        ("When this creature enters, create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", CREATURE, Clean, ParentTarget),
+        ("Choose one \u{2014}\n\u{2022} Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.\n\u{2022} Draw a card.", SORCERY, Clean, ParentTarget),
+        // The maintainer's composition: the exiled cards are the antecedent.
+        ("Create a 1/1 white Soldier creature token. Exile the top two cards of your library. Put a study counter on each of them.", SORCERY, Clean, ParentTarget),
+        // A payment or option, another instruction, a condition anywhere.
+        ("You may pay {2}. If you do, create two 1/1 white Soldier creature tokens named Cadet. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("You gain 2 life. Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Tap them. Put a +1/+1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them. You gain 2 life.", SORCERY, Clean, ParentTarget),
+        ("Create two 1/1 white Soldier creature tokens. If an opponent controls two or more creatures, put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+        ("If two or more creatures an opponent controls are tied for greatest power, create two 1/1 white Soldier creature tokens. Put a -1/-1 counter on each of them.", SORCERY, Clean, ParentTarget),
+    ];
+    let mismatches: Vec<String> = rows
+        .iter()
+        .filter_map(|(text, types, parse, reading)| {
+            let expected = match reading {
+                LastCreated => TargetFilter::LastCreated,
+                ParentTarget => TargetFilter::ParentTarget,
+            };
+            let actual = each_of_them_rider_target(text, types, *parse);
+            (actual != expected).then(|| format!("{text:?}: expected {expected:?}, got {actual:?}"))
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "rows with the wrong reading:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// CR 608.2c: SHAPE (U30, W). The swallow audit is card-wide: unrepresented
+/// text on another line of the same card keeps an otherwise whitelisted
+/// ability at the base reading, and the same ability on a card without one
+/// binds. Each row asserts the audit's state as its reach guard.
+#[test]
+fn each_of_them_swallowed_clause_anywhere_on_the_card_keeps_base_reading() {
+    for (text, swallowed, expected) in [
+        (
+            "{T}: Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.\n{1}: Create a Treasure token as long as you control two or more creatures.",
+            true,
+            TargetFilter::ParentTarget,
+        ),
+        (
+            "{T}: Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on each of them.\n{1}: Draw a card.",
+            false,
+            TargetFilter::LastCreated,
+        ),
+    ] {
+        let parsed = parse_oracle_text(text, "Each Of Them Row", &[], &["Creature".to_string()], &[]);
+        assert_eq!(
+            parsed
+                .parse_warnings
+                .iter()
+                .any(|d| matches!(d, OracleDiagnostic::SwallowedClause { .. })),
+            swallowed,
+            "{text:?}: swallow audit state"
+        );
+        let nodes = each_of_them_all_nodes(&parsed);
+        let targets: Vec<&TargetFilter> = nodes
+            .iter()
+            .filter_map(|n| match &*n.effect {
+                Effect::PutCounter { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, vec![&expected], "{text:?}");
+    }
+}
+
+/// CR 608.2c: SHAPE preservation (U31). The other anaphor forms after a
+/// created token keep their reading (`LastCreated`, as at base): the pass only
+/// touches "each of them". Synthetic text.
+#[test]
+fn other_anaphor_forms_keep_their_reading_after_a_created_token() {
+    for text in [
+        "Create two 1/1 white Soldier creature tokens. Exile the top two cards of your library. Put a study counter on them.",
+        "Create a 1/1 white Soldier creature token. Exile the top two cards of your library. Put a study counter on it.",
+        "Create a 1/1 white Soldier creature token. Exile the top two cards of your library. Put a study counter on that token.",
+        "Create two 1/1 white Soldier creature tokens. Put a +1/+1 counter on them.",
+    ] {
+        assert_eq!(
+            each_of_them_rider_target(text, &["Sorcery"], EachOfThemParse::Clean),
+            TargetFilter::LastCreated,
+            "{text:?}"
+        );
+    }
 }
 
 /// Definite "that card perpetually gains ..." back-references the parent

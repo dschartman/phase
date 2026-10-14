@@ -247,8 +247,8 @@ pub(crate) fn parse_word_bounded<'a>(
 
 /// CR 608.2c: the distributive plural anaphor "each of them" (lowercase input),
 /// word-bounded so "each of themselves" is not this phrase. The single
-/// recognizer for `parse_target`'s plural-anaphor arm and the counter path's
-/// created-token binding (`counter_anaphor_created_token_binding`).
+/// recognizer for `parse_target`'s plural-anaphor arm and the whole-ability
+/// created-token pass (`oracle::bind_each_of_them_to_sole_created_tokens`).
 pub(crate) fn parse_each_of_them(input: &str) -> super::oracle_nom::error::OracleResult<'_, ()> {
     preceded(tag::<_, _, OracleError<'_>>("each of "), |i| {
         parse_word_bounded(i, "them")
@@ -1908,9 +1908,9 @@ pub fn parse_target_with_syntax<'a>(
     // for a typed trigger subject. Centralising the binding here means every
     // sibling effect parser (destroy, exile, bounce, tap, etc.) benefits
     // automatically instead of each site adding its own special case. A word-
-    // boundary guard via `parse_word_bounded` excludes "themselves". Consumers
-    // with chain context (the counter path) may rebind the anaphor to created
-    // tokens; `parse_target` itself stays `ParentTarget`.
+    // boundary guard via `parse_word_bounded` excludes "themselves". Only the
+    // whole-ability pass (`oracle::bind_each_of_them_to_sole_created_tokens`)
+    // rebinds it to created tokens; `parse_target` itself stays `ParentTarget`.
     if let Some((_, rest)) = nom_on_lower(text, &lower, parse_each_of_them) {
         return (TargetFilter::ParentTarget, rest, syntax);
     }

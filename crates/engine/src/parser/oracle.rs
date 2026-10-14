@@ -9513,6 +9513,9 @@ fn parse_oracle_pipeline(
     // CR 608.2c + CR 614.1a + CR 614.6 + CR 615.5: settle every deferred guard verdict.
     resolve_unlowered_guards(&mut parsed);
     demote_unreached_granter_references(&mut parsed);
+    // CR 608.2c: needs the printed text, the final definition and the swallow
+    // audit together, so it runs last.
+    bind_each_of_them_to_sole_created_tokens(&mut parsed);
     // The report-only stage clone is settled by the same pass, so no tree this function
     // hands out carries a live mark.
     if let Some(raw) = raw_lowered.as_mut() {
@@ -9669,6 +9672,51 @@ fn demote_unsupported_composite_counter_choice_costs(parsed: &mut ParsedAbilitie
 /// positions it misses.
 fn demote_unreached_granter_references(parsed: &mut ParsedAbilities) {
     demote_granter_references(parsed, granter_reference_unreached);
+}
+
+/// CR 608.2c + CR 113.3a + CR 602.1: turn on the created-token reading of "each
+/// of them" for a finished spell or activated ability whose whole effect is a
+/// plural creation and its counter rider
+/// (`counter::bind_each_of_them_rider_to_created_tokens`).
+///
+/// Reads the printed `description` as a semantic input because the instruction
+/// parsers drop text; the sibling is `deliver_coordinated_graveyard_permission_in_ability`,
+/// which rebuilds a binding only when `coordinated_permission_sentence_ends_at_anchor`
+/// proves from the description that the lowering dropped no gate. A card on which
+/// the swallow audit found unrepresented text is left as parsed. The audit is
+/// card-wide, so unrepresented text on any line of the card, not only the
+/// ability's own, keeps every ability on it at the base reading.
+fn bind_each_of_them_to_sole_created_tokens(parsed: &mut ParsedAbilities) {
+    if parsed
+        .parse_warnings
+        .iter()
+        .any(|d| matches!(d, OracleDiagnostic::SwallowedClause { .. }))
+    {
+        return;
+    }
+    for def in &mut parsed.abilities {
+        if let Some(effect_text) = printed_effect_text(def) {
+            super::oracle_effect::counter::bind_each_of_them_rider_to_created_tokens(
+                def,
+                &effect_text,
+            );
+        }
+    }
+}
+
+/// The lowercase effect text of a spell or activated ability, recovered from its
+/// printed `description` without reminder text; `None` for every other kind and
+/// for a definition with no printed description (a modal mode, a trigger body).
+fn printed_effect_text(def: &AbilityDefinition) -> Option<String> {
+    let printed = strip_reminder_text(def.description.as_deref()?);
+    let effect = match def.kind {
+        // CR 602.1: "[Cost]: [Effect.] [Activation instructions (if any).]"
+        AbilityKind::Activated => printed[find_top_level_colon(&printed)? + 1..].to_string(),
+        // CR 207.2c: an ability word has no rules meaning.
+        AbilityKind::Spell => strip_ability_word(&printed).unwrap_or(printed),
+        AbilityKind::Database | AbilityKind::BeginGame | AbilityKind::Mulligan => return None,
+    };
+    Some(effect.trim().to_lowercase())
 }
 
 /// CR 702.122c + CR 400.7: a quantity over a crew-history filter ("for each

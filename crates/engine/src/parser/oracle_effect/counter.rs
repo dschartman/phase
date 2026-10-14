@@ -7,9 +7,10 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    ChosenCounterCountCondition, Comparator, CounterMoveSelection, CounterTransferMode,
-    DoublePTMode, DoubleTarget, Effect, EventCounterReproductionCount, FilterProp, MultiTargetSpec,
-    ObjectScope, QuantityExpr, QuantityRef, TargetFilter,
+    AbilityDefinition, ChosenCounterCountCondition, Comparator, CounterMoveSelection,
+    CounterTransferMode, DoublePTMode, DoubleTarget, Effect, EventCounterReproductionCount,
+    FilterProp, MultiTargetSpec, ObjectScope, QuantityExpr, QuantityRef, SiblingCondition,
+    SubAbilityLink, TargetFilter, TargetReadOrigin,
 };
 use crate::types::counter::{parse_counter_type, CounterType};
 use crate::types::mana::ManaColor;
@@ -23,7 +24,7 @@ use super::super::oracle_target::{
 use super::super::oracle_util::{parse_count_expr, parse_number};
 use super::lower::{
     parse_bounded_target_cardinality, parse_for_each_multiplier_prefix,
-    strip_optional_target_prefix,
+    parse_where_x_quantity_expression, strip_optional_target_prefix,
 };
 use super::{resolve_it_pronoun, ParseContext};
 #[cfg(debug_assertions)]
@@ -45,31 +46,49 @@ fn is_self_ref(text: &str) -> bool {
 /// through the same resolver so ETB-self triggers like "put X counters on
 /// him" bind to `SelfRef` when the trigger subject is the source permanent.
 fn is_it_pronoun(text: &str) -> bool {
-    nom_on_lower(text, text, parse_object_pronoun_anaphor).is_some()
+    nom_on_lower(text, text, |i| {
+        value(
+            (),
+            alt((
+                // Bare object pronoun as the whole token or immediately followed
+                // by a space, routed through the shared recipient-pronoun
+                // combinator (single authority for the it/them/him/her set).
+                terminated(
+                    nom_primitives::parse_object_recipient_pronoun,
+                    alt((eof, peek(tag(" ")))),
+                ),
+                // Reflexive "*self" forms — a distinct set, matched here directly.
+                tag("itself"),
+                tag("himself"),
+                tag("herself"),
+                tag("themselves"),
+            )),
+        )
+        .parse(i)
+    })
+    .is_some()
 }
 
-/// Nom recognizer behind [`is_it_pronoun`] (lowercase input).
-fn parse_object_pronoun_anaphor(input: &str) -> OracleResult<'_, ()> {
-    value(
-        (),
-        alt((
-            // Bare object pronoun as the whole token or immediately followed
-            // by a space, routed through the shared recipient-pronoun
-            // combinator (single authority for the it/them/him/her set).
-            terminated(
-                nom_primitives::parse_object_recipient_pronoun,
-                alt((eof, peek(tag(" ")))),
-            ),
-            // Reflexive "*self" forms — a distinct set, matched here directly.
-            tag("itself"),
-            tag("himself"),
-            tag("herself"),
-            tag("themselves"),
-        )),
-    )
-    .parse(input)
-}
-
+/// CR 608.2c + CR 111.10 + CR 122.1: a same-chain counter anaphor placed AFTER a
+/// token-creating clause binds to that just-created token
+/// (`TargetFilter::LastCreated`) — the anaphor's most-recent object referent —
+/// rather than the ability source (`SelfRef`) or an unbound parent target.
+/// Recognizes three anaphor forms: the object-pronoun class (`it`/`them`/…, via
+/// [`is_it_pronoun`]), the demonstratives `that creature`/`that token`/`that
+/// permanent`, and the definite back-references `the token`/`the permanent`.
+/// `the creature` is deliberately EXCLUDED: it legitimately binds a chosen
+/// target slot (Longstalk Brawl's "the creature you control" →
+/// `ParentTargetSlot`) and is genuinely ambiguous.
+///
+/// Returns `Some(LastCreated)` only when the chain's most-recent referent is a
+/// created token (`ctx.token_created_in_chain`) AND, for the demonstrative /
+/// definite forms, no non-self trigger subject re-anchors the reference — Pip-Boy
+/// 3000's "Whenever equipped creature attacks … put a +1/+1 counter on that
+/// creature" keeps its `resolve_that_creature_in_trigger` triggering-source
+/// binding. That subject gate is intentionally SKIPPED for the object-pronoun
+/// form so this helper reproduces the legacy ungated bare-"it" binding exactly,
+/// making the it-branch refactor provably behavior-preserving. `None` ⇒ the
+/// caller applies its own default (source / parent / typed target).
 /// The demonstrative/definite half of the chain-created anaphor, WITHOUT the
 /// bare object pronoun.
 ///
@@ -91,124 +110,305 @@ pub(super) fn chain_created_demonstrative_binding(
     // non-self trigger subject re-anchors the reference to the triggering object
     // (Pip-Boy 3000), and only a chain that actually produced something can be
     // named at all.
-    (ctx.token_created_in_chain && subject_allows_chain_token(ctx))
-        .then_some(TargetFilter::LastCreated)
-}
-
-/// A demonstrative/definite/distributive anaphor under a non-self, non-`Any`
-/// trigger subject refers to that triggering object, not the created token.
-/// The single subject gate for every gated chain-created anaphor form.
-fn subject_allows_chain_token(ctx: &ParseContext) -> bool {
-    matches!(
+    let subject_allows_token = matches!(
         ctx.subject,
         None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
-    )
+    );
+    (ctx.token_created_in_chain && subject_allows_token).then_some(TargetFilter::LastCreated)
 }
 
 /// CR 608.2c: the demonstrative and definite back-reference forms.
 /// `the creature` is deliberately EXCLUDED — it legitimately binds a chosen
 /// target slot (Longstalk Brawl) and is genuinely ambiguous.
 fn anaphor_is_chain_created_demonstrative(anaphor_lower: &str) -> bool {
-    nom_on_lower(
-        anaphor_lower,
-        anaphor_lower,
-        parse_chain_created_demonstrative,
-    )
+    nom_on_lower(anaphor_lower, anaphor_lower, |i| {
+        value(
+            (),
+            alt((
+                tag("that creature"),
+                tag("that token"),
+                tag("that permanent"),
+                tag("the token"),
+                tag("the permanent"),
+            )),
+        )
+        .parse(i)
+    })
     .is_some()
 }
 
-/// Nom recognizer behind [`anaphor_is_chain_created_demonstrative`] (lowercase
-/// input).
-fn parse_chain_created_demonstrative(input: &str) -> OracleResult<'_, ()> {
+pub(super) fn counter_anaphor_created_token_binding(
+    anaphor_lower: &str,
+    ctx: &ParseContext,
+) -> Option<TargetFilter> {
+    let it_pronoun = is_it_pronoun(anaphor_lower);
+    let demonstrative = anaphor_is_chain_created_demonstrative(anaphor_lower);
+    if !it_pronoun && !demonstrative {
+        return None;
+    }
+    // A demonstrative/definite anaphor under a non-self, non-`Any` trigger subject
+    // refers to that triggering object, not the created token — the subject gate
+    // preserves that legacy binding. The bare object pronoun has no such
+    // re-anchor, so its gate is only the token flag.
+    let subject_allows_token = matches!(
+        ctx.subject,
+        None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
+    );
+    if ctx.token_created_in_chain && (it_pronoun || subject_allows_token) {
+        Some(TargetFilter::LastCreated)
+    } else {
+        None
+    }
+}
+
+/// CR 608.2c + CR 111.1 + CR 122.1: turn on the created-token reading of "each
+/// of them" in the one shape where those tokens are the only possible
+/// antecedent: the ability's whole effect is a creation of a fixed number of
+/// tokens, two or more, then a sentence that opens with "Put <counters> on each
+/// of them" (and may continue only with "and you gain N life"); a variable count
+/// keeps the base reading.
+///
+/// Deliberately narrow. Called once per finished spell or activated ability by
+/// `oracle::bind_each_of_them_to_sole_created_tokens`, after every line-level
+/// transform, with the ability's printed effect text: the instruction parsers
+/// drop text, so the verdict reads the printed sentences and the final
+/// definition together, like `coordinated_permission_sentence_ends_at_anchor`.
+/// Anything it cannot prove keeps the parse's base reading (`ParentTarget`).
+pub(crate) fn bind_each_of_them_rider_to_created_tokens(
+    def: &mut AbilityDefinition,
+    effect_text: &str,
+) {
+    if !whole_ability_is_creation_then_each_of_them_rider(def, effect_text) {
+        return;
+    }
+    if let Some(rider) = def.sub_ability.as_deref_mut() {
+        if let Effect::PutCounter { target, .. } = &mut *rider.effect {
+            *target = TargetFilter::LastCreated;
+        }
+    }
+}
+
+fn whole_ability_is_creation_then_each_of_them_rider(
+    def: &AbilityDefinition,
+    effect_text: &str,
+) -> bool {
+    let Some(rider) = def.sub_ability.as_deref() else {
+        return false;
+    };
+    effect_text_is_creation_then_each_of_them_rider(effect_text)
+        && creates_a_fixed_plural_count_of_tokens(&def.effect)
+        && instruction_is_unconditional(def)
+        // CR 608.2c: the rider opens the next sentence.
+        && rider.sub_link == SubAbilityLink::SequentialSibling
+        && matches!(
+            &*rider.effect,
+            Effect::PutCounter {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        )
+        && instruction_is_unconditional(rider)
+        // The only continuation the rider frame admits is the life gain; the
+        // definition must agree: no further node, or exactly that one.
+        && rider
+            .sub_ability
+            .as_deref()
+            .is_none_or(continuation_is_the_printed_life_gain)
+}
+
+/// CR 608.2c: the printed effect is exactly two sentences, a whole creation and
+/// a whole counter rider on "each of them", with no conditional guard and no
+/// target anywhere in it. `effect` is lowercase.
+fn effect_text_is_creation_then_each_of_them_rider(effect: &str) -> bool {
+    let sentences = nom_primitives::split_sentence_units(effect);
+    let [creation, rider] = sentences.as_slice() else {
+        return false;
+    };
+    creation_sentence(sentence_body(creation)).is_ok()
+        && rider_sentence(sentence_body(rider)).is_ok()
+        // CR 608.2c: no conditional guard anywhere, typed or not, through the
+        // parser's single leading-guard prefix authority, tried at every word
+        // boundary.
+        && nom_primitives::scan_at_word_boundaries(effect, conditional_guard_head).is_none()
+        // CR 115.10a: a target is identified by the word "target"; this refuses
+        // any word beginning "target".
+        && !nom_primitives::scan_contains(effect, "target")
+}
+
+/// A sentence unit without its surrounding whitespace and terminal period.
+fn sentence_body(unit: &str) -> &str {
+    let unit = unit.trim();
+    unit.strip_suffix('.').unwrap_or(unit) // allow-noncombinator: terminal sentence period cleanup on a unit split_sentence_units already produced, not dispatch.
+}
+
+/// CR 111.1: "create <count and description> token(s)", ending at the first
+/// token noun or followed only by a "where X is" binder.
+fn creation_sentence(input: &str) -> OracleResult<'_, ()> {
+    let (description, _) = tag::<_, _, OracleError<'_>>("create ").parse(input)?;
+    let (_, _, after_noun) = nom_primitives::scan_preceded(description, |i| {
+        alt((tag::<_, _, OracleError<'_>>("tokens"), tag("token"))).parse(i)
+    })
+    .ok_or_else(|| oracle_err(description))?;
+    all_consuming(alt((
+        value((), eof::<_, OracleError<'_>>),
+        value((), preceded(tag(", where x is "), where_x_binder)),
+    )))
+    .parse(after_noun)
+}
+
+/// CR 122.1: "put <count> <kind> counter(s) on each of them", consumed end to
+/// end, optionally continued by "and you gain <number or X> life" and that
+/// sentence's "where X is" binder.
+fn rider_sentence(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
-        alt((
-            tag("that creature"),
-            tag("that token"),
-            tag("that permanent"),
-            tag("the token"),
-            tag("the permanent"),
+        all_consuming((
+            tag::<_, _, OracleError<'_>>("put "),
+            alt((
+                nom_primitives::parse_article,
+                value((), terminated(nom_primitives::parse_number_or_x, tag(" "))),
+            )),
+            nom_primitives::parse_counter_type_typed,
+            alt((tag(" counters"), tag(" counter"))),
+            tag(" on "),
+            parse_each_of_them,
+            opt((
+                tag(" and you gain "),
+                nom_primitives::parse_number_or_x,
+                tag(" life"),
+                opt(preceded(tag(", where x is "), where_x_binder)),
+            )),
         )),
     )
     .parse(input)
 }
 
-/// The anaphor forms that can name a chain-created token set, classified so the
-/// binding's gate is an exhaustive `match` rather than a set of flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChainCreatedAnaphor {
-    /// `it`/`them`/`him`/`her` and their reflexives ([`is_it_pronoun`]).
-    ObjectPronoun,
-    /// `that creature`/`that token`/`that permanent`/`the token`/`the permanent`
-    /// ([`anaphor_is_chain_created_demonstrative`]).
-    Demonstrative,
-    /// The distributive plural `each of them` ([`parse_each_of_them`]).
-    DistributivePlural,
+/// CR 608.2c: a conditional guard head ("if", "then if", "then, if", "during
+/// any turn", "during a turn"), recognized by the parser's leading-guard prefix
+/// authority.
+fn conditional_guard_head(input: &str) -> OracleResult<'_, ()> {
+    super::conditions::parse_leading_conditional_prefix(input)
+        .map(|rest| (rest, ()))
+        .ok_or_else(|| oracle_err(input))
 }
 
-/// Classify a counter-recipient anaphor, in the order object pronoun,
-/// demonstrative, distributive plural. `None` ⇒ not a chain-created anaphor.
-fn classify_chain_created_anaphor(anaphor_lower: &str) -> Option<ChainCreatedAnaphor> {
-    alt((
-        value(
-            ChainCreatedAnaphor::ObjectPronoun,
-            parse_object_pronoun_anaphor,
-        ),
-        value(
-            ChainCreatedAnaphor::Demonstrative,
-            parse_chain_created_demonstrative,
-        ),
-        value(ChainCreatedAnaphor::DistributivePlural, parse_each_of_them),
-    ))
-    .parse(anaphor_lower)
-    .ok()
-    .map(|(_, anaphor)| anaphor)
+/// CR 107.3c: a "where X is" binder must be one quantity the where-X authority
+/// reads whole; trailing words fail.
+fn where_x_binder(input: &str) -> OracleResult<'_, ()> {
+    parse_where_x_quantity_expression(input)
+        .map(|_| ("", ()))
+        .ok_or_else(|| oracle_err(input))
 }
 
-/// CR 608.2c + CR 111.1 + CR 122.1: a same-chain counter anaphor placed AFTER a
-/// token-creating clause binds to that just-created token
-/// (`TargetFilter::LastCreated`) — the anaphor's most-recent object referent —
-/// rather than the ability source (`SelfRef`) or an unbound parent target.
-/// Recognizes four anaphor forms: the object-pronoun class (`it`/`them`/…, via
-/// [`is_it_pronoun`]), the demonstratives `that creature`/`that token`/`that
-/// permanent`, the definite back-references `the token`/`the permanent`, and the
-/// distributive plural `each of them`. `the creature` is deliberately EXCLUDED:
-/// it legitimately binds a chosen target slot (Longstalk Brawl's "the creature
-/// you control" → `ParentTargetSlot`) and is genuinely ambiguous.
-///
-/// CR 608.2c: "each of them" distributes over the same created-token set as
-/// "them" (Snarl Song, Assemble the Entmoot). It takes the subject gate because
-/// a plural anaphor under a typed batch trigger subject names the batch
-/// (Vrestin, #5949).
-///
-/// Returns `Some(LastCreated)` only when the chain's most-recent referent is a
-/// created token (`ctx.token_created_in_chain`) AND, for the demonstrative /
-/// definite / distributive forms, no non-self trigger subject re-anchors the
-/// reference — Pip-Boy 3000's "Whenever equipped creature attacks … put a +1/+1
-/// counter on that creature" keeps its `resolve_that_creature_in_trigger`
-/// triggering-source binding. That subject gate is intentionally SKIPPED for the
-/// object-pronoun form so this helper reproduces the legacy ungated bare-"it"
-/// binding exactly, making the it-branch refactor provably behavior-preserving.
-/// `None` ⇒ the caller applies its own default (source / parent / typed target).
-pub(super) fn counter_anaphor_created_token_binding(
-    anaphor_lower: &str,
-    ctx: &ParseContext,
-) -> Option<TargetFilter> {
-    let anaphor = classify_chain_created_anaphor(anaphor_lower)?;
-    let binds = match anaphor {
-        // The bare object pronoun has no trigger-subject re-anchor, so its gate is
-        // only the token flag.
-        ChainCreatedAnaphor::ObjectPronoun => ctx.token_created_in_chain,
-        // A demonstrative/definite anaphor under a non-self, non-`Any` trigger
-        // subject refers to that triggering object, not the created token; the
-        // subject gate preserves that legacy binding. No printed card has a typed
-        // batch subject plus an in-chain token creator before "each of them"; the
-        // gate is the conservative reading for the plural, consistent with #5949.
-        ChainCreatedAnaphor::Demonstrative | ChainCreatedAnaphor::DistributivePlural => {
-            ctx.token_created_in_chain && subject_allows_chain_token(ctx)
-        }
-    };
-    binds.then_some(TargetFilter::LastCreated)
+/// CR 111.1: a creation of a fixed number of tokens, two or more, made by the
+/// ability's controller; a variable count keeps the base reading.
+fn creates_a_fixed_plural_count_of_tokens(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            ..
+        } if *value >= 2
+    )
+}
+
+/// CR 608.2c: every field that gates, repeats, scopes, chooses or redirects an
+/// instruction is empty; a field added to `AbilityDefinition` later is a
+/// compile error here, so its author decides.
+fn instruction_is_unconditional(def: &AbilityDefinition) -> bool {
+    let AbilityDefinition {
+        condition,
+        optional,
+        optional_targeting,
+        optional_player,
+        optional_for,
+        unless_pay,
+        repeat_for,
+        player_scope,
+        starting_with,
+        else_ability,
+        modal,
+        mode_abilities,
+        multi_target,
+        distribute,
+        target_constraints,
+        duration,
+        declares_chosen_group,
+        reads_chosen_group,
+        reads_return_result,
+        repeat_until,
+        iteration_kind_binding,
+        target_chooser,
+        unlowered_guard,
+        sibling_condition,
+        target_reads,
+        kind: _,
+        effect: _,
+        cost: _,
+        sub_ability: _,
+        description: _,
+        target_prompt: _,
+        activation_restrictions: _,
+        activation_mana_payment_restriction: _,
+        activator_filter: _,
+        activation_zone: _,
+        ability_tag: _,
+        target_choice_timing: _,
+        min_x_value: _,
+        announced_x: _,
+        cant_be_copied: _,
+        illegal_targets_disposition: _,
+        cost_reduction: _,
+        forward_result: _,
+        target_selection_mode: _,
+        sub_link: _,
+        declares_return_result: _,
+        face_down_in_exile: _,
+        granting_object: _,
+    } = def;
+    condition.is_none()
+        && !optional
+        && !optional_targeting
+        && optional_player.is_none()
+        && optional_for.is_none()
+        && unless_pay.is_none()
+        && repeat_for.is_none()
+        && player_scope.is_none()
+        && starting_with.is_none()
+        && else_ability.is_none()
+        && modal.is_none()
+        && mode_abilities.is_empty()
+        && multi_target.is_none()
+        && distribute.is_none()
+        && target_constraints.is_empty()
+        && duration.is_none()
+        && declares_chosen_group.is_none()
+        && reads_chosen_group.is_none()
+        && reads_return_result.is_none()
+        && repeat_until.is_none()
+        && iteration_kind_binding.is_none()
+        && target_chooser.is_none()
+        && unlowered_guard.is_none()
+        && *sibling_condition == SiblingCondition::Dependent
+        && TargetReadOrigin::is_own(target_reads)
+}
+
+/// CR 608.2c: the one instruction the rider's sentence may add after the
+/// anaphor is the life gain the text frame read; text after the anaphor cannot
+/// be its antecedent.
+fn continuation_is_the_printed_life_gain(continuation: &AbilityDefinition) -> bool {
+    continuation.sub_link == SubAbilityLink::ContinuationStep
+        && continuation.sub_ability.is_none()
+        && matches!(
+            &*continuation.effect,
+            Effect::GainLife {
+                player: TargetFilter::Controller,
+                ..
+            }
+        )
+        && instruction_is_unconditional(continuation)
 }
 
 fn starts_with_deferred_dynamic_counter_placement(input: &str) -> bool {
@@ -371,16 +571,14 @@ fn resolve_counter_placement_target<'a>(
         let offset = text.len() - rem.len();
         return (TargetFilter::TriggeringSource, &text[offset..], None);
     }
-    // CR 608.2c + CR 111.1: a same-chain demonstrative/definite anaphor
+    // CR 608.2c + CR 111.10: a same-chain demonstrative/definite anaphor
     // ("that creature"/"that token"/"that permanent"/"the token"/"the permanent")
-    // or the distributive plural "each of them" placed after a token-creating
-    // clause binds to the just-created token(s), not the unbound parent target.
-    // Otterball Antics ("... put a +1/+1 counter on that creature"), Retrieve
-    // the Esper ("... put two +1/+1 counters on that token"), Grist ("... put a
-    // deathtouch counter on the token"), Snarl Song ("... put X +1/+1 counters
-    // on each of them"). Reached only after the non-self "that creature" trigger
-    // re-anchor above returns None, so Pip-Boy 3000's triggering-source binding
-    // is preserved.
+    // placed after a token-creating clause binds to the just-created token, not
+    // the unbound parent target. Otterball Antics ("... put a +1/+1 counter on
+    // that creature"), Retrieve the Esper ("... put two +1/+1 counters on that
+    // token"), Grist ("... put a deathtouch counter on the token"). Reached only
+    // after the non-self "that creature" trigger re-anchor above returns None, so
+    // Pip-Boy 3000's triggering-source binding is preserved.
     if let Some(bound) = counter_anaphor_created_token_binding(on_rest, ctx) {
         return (bound, parsed_remainder, None);
     }
@@ -4386,60 +4584,6 @@ mod tests {
             target,
             TargetFilter::LastCreated,
             "token in chain → bare it binds the created token"
-        );
-    }
-
-    /// CR 608.2c: the distributive plural anaphor "each of them" binds the
-    /// chain-created token set (`LastCreated`) only when a token creator is the
-    /// chain's most recent referent AND no typed trigger subject re-anchors the
-    /// plural to a batch (#5949). Rows: flag false → `ParentTarget`; flag true
-    /// with subject `None` / `SelfRef` → `LastCreated`; flag true with a typed
-    /// subject (Insect creature you control) → `ParentTarget`.
-    #[test]
-    fn put_on_each_of_them_binds_by_flag_and_subject() {
-        let text = "put a +1/+1 counter on each of them";
-        let target_with = |ctx: &mut ParseContext| {
-            let (effect, _, _) = try_parse_put_counter(text, text, ctx).expect("parse");
-            let Effect::PutCounter { target, .. } = effect else {
-                panic!("expected PutCounter, got {effect:?}");
-            };
-            target
-        };
-
-        assert_eq!(
-            target_with(&mut default_ctx()),
-            TargetFilter::ParentTarget,
-            "no token in chain → each of them stays ParentTarget"
-        );
-
-        let mut ctx = default_ctx();
-        ctx.token_created_in_chain = true;
-        assert_eq!(
-            target_with(&mut ctx),
-            TargetFilter::LastCreated,
-            "token in chain, no subject → each of them binds the created tokens"
-        );
-
-        let mut ctx = default_ctx();
-        ctx.token_created_in_chain = true;
-        ctx.subject = Some(TargetFilter::SelfRef);
-        assert_eq!(
-            target_with(&mut ctx),
-            TargetFilter::LastCreated,
-            "token in chain, self subject → each of them binds the created tokens"
-        );
-
-        let mut ctx = default_ctx();
-        ctx.token_created_in_chain = true;
-        ctx.subject = Some(TargetFilter::Typed(
-            TypedFilter::creature()
-                .subtype("Insect".to_string())
-                .controller(ControllerRef::You),
-        ));
-        assert_eq!(
-            target_with(&mut ctx),
-            TargetFilter::ParentTarget,
-            "typed batch subject → each of them names the batch, not the token"
         );
     }
 
