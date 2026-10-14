@@ -15994,6 +15994,25 @@ pub(super) fn counter_placement_is_mass(clause_lower: &str) -> bool {
         || nom_primitives::scan_contains(clause_lower, "on all ")
 }
 
+/// CR 122.1 + CR 608.2c: whether a parsed put-counter clause is a mass placement
+/// (`PutCounterAll`, a filter scan of the battlefield). An anaphoric recipient set
+/// is not: `ParentTarget` (the parent's chosen or batched objects; it has no slot
+/// for the scan to bind, #5949) and `LastCreated` (the tokens this chain just
+/// created) stay `PutCounter`, which also keeps a `LastCreated` reader visible to
+/// `relink_gated_token_referent_consumers` through `Effect::target_filter`.
+pub(super) fn counter_placement_routes_to_all(
+    clause_lower: &str,
+    target: &TargetFilter,
+    multi_target: Option<&MultiTargetSpec>,
+) -> bool {
+    counter_placement_is_mass(clause_lower)
+        && multi_target.is_none()
+        && !matches!(
+            target,
+            TargetFilter::ParentTarget | TargetFilter::LastCreated
+        )
+}
+
 /// CR 122.1 + CR 608.2c: In a distributive "put a number of +1/+1 counters on
 /// EACH ... equal to THAT CREATURE's <stat>" (Canopy Gargantuan), "that
 /// creature" is the per-iteration recipient — each object receives counters
@@ -16287,7 +16306,6 @@ pub(super) fn parse_zone_counter_ast<'a>(
         // between the counter noun and the target — e.g. Gruff Triplets:
         // "put a number of +1/+1 counters equal to its power on each creature you
         // control named ~".
-        let is_all = counter_placement_is_mass(lower);
         return match try_parse_put_counter(lower, text, ctx) {
             Some((
                 Effect::PutCounter {
@@ -16309,11 +16327,12 @@ pub(super) fn parse_zone_counter_ast<'a>(
                 // resolve a bare `ParentTarget` (it has no target slot to bind),
                 // so route the anaphor to `PutCounter`, whose
                 // `resolve_defined_or_targets` binds `ability.targets` (the
-                // chosen creatures). Typed mass placements ("on each creature you
-                // control") and tracked-set demonstratives still take the
-                // `PutCounterAll` path.
-                if is_all && multi_target.is_none() && !matches!(target, TargetFilter::ParentTarget)
-                {
+                // chosen creatures). A `LastCreated` subject ("each of them"
+                // after a token-creating clause) is likewise the bounded set of
+                // tokens this chain just created and stays `PutCounter`. Typed
+                // mass placements ("on each creature you control") and
+                // tracked-set demonstratives still take the `PutCounterAll` path.
+                if counter_placement_routes_to_all(lower, &target, multi_target.as_ref()) {
                     Some(Ok(ZoneCounterImperativeAst::PutCounterAll {
                         counter_type,
                         count: rebind_distributive_recipient_count(count, lower),

@@ -245,6 +245,17 @@ pub(crate) fn parse_word_bounded<'a>(
     }
 }
 
+/// CR 608.2c: the distributive plural anaphor "each of them" (lowercase input),
+/// word-bounded so "each of themselves" is not this phrase. The single
+/// recognizer for `parse_target`'s plural-anaphor arm and the counter path's
+/// created-token binding (`counter_anaphor_created_token_binding`).
+pub(crate) fn parse_each_of_them(input: &str) -> super::oracle_nom::error::OracleResult<'_, ()> {
+    preceded(tag::<_, _, OracleError<'_>>("each of "), |i| {
+        parse_word_bounded(i, "them")
+    })
+    .parse(input)
+}
+
 fn parse_card_or_cards_word(input: &str) -> super::oracle_nom::error::OracleResult<'_, ()> {
     parse_word_bounded(input, "cards").or_else(|_| parse_word_bounded(input, "card"))
 }
@@ -1897,11 +1908,10 @@ pub fn parse_target_with_syntax<'a>(
     // for a typed trigger subject. Centralising the binding here means every
     // sibling effect parser (destroy, exile, bounce, tap, etc.) benefits
     // automatically instead of each site adding its own special case. A word-
-    // boundary guard via `parse_word_bounded` excludes "themselves".
-    if let Some((_, rest)) = nom_on_lower(text, &lower, |input| {
-        let (i, ()) = value((), tag::<_, _, OracleError<'_>>("each of ")).parse(input)?;
-        parse_word_bounded(i, "them")
-    }) {
+    // boundary guard via `parse_word_bounded` excludes "themselves". Consumers
+    // with chain context (the counter path) may rebind the anaphor to created
+    // tokens; `parse_target` itself stays `ParentTarget`.
+    if let Some((_, rest)) = nom_on_lower(text, &lower, parse_each_of_them) {
         return (TargetFilter::ParentTarget, rest, syntax);
     }
 
@@ -14493,6 +14503,37 @@ mod tests {
             TargetFilter::ParentTarget,
             "\"each of themselves\" must not bind to ParentTarget via the \"each of them\" arm"
         );
+    }
+
+    /// CR 608.2c: the shared "each of them" recognizer accepts the anaphor at a
+    /// word boundary and leaves the remainder for the caller, and rejects other
+    /// "each of ..." recipients and the reflexive "themselves".
+    #[test]
+    fn parse_each_of_them_is_word_bounded() {
+        for (input, remainder) in [
+            ("each of them", ""),
+            ("each of them.", "."),
+            ("each of them and you gain x life", " and you gain x life"),
+            (
+                "each of them for every three cards",
+                " for every three cards",
+            ),
+        ] {
+            let (rest, ()) = parse_each_of_them(input)
+                .unwrap_or_else(|_| panic!("{input:?} must be recognized"));
+            assert_eq!(rest, remainder, "{input:?}");
+        }
+        for input in [
+            "each of themselves",
+            "each of those creatures",
+            "each of two target creatures",
+            "each of up to two target creatures",
+        ] {
+            assert!(
+                parse_each_of_them(input).is_err(),
+                "{input:?} is not the each-of-them anaphor"
+            );
+        }
     }
 
     /// CR 702.113: "card with awaken" is a parameterized-keyword presence

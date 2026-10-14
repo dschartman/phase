@@ -46412,6 +46412,278 @@ fn counter_anaphor_after_conjure_binds_last_created() {
     }
 }
 
+/// Every node of a within-clause chain (node, sub, else), depth-first.
+fn each_of_them_chain_nodes(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
+    let mut nodes = vec![def];
+    if let Some(sub) = def.sub_ability.as_deref() {
+        nodes.extend(each_of_them_chain_nodes(sub));
+    }
+    if let Some(other) = def.else_ability.as_deref() {
+        nodes.extend(each_of_them_chain_nodes(other));
+    }
+    nodes
+}
+
+/// Every execute chain a parsed card carries (spell/activated abilities and
+/// trigger bodies).
+fn each_of_them_card_chains(
+    text: &str,
+    name: &str,
+    keywords: &[&str],
+    types: &[&str],
+) -> Vec<AbilityDefinition> {
+    let keywords: Vec<String> = keywords.iter().map(|k| (*k).to_string()).collect();
+    let types: Vec<String> = types.iter().map(|t| (*t).to_string()).collect();
+    let parsed = parse_oracle_text(text, name, &keywords, &types, &[]);
+    parsed
+        .abilities
+        .into_iter()
+        .chain(
+            parsed
+                .triggers
+                .into_iter()
+                .filter_map(|t| t.execute.map(|b| *b)),
+        )
+        .collect()
+}
+
+/// The single chain of `chains` that contains a node matching `pred`.
+fn each_of_them_chain_with<'a>(
+    chains: &'a [AbilityDefinition],
+    pred: impl Fn(&Effect) -> bool,
+) -> Vec<&'a AbilityDefinition> {
+    chains
+        .iter()
+        .map(each_of_them_chain_nodes)
+        .find(|nodes| nodes.iter().any(|n| pred(&n.effect)))
+        .expect("a chain with the requested node")
+}
+
+fn each_of_them_assert_no_unimplemented(nodes: &[&AbilityDefinition], card: &str) {
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| matches!(*n.effect, Effect::Unimplemented { .. })),
+        "{card} must parse with zero Unimplemented"
+    );
+}
+
+/// CR 608.2c + CR 111.1: SHAPE (U3). After a token-creating clause, "put ...
+/// counters on each of them" binds the created token set: Snarl Song's and
+/// Assemble the Entmoot's verbatim chains carry `PutCounter { LastCreated }`,
+/// not `ParentTarget` (unbound at runtime) and not `PutCounterAll` (invisible
+/// to the gated-publisher relink pass).
+#[test]
+fn each_of_them_after_created_tokens_is_put_counter_last_created() {
+    const SNARL_SONG: &str = "Converge \u{2014} Create two 0/0 green and blue Fractal creature tokens. Put X +1/+1 counters on each of them and you gain X life, where X is the number of colors of mana spent to cast this spell.";
+    const ENTMOOT: &str = "Creatures you control have reach.\nSacrifice this enchantment: Create three tapped X/X green Treefolk creature tokens, where X is the amount of life you gained this turn. Put a reach counter on each of them.";
+    for (text, name, keywords, types, counter) in [
+        (
+            SNARL_SONG,
+            "Snarl Song",
+            &["Converge"][..],
+            &["Sorcery"][..],
+            CounterType::Plus1Plus1,
+        ),
+        (
+            ENTMOOT,
+            "Assemble the Entmoot",
+            &[][..],
+            &["Enchantment"][..],
+            CounterType::Keyword(crate::types::keywords::KeywordKind::Reach),
+        ),
+    ] {
+        let chains = each_of_them_card_chains(text, name, keywords, types);
+        let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::Token { .. }));
+        each_of_them_assert_no_unimplemented(&nodes, name);
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| matches!(*n.effect, Effect::PutCounterAll { .. })),
+            "{name}: the anaphoric placement must not be a battlefield scan"
+        );
+        let put = nodes
+            .iter()
+            .find_map(|n| match &*n.effect {
+                Effect::PutCounter {
+                    counter_type,
+                    target,
+                    ..
+                } if *counter_type == counter => Some(target.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: the counter clause is a PutCounter"));
+        assert_eq!(
+            put,
+            TargetFilter::LastCreated,
+            "{name}: each of them binds the just-created tokens"
+        );
+    }
+}
+
+/// CR 603.12 + CR 608.2c + CR 609.3: SHAPE (U4). In a gated publisher chain the
+/// "each of them" consumer reads `LastCreated` and is relinked onto the gated
+/// instruction's continuation path (`ContinuationStep`), so a declined gate
+/// cannot read a stale created-token ledger. `sub_link` is a parse-time
+/// property with no behavioural twin. Synthetic text, templated on the "you may
+/// pay {N}. If you do, create ..." pattern.
+#[test]
+fn gated_each_of_them_consumer_is_relinked() {
+    let text = "You may pay {2}. If you do, create two 1/1 white Soldier creature tokens named Cadet. Put a +1/+1 counter on each of them.";
+    let chains = each_of_them_card_chains(text, "Gated Creator", &[], &["Sorcery"]);
+    let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::Token { .. }));
+    each_of_them_assert_no_unimplemented(&nodes, "Gated Creator");
+    let put = nodes
+        .iter()
+        .find(|n| matches!(*n.effect, Effect::PutCounter { .. }))
+        .expect("the counter clause is a PutCounter");
+    let Effect::PutCounter { target, .. } = &*put.effect else {
+        unreachable!("matched above");
+    };
+    assert_eq!(*target, TargetFilter::LastCreated);
+    assert_eq!(put.sub_link, SubAbilityLink::ContinuationStep);
+}
+
+/// CR 122.1 + CR 608.2c: SHAPE (U5). The compound-split router in
+/// `try_parse_verb_and_target` agrees with the imperative router: with a token
+/// creator in the chain, "each of them" stays `PutCounter { LastCreated }`
+/// rather than promoting to `PutCounterAll`; without one it stays
+/// `PutCounter { ParentTarget }`. The remainder keeps the next conjunct.
+#[test]
+fn compound_split_routes_each_of_them_last_created_to_put_counter() {
+    let text = "put a +1/+1 counter on each of them and tap target creature";
+    let lower = text.to_lowercase();
+    for (flag, expected) in [
+        (true, TargetFilter::LastCreated),
+        (false, TargetFilter::ParentTarget),
+    ] {
+        let mut ctx = ParseContext {
+            token_created_in_chain: flag,
+            ..Default::default()
+        };
+        let (ast, rem) =
+            try_parse_verb_and_target(text, &lower, &mut ctx).expect("the counter verb parses");
+        assert_eq!(rem, " and tap target creature", "flag {flag}");
+        let TargetedImperativeAst::ZoneCounterProxy(inner) = ast else {
+            panic!("flag {flag}: expected ZoneCounterProxy, got {ast:?}");
+        };
+        match *inner {
+            ZoneCounterImperativeAst::PutCounter { target, .. } => {
+                assert_eq!(target, expected, "flag {flag}");
+            }
+            other => panic!("flag {flag}: expected PutCounter, got {other:?}"),
+        }
+    }
+}
+
+/// CR 608.2c: SHAPE preservation (S10 hostile). An untargeted "choose" between
+/// the token creator and "each of them" re-anchors the plural to the chosen
+/// creatures, so the created-token binding must not fire and the placement
+/// keeps `PutCounter { ParentTarget }`. Synthetic text (no printed witness).
+#[test]
+fn untargeted_choice_between_creator_and_each_of_them_stays_parent_target() {
+    let text = "Create a 1/1 white Soldier creature token. Choose up to two creatures you control. Put a +1/+1 counter on each of them.";
+    let chains = each_of_them_card_chains(text, "Choice After Creator", &[], &["Sorcery"]);
+    let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::Token { .. }));
+    let target = nodes
+        .iter()
+        .find_map(|n| match &*n.effect {
+            Effect::PutCounter { target, .. } => Some(target.clone()),
+            _ => None,
+        })
+        .expect("the counter clause is a PutCounter");
+    assert_eq!(target, TargetFilter::ParentTarget);
+}
+
+/// CR 608.2c + CR 122.6: SHAPE preservation (U6). A typed "each <type> you
+/// control" recipient after a token creator in the same chain is still a
+/// battlefield scan (`PutCounterAll { Typed }`), not the created set:
+/// Biomathematician and Oracle's Gift count Fractals that existed before.
+#[test]
+fn typed_mass_counter_after_created_token_stays_put_counter_all() {
+    const BIOMATHEMATICIAN: &str = "When this creature enters, create a 0/0 green and blue Fractal creature token. Put a +1/+1 counter on each Fractal you control.";
+    const ORACLES_GIFT: &str = "Create X 0/0 green and blue Fractal creature tokens, then put X +1/+1 counters on each Fractal you control.";
+    for (text, name, types) in [
+        (BIOMATHEMATICIAN, "Biomathematician", &["Creature"][..]),
+        (ORACLES_GIFT, "Oracle's Gift", &["Sorcery"][..]),
+    ] {
+        let chains = each_of_them_card_chains(text, name, &[], types);
+        let nodes = each_of_them_chain_with(
+            &chains,
+            |e| matches!(e, Effect::Token { name, .. } if name == "Fractal"),
+        );
+        each_of_them_assert_no_unimplemented(&nodes, name);
+        let filter = nodes
+            .iter()
+            .find_map(|n| match &*n.effect {
+                Effect::PutCounterAll {
+                    target: TargetFilter::Typed(filter),
+                    ..
+                } => Some(filter.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: typed mass placement stays PutCounterAll"));
+        assert_eq!(filter.get_subtype(), Some("Fractal"), "{name}");
+        assert_eq!(filter.controller, Some(ControllerRef::You), "{name}");
+    }
+}
+
+/// CR 608.2c: SHAPE preservation (U7). With no token creator in the chain,
+/// "each of them" keeps its tracked-set reading: Imbraham's study counter and
+/// Pako's fetch counter go on the cards exiled by the same instruction
+/// (`PutCounter { ParentTarget }`); the created-token binding must not fire.
+#[test]
+fn tracked_set_each_of_them_without_creator_stays_parent_target() {
+    const IMBRAHAM: &str = "Flying\n{X}{U}{U}, {T}: Exile the top X cards of your library and put a study counter on each of them. Then you may put a card you own in exile with a study counter on it into your hand.";
+    const PAKO: &str = "Partner with Haldan, Avid Arcanist\nHaste\nWhenever Pako attacks, exile the top card of each player's library and put a fetch counter on each of them. Put a +1/+1 counter on Pako for each noncreature card exiled this way.";
+    for (text, name, keywords, counter) in [
+        (
+            IMBRAHAM,
+            "Imbraham, Dean of Theory",
+            &["Flying"][..],
+            "study",
+        ),
+        (
+            PAKO,
+            "Pako, Arcane Retriever",
+            &["Haste", "Partner with"][..],
+            "fetch",
+        ),
+    ] {
+        let chains = each_of_them_card_chains(text, name, keywords, &["Creature"]);
+        let nodes = each_of_them_chain_with(&chains, |e| matches!(e, Effect::ExileTop { .. }));
+        let target = nodes
+            .iter()
+            .find_map(|n| match &*n.effect {
+                Effect::PutCounter {
+                    counter_type: CounterType::Generic(kind),
+                    target,
+                    ..
+                } if kind == counter => Some(target.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: the {counter} counter clause is a PutCounter"));
+        assert_eq!(
+            target,
+            TargetFilter::ParentTarget,
+            "{name}: each of them names the exiled cards"
+        );
+    }
+    let pako = each_of_them_card_chains(PAKO, "Pako, Arcane Retriever", &[], &["Creature"]);
+    let nodes = each_of_them_chain_with(&pako, |e| matches!(e, Effect::ExileTop { .. }));
+    assert!(
+        nodes.iter().any(|n| matches!(
+            &*n.effect,
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        )),
+        "Pako's trailing +1/+1 counter on Pako stays SelfRef (positive reach)"
+    );
+}
+
 /// Definite "that card perpetually gains ..." back-references the parent
 /// target ([`TargetFilter::ParentTarget`]). Bare "It ..." needs the surrounding
 /// chain context and is covered by `perpetual_anaphor_after_chosen_card_targets_parent_target`

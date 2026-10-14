@@ -21252,13 +21252,14 @@ fn try_parse_verb_and_target<'a>(
             // UTF-8 char boundary and `text[..text.len() - rem.len()]` is sound.
             let primary_clause = &text[..text.len() - rem.len()];
             let primary_clause_lower = primary_clause.to_ascii_lowercase();
-            // CR 608.2c: A `ParentTarget` placement subject ("each of them") is
-            // an anaphor to a bounded set of chosen objects, not a battlefield-
-            // wide type scan — mirror imperative.rs mass-classification authority.
-            let ast = if imperative::counter_placement_is_mass(&primary_clause_lower)
-                && multi_target.is_none()
-                && !matches!(target, TargetFilter::ParentTarget)
-            {
+            // CR 608.2c: A `ParentTarget` or `LastCreated` placement subject
+            // ("each of them") is an anaphor to a bounded set of objects, not a
+            // battlefield-wide type scan — the shared router predicate.
+            let ast = if imperative::counter_placement_routes_to_all(
+                &primary_clause_lower,
+                &target,
+                multi_target.as_ref(),
+            ) {
                 ZoneCounterImperativeAst::PutCounterAll {
                     counter_type,
                     count,
