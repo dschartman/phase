@@ -46448,10 +46448,10 @@ fn each_of_them_card_chains(
 }
 
 /// The single chain of `chains` that contains a node matching `pred`.
-fn each_of_them_chain_with<'a>(
-    chains: &'a [AbilityDefinition],
+fn each_of_them_chain_with(
+    chains: &[AbilityDefinition],
     pred: impl Fn(&Effect) -> bool,
-) -> Vec<&'a AbilityDefinition> {
+) -> Vec<&AbilityDefinition> {
     chains
         .iter()
         .map(each_of_them_chain_nodes)
