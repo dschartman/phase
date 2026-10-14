@@ -149,21 +149,20 @@ enum ChainCreatedAnaphor {
 /// Classify a counter-recipient anaphor, in the order object pronoun,
 /// demonstrative, distributive plural. `None` ⇒ not a chain-created anaphor.
 fn classify_chain_created_anaphor(anaphor_lower: &str) -> Option<ChainCreatedAnaphor> {
-    nom_on_lower(anaphor_lower, anaphor_lower, |i| {
-        alt((
-            value(
-                ChainCreatedAnaphor::ObjectPronoun,
-                parse_object_pronoun_anaphor,
-            ),
-            value(
-                ChainCreatedAnaphor::Demonstrative,
-                parse_chain_created_demonstrative,
-            ),
-            value(ChainCreatedAnaphor::DistributivePlural, parse_each_of_them),
-        ))
-        .parse(i)
-    })
-    .map(|(anaphor, _)| anaphor)
+    alt((
+        value(
+            ChainCreatedAnaphor::ObjectPronoun,
+            parse_object_pronoun_anaphor,
+        ),
+        value(
+            ChainCreatedAnaphor::Demonstrative,
+            parse_chain_created_demonstrative,
+        ),
+        value(ChainCreatedAnaphor::DistributivePlural, parse_each_of_them),
+    ))
+    .parse(anaphor_lower)
+    .ok()
+    .map(|(_, anaphor)| anaphor)
 }
 
 /// CR 608.2c + CR 111.1 + CR 122.1: a same-chain counter anaphor placed AFTER a

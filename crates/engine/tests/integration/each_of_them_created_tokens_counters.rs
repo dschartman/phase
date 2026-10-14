@@ -334,7 +334,7 @@ fn recursive_recruitment_rider_stays_unimplemented() {
         walk(ability, &mut |def| match &*def.effect {
             Effect::Token { name, .. } if name == "Cadet" => cadet_token = true,
             Effect::Unimplemented { name, .. } if name == "put_counter_tail" => {
-                rider_gap = def
+                rider_gap |= def
                     .effect
                     .unimplemented_description()
                     .is_some_and(|text| text.contains("for every three cards"));
