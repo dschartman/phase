@@ -3789,6 +3789,24 @@ fn parse_subject_application_for(
             );
             let binds_declared_target =
                 consumer == AnaphorConsumer::AffectedObject && names_declared_target;
+            // CR 608.2c + CR 608.2k: in a delayed body whose creating chain created a
+            // token, the demonstrative names the condition's subject only when its noun
+            // describes that subject. Otherwise the subject is not its antecedent and the
+            // created token is ("whenever you gain life this turn, that creature ...": a
+            // life gain introduces no creature; "when target creature an opponent controls
+            // dies this turn, that Spirit ...": the dying creature is not described as a
+            // Spirit). CR 111.1: "that token" describes only a subject described as a token.
+            if ctx.enclosing_chain_created_token
+                && !demonstrative_describes_subject(&filter, ctx.subject.as_ref())
+            {
+                return Some(SubjectApplication {
+                    affected: TargetFilter::LastCreated,
+                    target: Some(TargetFilter::LastCreated),
+                    multi_target: None,
+                    inherits_parent: false,
+                    is_optional: false,
+                });
+            }
             if ctx.subject.is_some() && !binds_declared_target {
                 return Some(SubjectApplication {
                     affected: filter,
@@ -4264,6 +4282,12 @@ fn resolve_they_pronoun(ctx: &mut ParseContext, consumer: AnaphorConsumer) -> Ta
             TargetFilter::TriggeringPlayer
         }
         Some(TargetFilter::Player) => TargetFilter::TriggeringPlayer,
+        // CR 608.2c + CR 608.2k: a player condition subject ("whenever you gain life this
+        // turn") introduces no object, so in a delayed body whose creating chain created
+        // tokens, "they" names those tokens, as a bare "it" does (`resolve_it_pronoun`).
+        Some(subject) if subject.is_player_scope() && ctx.enclosing_chain_created_token => {
+            TargetFilter::LastCreated
+        }
         // Object-type trigger subject: the trigger's SOURCE is "they" only when no
         // nearer antecedent exists.
         //
@@ -4287,6 +4311,38 @@ fn resolve_they_pronoun(ctx: &mut ParseContext, consumer: AnaphorConsumer) -> Ta
         _ if ctx.prior_player_declaration => TargetFilter::ParentTargetController,
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
+    }
+}
+
+/// CR 608.2c: does the noun of a "that <type>" demonstrative describe the trigger
+/// condition's subject? Every card type or subtype the noun names must appear in the
+/// subject's description, and a noun naming a token (CR 111.1) needs a subject
+/// described as a token: "that token" describes "a token you control", "that creature"
+/// describes "a creature you control", "that Spirit" does not describe "target creature
+/// an opponent controls". A player subject, or no subject, is described by no noun. A
+/// demonstrative whose noun names no type ("that one") is not this rule's to decide and
+/// keeps the subject.
+fn demonstrative_describes_subject(anaphor: &TargetFilter, subject: Option<&TargetFilter>) -> bool {
+    let TargetFilter::Typed(noun) = anaphor else {
+        return true;
+    };
+    let names_token =
+        |tf: &TypedFilter| tf.properties.iter().any(|p| matches!(p, FilterProp::Token));
+    if noun.type_filters.is_empty() && !names_token(noun) {
+        return true;
+    }
+    let describes = |tf: &TypedFilter| {
+        noun.type_filters
+            .iter()
+            .all(|t| tf.type_filters.contains(t))
+            && (!names_token(noun) || names_token(tf))
+    };
+    match subject {
+        Some(TargetFilter::Typed(tf)) => describes(tf),
+        Some(TargetFilter::And { filters }) => filters
+            .iter()
+            .any(|f| matches!(f, TargetFilter::Typed(tf) if describes(tf))),
+        _ => false,
     }
 }
 
@@ -4623,6 +4679,9 @@ pub(super) fn is_single_object_ref(filter: &TargetFilter) -> bool {
             | TargetFilter::TriggeringSource
             | TargetFilter::AttachedTo
             | TargetFilter::ParentTarget
+            // CR 608.2c: the chain's created token, one reference snapshotted when the
+            // delayed trigger is created (`delayed_trigger::resolve`).
+            | TargetFilter::LastCreated
     )
 }
 

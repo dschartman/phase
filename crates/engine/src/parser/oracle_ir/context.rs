@@ -648,6 +648,21 @@ pub(crate) struct ParseContext {
     /// `SelfRef` so non-token self-triggers ("Whenever ~ attacks, put a counter on
     /// it") are unaffected.
     pub token_created_in_chain: bool,
+    /// CR 608.2c: An earlier clause of the current chunk's chain created a token,
+    /// whether or not a later explicit typed target has since re-anchored "it"
+    /// (`token_created_in_chain` is the narrower most-recent-referent fact). Seeded
+    /// only in the chunk loop, from the same walk; read only by the delayed-body
+    /// builders to seed `enclosing_chain_created_token`.
+    pub token_created_earlier_in_chain: bool,
+    /// CR 608.2c + CR 608.2k: The chain that creates this nested body (a delayed
+    /// trigger's effect) created a token earlier. Separate from
+    /// `token_created_in_chain` because the body's own trigger condition may
+    /// introduce a nearer object antecedent: a demonstrative ("that token", "that
+    /// creature") names the created token unless its noun describes the condition's
+    /// subject, and a bare "it"/"they" names it only when the condition's subject is a
+    /// player (no object antecedent). Seeded by the delayed-body builders; carried
+    /// unchanged by the chunk loop; `false` on every standalone parse.
+    pub enclosing_chain_created_token: bool,
     /// CR 608.2c + CR 301.5 + CR 303.4: An EARLIER clause in this same effect
     /// chain turns the ability's own SOURCE into an attachable object — an Aura
     /// (CR 303.4: an enchantment with the Aura subtype, attached via its enchant
