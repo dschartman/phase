@@ -2706,7 +2706,8 @@ pub(super) fn chosen_player_anaphor_filter(scope: Option<&ControllerRef>) -> Opt
 /// CR 115.1 + CR 109.4 + CR 608.2c: The single player a subject phrase
 /// introduces as the antecedent of a "that player" / "they" in its own
 /// predicate. A declared player subject ("target player", "target opponent")
-/// names itself; an object subject names its controller. A subject declaring
+/// names itself; an object subject names its controller; an untargeted
+/// "defending player" subject names the defending player. A subject declaring
 /// several players ("any number of target opponents each …") names no single
 /// player: each member is the antecedent in turn, so no declared slot can stand
 /// for it.
@@ -2714,7 +2715,15 @@ pub(super) fn subject_player_antecedent(subject: &SubjectPhraseAst) -> Option<Co
     if subject.multi_target.is_some() {
         return None;
     }
-    let target = subject.target.as_ref()?;
+    let Some(target) = subject.target.as_ref() else {
+        // CR 508.5 + CR 608.2c: "defending player" declares no target; the
+        // subject grammar carries it in `affected`, and an attacking creature's
+        // ability reads it from combat. It is a single player, so it is the
+        // antecedent of "they" / "that player" in its own predicate
+        // (Witch-king, Bringer of Ruin; Crashing Boars).
+        return matches!(subject.affected, Some(TargetFilter::DefendingPlayer))
+            .then_some(ControllerRef::DefendingPlayer);
+    };
     if let Some(declared) = super::declared_player_controller_ref(target) {
         return Some(declared);
     }
