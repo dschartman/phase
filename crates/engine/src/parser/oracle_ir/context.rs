@@ -659,9 +659,11 @@ pub(crate) struct ParseContext {
     /// `token_created_in_chain` because the body's own trigger condition may
     /// introduce a nearer object antecedent: a demonstrative ("that token", "that
     /// creature") names the created token unless its noun describes the condition's
-    /// subject, and a bare "it"/"they" names it only when the condition's subject is a
-    /// player (no object antecedent). Seeded by the delayed-body builders; carried
-    /// unchanged by the chunk loop; `false` on every standalone parse.
+    /// subject; a bare "it" names it when the condition's subject is a player (no object
+    /// antecedent); a plural "they" names it unless the condition's subject is a player
+    /// it can name. Set even when a later typed target of the creating chain re-anchored
+    /// that chain's own "it". Seeded by the delayed-body builders; carried unchanged by the
+    /// chunk loop; `false` on every standalone parse.
     pub enclosing_chain_created_token: bool,
     /// CR 608.2c + CR 301.5 + CR 303.4: An EARLIER clause in this same effect
     /// chain turns the ability's own SOURCE into an attachable object — an Aura

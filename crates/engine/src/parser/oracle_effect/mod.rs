@@ -26816,8 +26816,9 @@ enum CreatedTokenAntecedent {
     /// No later clause declared an object referent: the token is the nearest antecedent,
     /// so a bare "it" names it.
     MostRecent,
-    /// A later explicit typed target re-anchored "it" to itself; a demonstrative whose
-    /// noun agrees with the token ("that token") still names the token.
+    /// A later explicit typed target re-anchored "it" in this chain to itself. The token
+    /// is still an antecedent of a delayed body this chain creates
+    /// (`ParseContext::enclosing_chain_created_token`).
     BehindLaterReferent,
 }
 
@@ -26879,7 +26880,7 @@ fn chain_created_token_antecedent(clauses: &[ClauseIr]) -> Option<CreatedTokenAn
         }
         if has_typed_target_widened(&prev.parsed.effect) {
             // A later explicit typed target re-anchors "it" to itself; the token stays
-            // nameable only by a noun it agrees with.
+            // behind it.
             behind_later_referent = true;
         }
         // This clause is being skipped; record whether it breaks the path. Its
