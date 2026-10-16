@@ -4634,7 +4634,11 @@ fn rewrite_populated_anaphor_in_def(def: &mut AbilityDefinition, token_is_attach
         return;
     }
 
-    rewrite_populated_anaphor_in_effect(&mut def.effect, token_is_attachable);
+    rewrite_populated_anaphor_in_effect(
+        &mut def.effect,
+        token_is_attachable,
+        PostTokenRebindScope::ChainFollowup,
+    );
     // CR 608.2c + CR 701.36a: recurse into sub_ability chains so anaphoric
     // rewrites apply to sibling followups (Fractal Harness PutCounter/Attach).
     if let Some(sub) = def.sub_ability.as_mut() {
@@ -4741,8 +4745,13 @@ pub(super) fn fold_token_it_has_grants_into_token_statics(def: &mut AbilityDefin
 
 /// Walk an effect, rewriting the populated-token anaphor at whichever level
 /// it appears. Recurses into `CreateDelayedTrigger.effect` so the "sacrifice
-/// it" pattern inside a delayed trigger also rewrites.
-fn rewrite_populated_anaphor_in_effect(effect: &mut Effect, token_is_attachable: bool) {
+/// it" pattern inside a delayed trigger also rewrites; `scope` says which
+/// fallback anaphors at this level stand in for the token.
+fn rewrite_populated_anaphor_in_effect(
+    effect: &mut Effect,
+    token_is_attachable: bool,
+    scope: PostTokenRebindScope,
+) {
     // Case 1: bare Unimplemented anaphor at the top level (e.g., "the token
     // created this way gains haste").
     if let Some(new_effect) = rewrite_token_created_this_way_unimplemented(effect, None) {
@@ -4753,8 +4762,31 @@ fn rewrite_populated_anaphor_in_effect(effect: &mut Effect, token_is_attachable:
     // Case 2: CreateDelayedTrigger whose inner ability references the token
     // via ParentTarget. Rewrite to LastCreated and recurse into the inner
     // effect for any nested anaphors.
-    if let Effect::CreateDelayedTrigger { effect: inner, .. } = effect {
-        rewrite_parent_target_to_last_created(&mut inner.effect, token_is_attachable);
+    if let Effect::CreateDelayedTrigger {
+        effect: inner,
+        condition,
+        ..
+    } = effect
+    {
+        // CR 603.7c + CR 608.2k: in an EVENT-delayed payload, `TriggeringSource` is
+        // the object whose event fires the trigger (the earthbent land that dies, the
+        // creature that dies this turn), bound when it fires. A reference to the created
+        // token is bound by the delayed-body builders at parse time
+        // (`ParseContext::enclosing_chain_created_token`) or left as a `ParentTarget`
+        // back-reference rebound below, so a `TriggeringSource` there is never the token.
+        // Only a PHASE-delayed payload's `TriggeringSource` is the enclosing trigger's
+        // subject standing in for the token (Flameshadow Conjuring's "Exile it at the
+        // beginning of the next end step").
+        let inner_scope = if delayed_condition_names_event_object(condition) {
+            PostTokenRebindScope::EventDelayedBody
+        } else {
+            PostTokenRebindScope::ChainFollowup
+        };
+        rewrite_parent_target_to_last_created_in_scope(
+            &mut inner.effect,
+            token_is_attachable,
+            inner_scope,
+        );
         // CR 603.7c + CR 608.2c (issue #4601): a PHASE-triggered token-copier
         // (Mishra, Eminent One — "At the beginning of combat on your turn,
         // create a token …, Sacrifice it at the beginning of the next end step")
@@ -4762,7 +4794,7 @@ fn rewrite_populated_anaphor_in_effect(effect: &mut Effect, token_is_attachable:
         // `SelfRef` (the source) rather than `ParentTarget`/`TriggeringSource`.
         // In this gated post-token scope the antecedent is the created token.
         rewrite_delayed_cleanup_self_ref_to_last_created(&mut inner.effect);
-        rewrite_populated_anaphor_in_effect(&mut inner.effect, token_is_attachable);
+        rewrite_populated_anaphor_in_effect(&mut inner.effect, token_is_attachable, inner_scope);
     }
 
     // Case 3: a bare "it gains/gets X" grant that parsed to a `GenericEffect`
@@ -4777,7 +4809,7 @@ fn rewrite_populated_anaphor_in_effect(effect: &mut Effect, token_is_attachable:
     // subject). After a token creator in the same chain, rewrite to LastCreated —
     // on the `attachment` slot when the created token is itself an Equipment/Aura
     // (U.S.Agent, John Walker: "Attach it to ~"), or the `target` slot otherwise.
-    rewrite_parent_target_to_last_created(effect, token_is_attachable);
+    rewrite_parent_target_to_last_created_in_scope(effect, token_is_attachable, scope);
 }
 
 /// If `effect` is `Unimplemented { description: "<anaphor> <verb-phrase>" }`,
@@ -5006,9 +5038,60 @@ pub(super) fn thread_chosen_damage_source_into_oneshot_effects(defs: &mut [Abili
     }
 }
 
+/// CR 608.2c: which fallback anaphors the post-token pass may rebind to the
+/// created token at one level of the effect tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostTokenRebindScope {
+    /// A same-chain followup or a phase-delayed payload: `ParentTarget`, `SelfRef`
+    /// and the enclosing trigger's `TriggeringSource` all stand in for the token.
+    ChainFollowup,
+    /// An event-delayed payload: `TriggeringSource` is the firing event's object
+    /// (CR 608.2k), never the token; only `ParentTarget`/`SelfRef` stand in for it.
+    EventDelayedBody,
+}
+
+/// CR 603.7: does the delayed trigger fire on an object's event, so that its
+/// payload's `TriggeringSource` is that object rather than the enclosing trigger's
+/// subject?
+fn delayed_condition_names_event_object(condition: &DelayedTriggerCondition) -> bool {
+    match condition {
+        DelayedTriggerCondition::AtNextPhase { .. }
+        | DelayedTriggerCondition::AtNextPhaseForPlayer { .. }
+        | DelayedTriggerCondition::AtBeginningOfAddedPhase { .. } => false,
+        DelayedTriggerCondition::WhenLeavesPlay { .. }
+        | DelayedTriggerCondition::WhenDies { .. }
+        | DelayedTriggerCondition::WhenLeavesPlayFiltered { .. }
+        | DelayedTriggerCondition::WhenEntersBattlefield { .. }
+        | DelayedTriggerCondition::WhenDiesOrExiled { .. }
+        | DelayedTriggerCondition::WheneverEvent { .. }
+        | DelayedTriggerCondition::WhenNextEvent { .. } => true,
+    }
+}
+
+/// Is `target` a fallback anaphor that stands in for the created token in `scope`?
+fn is_token_stand_in(target: &TargetFilter, scope: PostTokenRebindScope) -> bool {
+    match target {
+        TargetFilter::ParentTarget => true,
+        TargetFilter::TriggeringSource => scope == PostTokenRebindScope::ChainFollowup,
+        _ => false,
+    }
+}
+
 pub(super) fn rewrite_parent_target_to_last_created(
     effect: &mut Effect,
     token_is_attachable: bool,
+) {
+    rewrite_parent_target_to_last_created_in_scope(
+        effect,
+        token_is_attachable,
+        PostTokenRebindScope::ChainFollowup,
+    );
+}
+
+fn rewrite_parent_target_to_last_created_in_scope(
+    effect: &mut Effect,
+    token_is_attachable: bool,
+    scope: PostTokenRebindScope,
 ) {
     match effect {
         Effect::GenericEffect {
@@ -5025,28 +5108,18 @@ pub(super) fn rewrite_parent_target_to_last_created(
             // reference over the outer GenericEffect target.
             let mut rebound = false;
             for static_def in static_abilities {
-                if matches!(
-                    static_def.affected,
-                    Some(
-                        TargetFilter::ParentTarget
-                            | TargetFilter::SelfRef
-                            | TargetFilter::TriggeringSource
-                            | TargetFilter::LastCreated
-                    )
-                ) {
+                if static_def.affected.as_ref().is_some_and(|a| {
+                    matches!(a, TargetFilter::SelfRef | TargetFilter::LastCreated)
+                        || is_token_stand_in(a, scope)
+                }) {
                     static_def.affected = Some(TargetFilter::LastCreated);
                     rebound = true;
                 }
             }
-            if matches!(
-                target,
-                Some(
-                    TargetFilter::ParentTarget
-                        | TargetFilter::SelfRef
-                        | TargetFilter::TriggeringSource
-                        | TargetFilter::LastCreated
-                )
-            ) {
+            if target.as_ref().is_some_and(|t| {
+                matches!(t, TargetFilter::SelfRef | TargetFilter::LastCreated)
+                    || is_token_stand_in(t, scope)
+            }) {
                 *target = Some(TargetFilter::LastCreated);
                 rebound = true;
             } else if rebound && target.is_none() {
@@ -5061,21 +5134,15 @@ pub(super) fn rewrite_parent_target_to_last_created(
             target,
             selection: _,
         } => {
-            if token_is_attachable
-                && matches!(
-                    attachment,
-                    TargetFilter::ParentTarget | TargetFilter::TriggeringSource
-                )
-            {
+            if token_is_attachable && is_token_stand_in(attachment, scope) {
                 // CR 301.5 + CR 303.4: the just-created token is itself an
                 // Equipment/Aura, and the attachment slot is the anaphor in
                 // U.S.Agent's "Attach it to ~". Rebind that slot and leave the
                 // explicit host alone.
                 *attachment = TargetFilter::LastCreated;
-            } else if matches!(
-                target,
-                TargetFilter::SelfRef | TargetFilter::ParentTarget | TargetFilter::TriggeringSource
-            ) {
+            } else if matches!(target, TargetFilter::SelfRef)
+                || is_token_stand_in(target, scope)
+            {
                 // CR 608.2c + CR 301.5b: after a token creator, "attach this
                 // Equipment to it" may have resolved the host pronoun through
                 // the source-default `SelfRef` path before this gated
@@ -5098,7 +5165,9 @@ pub(super) fn rewrite_parent_target_to_last_created(
         // bottom of its owner's library at the beginning of the next end step")
         // lowers its bare-"it" to `ParentTarget`/`TriggeringSource` just like the
         // other move/cleanup forms — rebind to the created token.
-        | Effect::PutAtLibraryPosition { target, .. } => {
+        | Effect::PutAtLibraryPosition { target, .. }
+            if is_token_stand_in(target, scope) =>
+        {
             // CR 603.7c + CR 608.2c: inside an ETB-triggered token-copier (e.g.
             // Flameshadow Conjuring / Inalla: "create a token that's a copy of
             // that creature. … Exile it at the beginning of the next end step"),
@@ -5110,19 +5179,9 @@ pub(super) fn rewrite_parent_target_to_last_created(
             // is structurally absent from these arms, so it stays
             // `TriggeringSource` — the token is still a copy of the entering
             // creature.)
-            if matches!(
-                target,
-                TargetFilter::ParentTarget | TargetFilter::TriggeringSource
-            ) {
-                *target = TargetFilter::LastCreated;
-            }
+            *target = TargetFilter::LastCreated;
         }
-        Effect::ChangeZone { target, origin, .. }
-            if matches!(
-                target,
-                TargetFilter::ParentTarget | TargetFilter::TriggeringSource
-            ) =>
-        {
+        Effect::ChangeZone { target, origin, .. } if is_token_stand_in(target, scope) => {
             // CR 603.7c: In the gated post-token scope, singular "it"/"that
             // token" anaphors refer to the one just-created token and must
             // still be on the battlefield at cleanup — bind `LastCreated`.
