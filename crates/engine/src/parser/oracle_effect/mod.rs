@@ -548,6 +548,14 @@ pub(crate) fn resolve_it_pronoun(ctx: &mut ParseContext) -> TargetFilter {
         return target;
     }
     match &ctx.subject {
+        // CR 608.2c + CR 608.2k: in a delayed body, a player condition subject ("whenever
+        // you gain life this turn", "whenever you draw a card this turn") introduces no
+        // object, so the nearest object antecedent of a bare "it" is the token the creating
+        // chain made. A condition that does name an object keeps it: a cast spell (pinned
+        // above), a dying or attacking permanent (the typed subject below).
+        Some(subject) if subject.is_player_scope() && ctx.enclosing_chain_created_token => {
+            TargetFilter::LastCreated
+        }
         // CR 608.2c + CR 701.21a: `CostPaidObject` is the gated "If you do,"
         // Sacrifice-antecedent anchor (`if_you_do_object_anchor`'s
         // `Effect::Sacrifice` arm) — a resolution-time referent, not a
@@ -2114,8 +2122,11 @@ enum UnwindowedWhenever {
     PrintedLine,
 }
 
-fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
-    try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::Delayed)
+fn try_parse_whenever_this_turn(
+    tp: TextPair,
+    antecedents: &ParseContext,
+) -> Option<ParsedEffectClause> {
+    try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::Delayed, antecedents)
 }
 
 /// CR 603.4 + CR 608.2c: does this delayed body's intervening-if test the
@@ -2197,6 +2208,7 @@ fn condition_reads_the_event_subject(condition: &AbilityCondition) -> bool {
 fn try_parse_whenever_this_turn_from(
     tp: TextPair,
     unwindowed: UnwindowedWhenever,
+    antecedents: &ParseContext,
 ) -> Option<ParsedEffectClause> {
     // CR 603.7b: capture a leading stated duration as the delayed trigger's
     // EXPIRY (its own lifetime), not the enclosing clause's duration. This runs
@@ -2313,6 +2325,9 @@ fn try_parse_whenever_this_turn_from(
     // this selects a parsing mode, it does not implement a rule.)
     let mut inner_ctx = ParseContext {
         trigger_condition_scope: TriggerConditionScope::Delayed,
+        // CR 608.2c: the creating chain's token is an antecedent the delayed body can name.
+        enclosing_chain_created_token: antecedents.token_created_earlier_in_chain
+            || antecedents.enclosing_chain_created_token,
         ..ParseContext::default()
     };
     let mut trigger_def = parse_dealt_damage_this_way_dies_trigger(condition_text, &mut inner_ctx)
@@ -2739,7 +2754,10 @@ fn try_parse_enters_this_way_additional_counter(lower: &str) -> Option<Effect> {
 /// - "When you next cast a creature spell this turn, that creature enters with an additional +1/+1 counter on it."
 /// - "When you next cast a creature spell this turn, search your library for a creature card..."
 /// - "When you next cast a spell with {X} in its mana cost this turn, you draw a card and gain half X life, rounded down." (Brass Infiniscope)
-fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
+fn try_parse_when_next_event(
+    tp: TextPair,
+    antecedents: &ParseContext,
+) -> Option<ParsedEffectClause> {
     use crate::types::triggers::TriggerMode;
 
     // CR 603.7: the SAME one-shot next-cast delayed trigger is printed with two word
@@ -2794,7 +2812,16 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     // instead of the empty chain-tracked set in the `TargetFilter::ParentTarget`
     // arm of `effects::effect::register_transient_effect`. Mirrors the
     // `lift_parent_target_to_triggering_source` family in oracle_trigger.rs.
-    lift_generic_effect_parent_target_to_triggering_source_in_ability(&mut inner);
+    //
+    // CR 608.2c: when the chain creating this trigger created a token earlier, that
+    // token is the antecedent the demonstrative names ("create a 1/1 Spirit token. When
+    // you next cast a spell this turn, that token gains flying"), so the grant keeps its
+    // back-reference and the post-token pass binds it to the token. The lift would
+    // otherwise move it onto the cast spell, which the post-token pass keeps (in an
+    // event-delayed payload `TriggeringSource` is the firing event's object).
+    if !(antecedents.token_created_earlier_in_chain || antecedents.enclosing_chain_created_token) {
+        lift_generic_effect_parent_target_to_triggering_source_in_ability(&mut inner);
+    }
 
     if let Some((spell_filter, ability_filter)) =
         try_parse_when_next_spell_or_activate_disjunction(condition_fragment)
@@ -3131,10 +3158,11 @@ pub(crate) fn try_parse_temporal_delayed_trigger_ability(
 ) -> Option<AbilityIr> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
-    let clause = try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::PrintedLine)
-        .or_else(|| try_parse_when_next_event(tp))
-        .or_else(|| try_parse_copy_next_spell_when_cast(tp))
-        .or_else(|| try_parse_at_next_phase_delayed_trigger(text, kind, antecedents))?;
+    let clause =
+        try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::PrintedLine, antecedents)
+            .or_else(|| try_parse_when_next_event(tp, antecedents))
+            .or_else(|| try_parse_copy_next_spell_when_cast(tp))
+            .or_else(|| try_parse_at_next_phase_delayed_trigger(text, kind, antecedents))?;
     Some(AbilityIr {
         source_text: text.to_string(),
         body: EffectChainIr::single_clause(text, kind, clause, None, None, false),
@@ -4558,6 +4586,9 @@ fn try_parse_inline_delayed_trigger(
     // Throwaway (`ChosenColorQualifierScope` rule 1) — the parsed `inner` is
     // kept, `inner_ctx` is dropped.
     let mut inner_ctx = ctx.clone_throwaway();
+    // CR 608.2c: the creating chain's token is an antecedent the delayed body can name.
+    inner_ctx.enclosing_chain_created_token =
+        ctx.token_created_earlier_in_chain || ctx.enclosing_chain_created_token;
     inner_ctx.subject = match &condition {
         DelayedTriggerCondition::WhenDies { filter }
         | DelayedTriggerCondition::WhenLeavesPlayFiltered { filter }
@@ -11249,7 +11280,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     }
 
     // CR 603.7b: "Whenever X this turn, Y" — multi-fire delayed trigger creation.
-    if let Some(clause) = try_parse_whenever_this_turn(tp) {
+    if let Some(clause) = try_parse_whenever_this_turn(tp, ctx) {
         return clause;
     }
 
@@ -11262,7 +11293,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     }
 
     // CR 603.7: "When you next cast a [type] spell this turn, ..." — one-shot delayed trigger.
-    if let Some(clause) = try_parse_when_next_event(tp) {
+    if let Some(clause) = try_parse_when_next_event(tp, ctx) {
         return clause;
     }
 
@@ -26767,6 +26798,26 @@ fn chain_declared_object_target_clause(clauses: &[ClauseIr]) -> Option<(usize, &
 /// ("when you do" / "if you do") does NOT bail — see the in-body comment for
 /// why, and for the paired re-link that makes it safe.
 fn chain_prior_referent_is_created_token(clauses: &[ClauseIr]) -> bool {
+    chain_created_token_antecedent(clauses) == Some(CreatedTokenAntecedent::MostRecent)
+}
+
+/// CR 608.2c: where a token created by an earlier clause of the chain stands among the
+/// chain's object referents, as seen from the clause being parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreatedTokenAntecedent {
+    /// No later clause declared an object referent: the token is the nearest antecedent,
+    /// so a bare "it" names it.
+    MostRecent,
+    /// A later explicit typed target re-anchored "it" to itself; a demonstrative whose
+    /// noun agrees with the token ("that token") still names the token.
+    BehindLaterReferent,
+}
+
+/// The walk behind [`chain_prior_referent_is_created_token`]: the same gates (the
+/// conditional bail, the gated-publisher reach), except that an explicit typed target
+/// between the creator and the consumer moves the token behind it instead of hiding it.
+fn chain_created_token_antecedent(clauses: &[ClauseIr]) -> Option<CreatedTokenAntecedent> {
+    let mut behind_later_referent = false;
     // CR 608.2c: does an unbroken continuation path still run from the clause
     // under inspection forward to the consumer being parsed? This is the
     // parse-time PREDICTION of `lower::gated_instruction_reaches`, built from the
@@ -26793,7 +26844,7 @@ fn chain_prior_referent_is_created_token(clauses: &[ClauseIr]) -> bool {
             .as_ref()
             .is_some_and(|c| !c.has_when_you_do_marker() && !c.is_affirmative_reflexive_gate())
         {
-            return false;
+            return None;
         }
         let spine_reaches = prev
             .parsed
@@ -26811,11 +26862,17 @@ fn chain_prior_referent_is_created_token(clauses: &[ClauseIr]) -> bool {
             // which is what would leave a STALE bind behind. Any condition still
             // present at this point is an affirmative gate (the bail above took
             // every other value), so `is_none` is exactly "ungated".
-            return prev.condition.is_none() || (gated_publisher_reaches && spine_reaches);
+            let reaches = prev.condition.is_none() || (gated_publisher_reaches && spine_reaches);
+            return reaches.then_some(if behind_later_referent {
+                CreatedTokenAntecedent::BehindLaterReferent
+            } else {
+                CreatedTokenAntecedent::MostRecent
+            });
         }
         if has_typed_target_widened(&prev.parsed.effect) {
-            // A later explicit typed target re-anchors "it" to itself.
-            return false;
+            // A later explicit typed target re-anchors "it" to itself; the token stays
+            // nameable only by a noun it agrees with.
+            behind_later_referent = true;
         }
         // This clause is being skipped; record whether it breaks the path. Its
         // own link comes from the boundary printed BEFORE it — i.e. the boundary
@@ -26827,7 +26884,7 @@ fn chain_prior_referent_is_created_token(clauses: &[ClauseIr]) -> bool {
                 == SubAbilityLink::ContinuationStep;
         // Carrier / non-referent clause (e.g. "It gains haste") — keep scanning.
     }
-    false
+    None
 }
 
 /// CR 301.5 + CR 303.4: Do these continuous modifications give their subject a
@@ -43988,6 +44045,7 @@ fn parse_effect_chain_ir_body(
             TargetFilter::DeclaredPlayer { group } => Some(ControllerRef::DeclaredPlayer { group }),
             _ => None,
         });
+        let chain_created_token = chain_created_token_antecedent(builder.clauses());
         let mut chunk_ctx = ParseContext {
             subject: chunk_subject,
             // CR 608.2k: precedence for a bare object anaphor, nearest antecedent
@@ -44178,7 +44236,13 @@ fn parse_effect_chain_ir_body(
             // token created by an earlier clause when that token is the chain's
             // most-recent object referent (Esper Terra's "put up to three lore
             // counters on it"). Cleared by an intervening explicit typed target.
-            token_created_in_chain: chain_prior_referent_is_created_token(builder.clauses()),
+            token_created_in_chain: chain_created_token == Some(CreatedTokenAntecedent::MostRecent),
+            // CR 608.2c: any earlier created token, including one behind a later typed
+            // target; seeds the antecedent a delayed body built from this chunk can name.
+            token_created_earlier_in_chain: chain_created_token.is_some(),
+            // CR 608.2c: an enclosing chain's created token stays an antecedent of every
+            // chunk of a nested delayed body; carried unchanged.
+            enclosing_chain_created_token: ctx.enclosing_chain_created_token,
             prior_player_declaration: bare_they_player_declaration(builder.clauses()),
             chain_prior_object_set: chain_prior_object_set(builder.clauses()),
             declared_player_scope,
