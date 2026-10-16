@@ -92,6 +92,23 @@ const COPY_NEXT_CAST_SACRIFICE_THAT_TOKEN: &str = "Whenever a nontoken creature 
 const COPY_NEXT_CAST_SACRIFICE_IT: &str = "Whenever a nontoken creature you control enters, create a token that's a copy of that creature. When you next cast a spell this turn, sacrifice it.";
 const COPY_HASTE_NEXT_CAST_EXILE_IT: &str = "Whenever a nontoken creature you control enters, create a token that's a copy of that creature. That token gains haste. When you next cast a spell this turn, exile it.";
 
+// Judge rows (engine-change-loop step 5).
+
+/// Constructed (Chandra, Acolyte of Flame's "They gain haste"): plural "they" cannot be the
+/// one dying creature; it is the two Spirits (CR 608.2c).
+const SPIRITS_DIES_THEY_PUMP: &str = "Create two 1/1 white Spirit creature tokens. When target creature you control dies this turn, they get +1/+1 until end of turn.";
+/// Constructed: a bare "it" under a condition that names an object is that object
+/// (CR 608.2k): the entering creature, not the Spirit.
+const SPIRIT_ENTERS_COUNTER_ON_IT: &str = "Create a 1/1 white Spirit creature token. Whenever a nontoken creature you control enters this turn, put a +1/+1 counter on it.";
+/// Constructed: "that creature" whose noun describes the condition's subject: the entering
+/// creature.
+const SPIRIT_ENTERS_THAT_CREATURE_PUMP: &str = "Create a 1/1 white Spirit creature token. Whenever a nontoken creature you control enters this turn, that creature gets +1/+1 until end of turn.";
+/// Constructed: Bumi's grammar with a targeted instruction between the token and the
+/// earthbend; the earthbent land returns (CR 701.66a).
+const FOOD_TAP_EARTHBEND: &str = "Create a Food token. Tap target creature an opponent controls. Then earthbend 2. (To earthbend 2, target land you control becomes a 0/0 creature with haste that's still a land. Put two +1/+1 counters on it. When it dies or is exiled, return it to the battlefield tapped.)";
+/// Constructed: "they" under an opponent subject is that opponent, not the Spirit.
+const SPIRIT_OPP_DRAWS_THEY_LOSE_LIFE: &str = "Create a 1/1 white Spirit creature token. Whenever an opponent draws a card this turn, they lose 1 life.";
+
 const GAIN_LIFE: &str = "You gain 3 life.";
 const DRAW: &str = "Draw a card.";
 const DESTROY: &str = "Destroy target creature.";
@@ -926,6 +943,139 @@ fn copy_token_then_next_cast_sacrifice_it() {
 #[test]
 fn copy_token_then_next_cast_exile_it() {
     assert_copy_left_original_stayed(&copy_engine_then(COPY_HASTE_NEXT_CAST_EXILE_IT, DRAW));
+}
+
+// ---------------------------------------------------------------------------
+// Judge rows: plural "they", the condition's own object, a targeted instruction
+// ---------------------------------------------------------------------------
+
+/// Right at base (both Spirits 2/2): plural "they" names the created tokens.
+#[test]
+fn tokens_then_dies_this_turn_they_get_pumped() {
+    let run = token_spell_then(SPIRITS_DIES_THEY_PUMP, 2, Setup::OwnCreature, DESTROY, true);
+    assert!(
+        run.runner.state().delayed_triggers.is_empty(),
+        "reach: it fired"
+    );
+    assert_eq!(
+        run.runner.state().objects[&run.target.expect("own creature")].zone,
+        Zone::Graveyard,
+        "reach: the creature died"
+    );
+    assert_tokens_pumped_once(&run);
+}
+
+/// Cast `text`, then cast a nontoken Grizzly Bears from hand; returns the runner, the
+/// Bears and the created token.
+fn token_spell_then_cast_bears(text: &str) -> (GameRunner, ObjectId, ObjectId) {
+    let mut s = base();
+    let spell = s
+        .add_spell_to_hand_from_oracle(P0, "Token Spell", false, text)
+        .id();
+    let bear = s.add_creature_to_hand(P0, "Grizzly Bears", 2, 2).id();
+    let mut runner = s.build();
+    let before = object_ids(&runner);
+    runner.cast(spell).resolve();
+    settle(&mut runner);
+    let tokens = new_tokens(&runner, &before);
+    assert_eq!(tokens.len(), 1, "reach: one Spirit");
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach: one delayed trigger"
+    );
+    runner.cast(bear).resolve();
+    settle(&mut runner);
+    assert_eq!(
+        runner.state().objects[&bear].zone,
+        Zone::Battlefield,
+        "reach: the creature resolved"
+    );
+    (runner, bear, tokens[0])
+}
+
+/// Right at base: the counter goes on the entering creature.
+#[test]
+fn token_then_creature_enters_counter_on_it_is_the_entering_creature() {
+    let (runner, bear, spirit) = token_spell_then_cast_bears(SPIRIT_ENTERS_COUNTER_ON_IT);
+    assert_eq!(
+        plus_counters(&runner, bear),
+        1,
+        "the entering creature gets it"
+    );
+    assert_eq!(plus_counters(&runner, spirit), 0, "the Spirit does not");
+}
+
+/// Wrong at base (the Spirit was pumped): "that creature" describes the entering creature.
+#[test]
+fn token_then_creature_enters_that_creature_is_the_entering_creature() {
+    let (runner, bear, spirit) = token_spell_then_cast_bears(SPIRIT_ENTERS_THAT_CREATURE_PUMP);
+    assert_eq!(
+        pt(&runner, bear),
+        (Some(3), Some(3)),
+        "the entering creature is pumped"
+    );
+    assert_eq!(pt(&runner, spirit), (Some(1), Some(1)), "the Spirit is not");
+}
+
+/// Wrong at base (the Food was tapped): the targeted instruction between the token and the
+/// earthbend does not change what the return names.
+#[test]
+fn token_then_targeted_instruction_then_earthbend_returns_the_land() {
+    let mut s = base();
+    let opp = s.add_creature(P1, "Opposing Bear", 2, 2).id();
+    let land = s.add_basic_land(P0, ManaColor::Green);
+    let spell = s
+        .add_spell_to_hand(P0, "Food Tap Bend", false)
+        .from_oracle_text_with_keywords(&["Earthbend", "Food"], FOOD_TAP_EARTHBEND)
+        .id();
+    let removal = add_removal(&mut s);
+    let mut runner = s.build();
+    let before = object_ids(&runner);
+    runner.cast(spell).target_objects(&[opp, land]).resolve();
+    settle(&mut runner);
+    let tokens = new_tokens(&runner, &before);
+    assert_eq!(tokens.len(), 1, "reach: one Food");
+    assert!(
+        runner.state().objects[&opp].tapped,
+        "reach: the opposing creature was tapped"
+    );
+    assert_eq!(
+        plus_counters(&runner, land),
+        2,
+        "reach: the land was earthbent"
+    );
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach: the earthbend return waits"
+    );
+    let mut run = EarthbendRun {
+        runner,
+        land,
+        tokens,
+        removal,
+    };
+    remove_land(&mut run, KILL);
+    assert_land_back_tapped_and_tokens_untouched(&run);
+}
+
+/// Right at base: "they" under an opponent subject is the opponent who drew.
+#[test]
+fn token_then_opponent_draws_they_is_that_opponent() {
+    let run = token_spell_then(
+        SPIRIT_OPP_DRAWS_THEY_LOSE_LIFE,
+        1,
+        Setup::None,
+        "Each player draws a card.",
+        false,
+    );
+    let state = run.runner.state();
+    assert_eq!(
+        (state.players[0].life, state.players[1].life),
+        (20, 19),
+        "the opponent who drew loses 1 life"
+    );
 }
 
 // ---------------------------------------------------------------------------
