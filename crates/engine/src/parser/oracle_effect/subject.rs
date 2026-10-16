@@ -4360,11 +4360,20 @@ fn resolve_they_pronoun(ctx: &mut ParseContext, consumer: AnaphorConsumer) -> Ta
             TargetFilter::TriggeringPlayer
         }
         Some(TargetFilter::Player) => TargetFilter::TriggeringPlayer,
-        // CR 608.2c + CR 608.2k: a player condition subject ("whenever you gain life this
-        // turn") introduces no object, so in a delayed body whose creating chain created
-        // tokens, "they" names those tokens, as a bare "it" does (`resolve_it_pronoun`).
-        Some(subject) if subject.is_player_scope() && ctx.enclosing_chain_created_token => {
-            TargetFilter::LastCreated
+        // CR 608.2c: in a delayed body whose creating chain created tokens, plural "they"
+        // names those tokens unless an earlier clause of the body set out a mass population
+        // (the nearer antecedent, as below). The condition introduces no plural object:
+        // a player condition ("whenever you gain life this turn") names no object, and an
+        // object condition watches one object at a time ("when target creature you
+        // control dies this turn"), which a plural pronoun cannot name. A player "they"
+        // ("whenever an opponent draws a card this turn, they ...") is decided above.
+        Some(subject)
+            if ctx.enclosing_chain_created_token
+                && !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any) =>
+        {
+            ctx.chain_prior_mass_population
+                .clone()
+                .unwrap_or(TargetFilter::LastCreated)
         }
         // Object-type trigger subject: the trigger's SOURCE is "they" only when no
         // nearer antecedent exists.
