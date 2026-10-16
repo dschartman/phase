@@ -1456,3 +1456,272 @@ fn accepting_body_anaphors_outside_its_own_operands_are_not_seeded() {
     );
     assert_eq!(scoped_player_refs(&body), 0, "{body:?}");
 }
+
+// --- Defending-player subject antecedent (Witch-king, Crashing Boars) ---
+
+const WITCH_KING_BRINGER_OF_RUIN: &str = "Flying\nWhenever Witch-king attacks, defending player sacrifices a creature with the least power among creatures they control.";
+
+const CRASHING_BOARS: &str = "Whenever this creature attacks, defending player chooses an untapped creature they control. That creature blocks this creature this turn if able.";
+
+/// Every `controller` reachable under a quantity (`qty`) node of the parsed
+/// abilities and triggers, in document order. Serialized so the walk covers
+/// filter properties, aggregates and counts without enumerating AST shapes.
+fn nested_quantity_controllers(text: &str, types: &[&str]) -> Vec<String> {
+    fn walk(value: &serde_json::Value, under_qty: bool, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    if key == "controller" && under_qty {
+                        if let serde_json::Value::String(s) = inner {
+                            out.push(s.clone());
+                        }
+                    }
+                    walk(inner, under_qty || key == "qty", out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for inner in items {
+                    walk(inner, under_qty, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+    let parsed = parse_oracle_text(text, "Probe", &[], &types, &[]);
+    let abilities = serde_json::to_value(&parsed.abilities).expect("abilities serialize");
+    let triggers = serde_json::to_value(&parsed.triggers).expect("triggers serialize");
+    assert!(
+        !abilities.to_string().contains("Unimplemented")
+            && !triggers.to_string().contains("Unimplemented"),
+        "reach-guard: {text:?} must parse without an Unimplemented node"
+    );
+    let mut out = Vec::new();
+    walk(&abilities, false, &mut out);
+    walk(&triggers, false, &mut out);
+    assert!(
+        !out.is_empty(),
+        "reach-guard: {text:?} must carry a quantity over a controlled population"
+    );
+    out
+}
+
+/// SHAPE. CR 608.2c + CR 115.1 + CR 508.5: in a clause whose subject is a single
+/// player ("target opponent", "target player", "defending player"), the
+/// pronoun "they" in the predicate's "<set> they control" names that player.
+/// Controls: an "each opponent" subject keeps its iterating `ScopedPlayer`, and
+/// an explicit "you control" keeps `You`.
+#[test]
+fn they_control_in_predicate_binds_to_singular_player_subject() {
+    for (text, types, expected) in [
+        (
+            "Target opponent sacrifices a creature with the greatest power among creatures they control.",
+            &["Instant"][..],
+            "TargetOpponent",
+        ),
+        (
+            "Target player loses life equal to the number of creatures they control.",
+            &["Sorcery"][..],
+            "TargetPlayer",
+        ),
+        (
+            "Whenever this creature attacks, defending player sacrifices a creature with the least power among creatures they control.",
+            &["Creature"][..],
+            "DefendingPlayer",
+        ),
+        (
+            "Each opponent sacrifices a creature with the greatest power among creatures they control.",
+            &["Sorcery"][..],
+            "ScopedPlayer",
+        ),
+        (
+            "Target opponent loses life equal to the number of creatures you control.",
+            &["Sorcery"][..],
+            "You",
+        ),
+    ] {
+        let controllers = nested_quantity_controllers(text, types);
+        assert!(
+            controllers.iter().all(|c| c == expected),
+            "{text:?}: every nested quantity controller must be {expected}, got {controllers:?}"
+        );
+    }
+}
+
+/// CR 608.2c + CR 508.5: "that player" in a defending-player clause's predicate
+/// names the defending player, the same antecedent "they" takes.
+#[test]
+fn that_player_controls_in_predicate_binds_to_defending_player_subject() {
+    let text = "Whenever this creature attacks, defending player loses life equal to the number of creatures that player controls.";
+    let controllers = nested_quantity_controllers(text, &["Creature"]);
+    assert!(
+        controllers.iter().all(|c| c == "DefendingPlayer"),
+        "{text:?}: every nested quantity controller must be DefendingPlayer, got {controllers:?}"
+    );
+}
+
+/// CR 608.2c: a player scope an enclosing trigger already pinned is the nearer
+/// antecedent and is kept over the clause's own subject (upstream's
+/// `lower_subject_predicate_ast` precedence). A damage trigger pins the damaged
+/// player; a phase trigger over each player pins the iterated player.
+#[test]
+fn a_pinned_trigger_scope_wins_over_the_clause_subject() {
+    for (text, types, expected) in [
+        (
+            "Whenever this creature deals combat damage to a player, target opponent loses life equal to the number of creatures they control.",
+            &["Creature"][..],
+            "TriggeringPlayer",
+        ),
+        (
+            "At the beginning of each player's upkeep, target opponent loses life equal to the number of creatures they control.",
+            &["Enchantment"][..],
+            "ScopedPlayer",
+        ),
+    ] {
+        let controllers = nested_quantity_controllers(text, types);
+        assert!(
+            controllers.iter().all(|c| c == expected),
+            "{text:?}: every nested quantity controller must be {expected}, got {controllers:?}"
+        );
+    }
+}
+
+/// Attack P1 with `attacker` and pass priority until the attack trigger asks
+/// for something or the stack is empty.
+fn attack_and_settle(runner: &mut GameRunner, attacker: ObjectId) {
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(attacker, AttackTarget::Player(P1))])
+        .expect("declare the attacker");
+    for _ in 0..40 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => return,
+        }
+    }
+}
+
+/// CR 608.2c + CR 508.5 + CR 701.21a: Witch-king's "creatures they control" is
+/// the defending player's creatures, so the defending player sacrifices their
+/// own least-power creature. The caster's smaller creature is neither eligible
+/// nor the ranking reference.
+#[test]
+fn witch_king_defending_player_sacrifices_their_least_power_creature() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let witch_king = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Witch-king, Bringer of Ruin",
+            5,
+            3,
+            WITCH_KING_BRINGER_OF_RUIN,
+        )
+        .id();
+    let own_small = scenario.add_creature(P0, "P0 One-One", 1, 1).id();
+    let their_small = scenario.add_creature(P1, "P1 Two-Two", 2, 2).id();
+    let their_mid = scenario.add_creature(P1, "P1 Three-Three", 3, 3).id();
+    let their_big = scenario.add_creature(P1, "P1 Four-Four", 4, 4).id();
+    let mut runner = scenario.build();
+
+    attack_and_settle(&mut runner, witch_king);
+
+    let zone = |id: ObjectId| runner.state().objects[&id].zone;
+    assert_eq!(
+        zone(their_small),
+        Zone::Graveyard,
+        "the defending player sacrifices their least-power creature"
+    );
+    assert_eq!(zone(their_mid), Zone::Battlefield);
+    assert_eq!(zone(their_big), Zone::Battlefield);
+    assert_eq!(zone(own_small), Zone::Battlefield);
+}
+
+/// CR 608.2c + CR 119.3: a defending-player life-loss count over "creatures
+/// they control" counts the defending player's creatures.
+#[test]
+fn defending_player_loses_life_per_creature_they_control() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let raider = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Probe Raider",
+            5,
+            5,
+            "Whenever this creature attacks, defending player loses life equal to the number of creatures they control.",
+        )
+        .id();
+    scenario.add_creature(P0, "P0 Bear", 2, 2);
+    for name in ["P1 Bear A", "P1 Bear B", "P1 Bear C"] {
+        scenario.add_creature(P1, name, 2, 2);
+    }
+    let mut runner = scenario.build();
+
+    attack_and_settle(&mut runner, raider);
+
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach-guard: the attack trigger resolved; waiting_for={:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.life(P1), 17, "P1 controls three creatures");
+    assert_eq!(runner.life(P0), 20);
+}
+
+/// CR 608.2c + CR 508.5 + CR 509.1c: Crashing Boars's defending player chooses
+/// among the untapped creatures THEY control, and the chosen creature must
+/// block the Boars. The attacker's controller's untapped creature is not the
+/// one chosen, so the defending player may not decline to block.
+#[test]
+fn crashing_boars_defending_player_chooses_their_own_creature_to_block() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let boars = scenario
+        .add_creature_from_oracle(P0, "Crashing Boars", 4, 4, CRASHING_BOARS)
+        .id();
+    scenario.add_creature(P0, "P0 Bear", 2, 2);
+    let their_untapped = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let their_tapped = scenario.add_creature(P1, "P1 Tapped Bear", 2, 2).id();
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&their_tapped)
+        .expect("the tapped bear exists")
+        .tapped = true;
+
+    attack_and_settle(&mut runner, boars);
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach-guard: the attack trigger resolved; waiting_for={:?}",
+        runner.state().waiting_for
+    );
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } if runner.state().phase == Phase::DeclareAttackers => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareBlockers { .. }
+        ),
+        "reach-guard: at declare blockers; waiting_for={:?}",
+        runner.state().waiting_for
+    );
+
+    assert!(
+        runner.declare_blockers(&[]).is_err(),
+        "CR 509.1c: the defending player's chosen creature must block Crashing Boars"
+    );
+    assert!(
+        runner.declare_blockers(&[(their_untapped, boars)]).is_ok(),
+        "reach-guard: declaring the required block is legal"
+    );
+}
