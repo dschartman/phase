@@ -661,6 +661,189 @@ mod tests {
         assert_eq!(price_of(&prices, six), 3.0 + KEEP_PRICE_STEP);
     }
 
+    /// A basic land of `subtype` (so `mana_colors::land_produced_color_types`
+    /// reads its colour) in `zone`, owned by P0.
+    fn basic_land(state: &mut GameState, subtype: &str, zone: Zone) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            P0,
+            subtype.to_string(),
+            zone,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.card_types.subtypes.push(subtype.to_string());
+        id
+    }
+
+    /// A `power`/`power` creature in hand costing `{generic}` plus `shards`.
+    fn creature_card(
+        state: &mut GameState,
+        power: i32,
+        shards: Vec<engine::types::mana::ManaCostShard>,
+        generic: u32,
+    ) -> ObjectId {
+        let id = card_in_hand(state, "Creature");
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(power);
+        obj.toughness = Some(power);
+        obj.mana_cost = engine::types::mana::ManaCost::Cost { shards, generic };
+        id
+    }
+
+    fn surrender_order(
+        state: &GameState,
+        pool: &[ObjectId],
+        plan: Option<PlanState>,
+    ) -> Vec<ObjectId> {
+        let mut order = pool.to_vec();
+        order.sort_by(|a, b| cmp_keep(&keep_key(state, *a, plan), &keep_key(state, *b, plan)));
+        order
+    }
+
+    /// CR 305.2: a player normally plays one land a turn, so below the land
+    /// target only the land that makes the next land drop is needed. A second
+    /// (or third) land in hand is an `Ordinary` card priced by its value, so it
+    /// is given up before a spell worth more (the 3/3, 9.0 against 3.0) and the
+    /// needed land is given up last. Holds however far behind the board is: the
+    /// deficit says lands are wanted, the land drop says one at a time.
+    #[test]
+    fn below_the_land_target_only_the_next_land_drop_is_needed() {
+        for (lands_behind, lands_in_hand) in [(1_i8, 2_usize), (2, 2), (4, 3)] {
+            let mut state = GameState::new_two_player(7);
+            let lands: Vec<_> = (0..lands_in_hand).map(|_| land_card(&mut state)).collect();
+            let three_three = creature_card(
+                &mut state,
+                3,
+                vec![engine::types::mana::ManaCostShard::Black],
+                2,
+            );
+            let plan = behind(lands_behind, 0);
+
+            let needed: Vec<_> = lands
+                .iter()
+                .copied()
+                .filter(|&land| keep_tier(&state, land, plan) == KeepTier::NeededManaSource)
+                .collect();
+            assert_eq!(
+                needed.len(),
+                1,
+                "{lands_behind} behind with {lands_in_hand} lands in hand: exactly one land \
+                 (the next drop) is needed"
+            );
+            for &land in lands.iter().filter(|land| !needed.contains(land)) {
+                assert_eq!(
+                    keep_tier(&state, land, plan),
+                    KeepTier::Ordinary,
+                    "a land past the next drop is an ordinary card, not surplus"
+                );
+            }
+
+            let mut pool = lands.clone();
+            pool.push(three_three);
+            let order = surrender_order(&state, &pool, plan);
+            assert_eq!(
+                order.last(),
+                Some(&needed[0]),
+                "the needed land is surrendered last"
+            );
+            assert_eq!(
+                order[order.len() - 2],
+                three_three,
+                "the 3/3 (9.0) is kept over every land past the next drop (3.0)"
+            );
+            let prices = keep_prices(&state, &pool, plan);
+            for &spare in lands.iter().filter(|land| !needed.contains(land)) {
+                assert!(
+                    price_of(&prices, spare) < price_of(&prices, three_three),
+                    "the discard cost gives up the spare land before the 3/3"
+                );
+            }
+        }
+    }
+
+    /// The lone land below the target is still the next land drop and is kept
+    /// over any spell, however valuable (a 5/5, 15.5 against 3.0).
+    #[test]
+    fn below_the_land_target_a_lone_land_is_still_needed() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let fatty = creature_card(
+            &mut state,
+            5,
+            vec![engine::types::mana::ManaCostShard::Black],
+            5,
+        );
+        let plan = behind(2, 0);
+        assert_eq!(keep_tier(&state, land, plan), KeepTier::NeededManaSource);
+        assert_eq!(
+            surrender_order(&state, &[land, fatty], plan),
+            vec![fatty, land]
+        );
+        let prices = keep_prices(&state, &[land, fatty], plan);
+        assert!(price_of(&prices, fatty) < price_of(&prices, land));
+    }
+
+    /// The needed land is the one whose colour the hand's spells are missing
+    /// (the judge's row R3): five Islands in play, a Forest and an Island in
+    /// hand, a {2}{G} 3/3. The Forest is the next drop; the Island is an
+    /// ordinary card. Both creation orders, so no id tie-break can pass it.
+    #[test]
+    fn the_needed_land_is_the_one_whose_colour_the_hand_needs() {
+        for forest_first in [false, true] {
+            let mut state = GameState::new_two_player(7);
+            for _ in 0..5 {
+                basic_land(&mut state, "Island", Zone::Battlefield);
+            }
+            let (forest, island) = if forest_first {
+                let forest = basic_land(&mut state, "Forest", Zone::Hand);
+                (forest, basic_land(&mut state, "Island", Zone::Hand))
+            } else {
+                let island = basic_land(&mut state, "Island", Zone::Hand);
+                (basic_land(&mut state, "Forest", Zone::Hand), island)
+            };
+            let green = creature_card(
+                &mut state,
+                3,
+                vec![engine::types::mana::ManaCostShard::Green],
+                2,
+            );
+            let plan = behind(1, 0);
+
+            assert_eq!(
+                keep_tier(&state, forest, plan),
+                KeepTier::NeededManaSource,
+                "the Forest makes the green 3/3 castable: it is the next drop"
+            );
+            assert_eq!(
+                keep_tier(&state, island, plan),
+                KeepTier::Ordinary,
+                "a sixth Island adds no colour the hand needs"
+            );
+            assert_eq!(
+                surrender_order(&state, &[forest, island, green], plan),
+                vec![island, green, forest]
+            );
+        }
+    }
+
+    /// Scope guard: the next-drop rule reads the hand. A land on the
+    /// battlefield (the sacrifice-cost gate's object) is still needed while the
+    /// board is behind, whatever the hand holds.
+    #[test]
+    fn a_battlefield_land_is_needed_below_the_target_whatever_the_hand_holds() {
+        let mut state = GameState::new_two_player(7);
+        let in_play = basic_land(&mut state, "Swamp", Zone::Battlefield);
+        land_card(&mut state);
+        land_card(&mut state);
+        assert_eq!(
+            keep_tier(&state, in_play, behind(2, 0)),
+            KeepTier::NeededManaSource
+        );
+    }
+
     /// A missing object is not a mana source and never sorts ahead of a real card.
     #[test]
     fn missing_object_is_not_a_mana_source() {
