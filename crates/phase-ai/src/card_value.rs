@@ -29,7 +29,11 @@
 //! there: in the 2026-10-17 FRA signals run, 137 of 176 PayCost discards that
 //! kept a land and pitched a castable spell were decided by the flat land
 //! price alone (`deck-builder/sims/fra-phase/2026-10-17-signals-r2/
-//! investigation-discard-signal.md`). It has one further consumer, which is a
+//! investigation-discard-signal.md`). The decision to pay that cost at all
+//! (the loot's activation, a flashback cast whose cost discards) reads the
+//! same order through [`given_up_value`], priced against
+//! [`expected_draw_value`] by `policies::self_cost`, so the card the
+//! activation is charged for is the card the `PayCost` prompt then gives up. It has one further consumer, which is a
 //! policy rather than a `deterministic_choice` arm: the CR 601.2f sacrifice-cost
 //! cast gate (`policies::sacrifice_cost_mana_gate`), which reads the tier of
 //! *battlefield* objects. That does not collide with the sentence below, because
@@ -55,6 +59,7 @@ use std::cmp::{Ordering, Reverse};
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 use crate::mana_colors::{land_produced_color_types, UnmetColors};
@@ -301,6 +306,49 @@ pub(crate) fn keep_prices(
         previous = Some((key, price));
     }
     prices
+}
+
+/// CR 118.1 + CR 701.9b: the value the keep order surrenders when `count`
+/// cards of `pool` are discarded to pay a cost, on the [`intrinsic_value`]
+/// scale. The cards are the first `count` in [`cmp_keep`] order, the ones
+/// `policies::payment_selection` then discards.
+///
+/// Each card is lost at its own value, with one exception. A
+/// [`KeepTier::Surplus`] mana source is priced at its [`keep_prices`] price,
+/// which puts it below every spell in the pool: past the plan's target it is
+/// worth less than a land's flat 3.0. Any other card the order gives up is a
+/// real loss at its own value, so a needed land kept over a 9.0 creature
+/// costs the creature's 9.0, not the pool's lowest value that
+/// [`keep_prices`] would assign it.
+pub(crate) fn given_up_value(
+    state: &GameState,
+    pool: &[ObjectId],
+    count: usize,
+    plan: Option<PlanState>,
+) -> f64 {
+    keep_prices(state, pool, plan)
+        .into_iter()
+        .take(count)
+        .map(|(id, price)| match keep_tier(state, id, plan) {
+            KeepTier::Surplus => price,
+            KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
+        })
+        .sum()
+}
+
+/// CR 121.1 + CR 401.2: the value of one card `player` draws, on the
+/// [`intrinsic_value`] scale: the mean over their library. The library's order
+/// is hidden, so a draw is priced as an expected card, never as the card on
+/// top. `None` when the library is empty or its cards carry no value, where
+/// there is no scale to measure a card against.
+pub(crate) fn expected_draw_value(state: &GameState, player: PlayerId) -> Option<f64> {
+    let library = &state.players.get(player.0 as usize)?.library;
+    if library.is_empty() {
+        return None;
+    }
+    let total: f64 = library.iter().map(|&id| intrinsic_value(state, id)).sum();
+    let mean = total / library.len() as f64;
+    (mean > 0.0).then_some(mean)
 }
 
 /// The smallest price gap [`keep_prices`] puts between two cards that
@@ -912,5 +960,53 @@ mod tests {
             keep_tier(&state, ObjectId(9999), behind(3, 3)),
             KeepTier::Ordinary
         );
+    }
+    // --- given_up_value / expected_draw_value -----------------------------
+
+    #[test]
+    fn given_up_value_is_the_keep_orders_first_cards_at_their_own_value() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let three = spell_card(&mut state, "Three", 3);
+        let creature = creature_card(&mut state, 3, Vec::new(), 3);
+        let pool = [creature, land, three];
+        // No plan: Ordinary throughout, value order {3} spell 1.5, land 3.0,
+        // 3/3 9.0.
+        assert_eq!(given_up_value(&state, &pool, 1, None), 1.5);
+        assert_eq!(given_up_value(&state, &pool, 2, None), 4.5);
+        // Lands behind: the lone land is the next drop (NeededManaSource) and
+        // is kept, so two cards give up the spell and the 3/3 at 1.5 + 9.0,
+        // not at the pool's two lowest values.
+        assert_eq!(given_up_value(&state, &pool, 2, behind(2, 0)), 10.5);
+        // Past the land target the land is Surplus: it goes first, at its
+        // keep price (the pool's lowest value, 1.5), not at 3.0.
+        assert_eq!(given_up_value(&state, &pool, 1, behind(-2, 0)), 1.5);
+        let order = surrender_order(&state, &pool, behind(-2, 0));
+        assert_eq!(order[0], land, "the surplus land is the card given up");
+    }
+
+    #[test]
+    fn expected_draw_value_is_the_library_mean_and_none_without_a_scale() {
+        let mut state = GameState::new_two_player(7);
+        assert_eq!(expected_draw_value(&state, P0), None, "empty library");
+        let blank = card_in_hand(&mut state, "Blank");
+        move_to_library(&mut state, blank);
+        assert_eq!(
+            expected_draw_value(&state, P0),
+            None,
+            "no value to measure by"
+        );
+        let land = land_card(&mut state);
+        move_to_library(&mut state, land);
+        let creature = creature_card(&mut state, 3, Vec::new(), 3);
+        move_to_library(&mut state, creature);
+        assert_eq!(
+            expected_draw_value(&state, P0),
+            Some((0.0 + 3.0 + 9.0) / 3.0)
+        );
+    }
+
+    fn move_to_library(state: &mut GameState, id: ObjectId) {
+        engine::game::zones::move_to_zone(state, id, Zone::Library, &mut Vec::new());
     }
 }
