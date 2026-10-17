@@ -5378,6 +5378,7 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::InTrackedSet { .. }
         | FilterProp::Modified
