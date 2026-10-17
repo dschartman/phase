@@ -18,6 +18,7 @@ use engine::game::functioning_abilities::{
     active_replacements, active_trigger_definitions, battlefield_active_triggers,
     game_active_statics, game_functioning_statics,
 };
+use engine::game::players::is_opponent;
 use engine::game::quantity::{
     ability_definition_has_only_unbound_variable_quantities_for_pre_cast,
     ability_definition_is_cast_stable_for_pre_cast, additional_cost_is_cast_stable_for_pre_cast,
@@ -57,6 +58,7 @@ use crate::policies::context::{collect_ability_effects, PolicyContext};
 use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, targets_creatures_only, EffectPolarity,
 };
+use crate::policies::removal_lethality::toughness_reduction_is_lethal;
 use crate::policies::stack_awareness::{has_pending_removal, will_target_die_from_stack};
 use crate::policies::strategy_helpers::can_pay_ward_cost;
 use crate::search::ability_is_temporary_combat_modifier;
@@ -420,13 +422,21 @@ fn assess_cast_effects(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> GateDeci
                 || source.card_types.core_types.contains(&CoreType::Sorcery)
         });
         if source_is_spell && toughness_bonus < 0 {
-            // CR 704.5f: a -X/-X spell kills any creature whose toughness it
-            // takes to 0 or less, in whatever window it resolves, so it is
-            // creature removal, not a combat trick. It has already passed the
-            // removal path above (`is_redundant_creature_only_removal`: a live
-            // opposing target that is not already dying); the pump-window
-            // rejection, which prices a temporary stat change by the combat
-            // it can swing, does not apply.
+            // CR 704.5f + CR 704.5g: a -X/-X spell is creature removal, not a
+            // combat trick, and it has already passed the removal path above
+            // (`is_redundant_creature_only_removal`: a live opposing target
+            // that is not already dying). Outside combat it is only removal,
+            // so it must kill a legal opposing creature to be worth a card.
+            // CR 510.1a: while an opposing creature is attacking or blocking
+            // before damage, shrinking it can stop or win damage without
+            // killing it. That stays with policy scoring: the pump-window
+            // check (`pump_changes_combat_outcome`) prices only bonuses on the
+            // AI's own creatures and would reject a shrink that stops lethal.
+            if !opposing_creature_in_combat_before_damage(ctx.state, ctx.ai_player)
+                && !negative_pump_kills_a_legal_opposing_creature(ctx, effects)
+            {
+                return GateDecision::Reject;
+            }
         } else if source_is_spell {
             let facts = TacticalFacts::derive(ctx.state, ctx.ai_player);
             if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
@@ -1364,6 +1374,67 @@ fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effec
     }
 
     saw_creature_only_harm
+}
+
+/// CR 510.1: an opposing creature is attacking or blocking and
+/// regular combat damage is still to be dealt, so shrinking it can change the
+/// damage it deals or takes without killing it.
+fn opposing_creature_in_combat_before_damage(state: &GameState, ai_player: PlayerId) -> bool {
+    let Some(combat) = &state.combat else {
+        return false;
+    };
+    if combat.regular_damage_done {
+        return false;
+    }
+    combat
+        .attackers
+        .iter()
+        .map(|attacker| attacker.object_id)
+        .chain(combat.blocker_to_attacker.keys().copied())
+        .any(|id| {
+            state
+                .objects
+                .get(&id)
+                .is_some_and(|object| is_opponent(state, ai_player, object.controller))
+        })
+}
+
+/// CR 704.5f + CR 704.5g: does some fixed negative-toughness `Pump` among
+/// `effects` have a legal opposing creature target it would kill? Each pump is
+/// read with its own toughness change against that creature's current
+/// toughness and marked damage; a target already dying to the stack does not
+/// count. A pump whose target filter can't be read fails open.
+fn negative_pump_kills_a_legal_opposing_creature(
+    ctx: &PolicyContext<'_>,
+    effects: &[&Effect],
+) -> bool {
+    let Some(source) = ctx.source_object() else {
+        return true;
+    };
+    effects.iter().any(|effect| {
+        let Effect::Pump {
+            toughness: PtValue::Fixed(toughness),
+            ..
+        } = effect
+        else {
+            return false;
+        };
+        if *toughness >= 0 {
+            return false;
+        }
+        let reduction = toughness.unsigned_abs();
+        let Some(filter) = extract_target_filter(effect) else {
+            return true;
+        };
+        ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
+            !will_target_die_from_stack(ctx.state, id)
+                && ctx
+                    .state
+                    .objects
+                    .get(&id)
+                    .is_some_and(|object| toughness_reduction_is_lethal(object, reduction))
+        })
+    })
 }
 
 fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {
