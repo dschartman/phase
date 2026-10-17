@@ -15562,6 +15562,424 @@ mod tests {
     }
 
     // ======================================================================
+    // Scry and surveil keep-on-top by card value (CR 701.22a, CR 701.25a).
+    //
+    // Both prompts are answered by `deterministic_choice` before any scoring,
+    // and both payloads are the keep-on-top set. Every row below asserts the
+    // partition the AI submits: which looked-at cards stay on top, and that
+    // the rest go to the bottom (scry) or the graveyard (surveil).
+    // ======================================================================
+
+    /// A card at the bottom of `owner`'s library. Build the looked-at pile
+    /// first so it sits on top, in creation order.
+    fn library_card(state: &mut GameState, owner: PlayerId, name: &str) -> ObjectId {
+        create_object(
+            state,
+            CardId(state.next_object_id),
+            owner,
+            name.to_string(),
+            Zone::Library,
+        )
+    }
+
+    /// 5/5 for `{B}{5}`. `intrinsic_value` = 5*1.5 + 5 + (1+5)*0.5 = **15.5**.
+    fn library_fatty(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = library_card(state, owner, "Fatty");
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(5);
+            obj.toughness = Some(5);
+        }
+        set_cost(state, id, vec![ManaCostShard::Black], 5);
+        id
+    }
+
+    /// 2/2 for `{B}{1}`. `intrinsic_value` = 2*1.5 + 2 + (1+1)*0.5 = **6.0**.
+    fn library_bear(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = library_card(state, owner, "Bear");
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+        }
+        set_cost(state, id, vec![ManaCostShard::Black], 1);
+        id
+    }
+
+    /// No card type, no mana cost: `intrinsic_value` **0.0**, under the 0.1
+    /// floor the `DigChoice` up-to arm uses.
+    fn library_dud(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = library_card(state, owner, "Dud");
+        assert_eq!(
+            crate::card_value::intrinsic_value(state, id),
+            0.0,
+            "fixture premise: the dud must score below the Dig arm's 0.1 floor"
+        );
+        id
+    }
+
+    /// A basic land: `intrinsic_value` **3.0**, so only the plan's land axis
+    /// can make it a card not worth drawing.
+    fn library_land(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = library_card(state, owner, "Swamp");
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        id
+    }
+
+    fn kept_on_top(action: Option<GameAction>) -> Vec<ObjectId> {
+        match action {
+            Some(GameAction::SelectCards { cards }) => cards,
+            other => panic!("expected the keep-on-top SelectCards, got {other:?}"),
+        }
+    }
+
+    fn surveil_prompt(player: PlayerId, cards: Vec<ObjectId>) -> WaitingFor {
+        WaitingFor::SurveilChoice { player, cards }
+    }
+
+    fn scry_prompt(player: PlayerId, cards: Vec<ObjectId>) -> WaitingFor {
+        WaitingFor::ScryChoice { player, cards }
+    }
+
+    /// A two-player state where `ai` controls `lands` lands, plus a context
+    /// whose session carries the default deck plan (land target 6).
+    fn state_with_lands(lands: usize) -> GameState {
+        let mut state = make_state();
+        for _ in 0..lands {
+            land_on_battlefield(&mut state, PlayerId(0));
+        }
+        state
+    }
+
+    fn assert_lands_behind(state: &GameState, ai: PlayerId, expected: i8) {
+        let realized = crate::plan::PlanState::realize(state, ai, &default_deck_plan());
+        assert_eq!(
+            realized.lands_behind, expected,
+            "fixture premise: the default plan's land target is 6"
+        );
+    }
+
+    /// CR 701.25a: surveil 1 revealing a card worth drawing keeps it on top.
+    ///
+    /// FAILS AT dce458309: the arm keeps `1 / 2 = 0` cards, so every surveil 1
+    /// mills (seed 42: Jace's surveil milled Variable Chaser and Traxos).
+    #[test]
+    fn surveil_1_keeps_a_card_worth_drawing_on_top() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let fatty = library_fatty(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![fatty]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert_eq!(kept, vec![fatty], "a 15.5-value creature must stay on top");
+    }
+
+    /// CR 701.25a: surveil 1 revealing a card under the Dig arm's floor bins it.
+    #[test]
+    fn surveil_1_mills_a_card_below_the_dig_floor() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let dud = library_dud(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![dud]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert!(kept.is_empty(), "a 0.0-value card must go to the graveyard");
+    }
+
+    /// CR 701.25a + CR 305.2: past the plan's land target, a revealed land is
+    /// an excess land and is binned.
+    #[test]
+    fn surveil_1_mills_an_excess_land_while_flooded() {
+        let mut state = state_with_lands(7);
+        let ai = PlayerId(0);
+        assert_lands_behind(&state, ai, -1);
+        let land = library_land(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![land]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+
+        assert!(
+            kept.is_empty(),
+            "a land past the land target must be milled"
+        );
+    }
+
+    /// CR 701.25a + CR 305.2: short of the plan's land target, a revealed land
+    /// is worth drawing. The sibling of the flooded row: without it, "mill
+    /// every land" would pass that row.
+    ///
+    /// FAILS AT dce458309 (surveil 1 always mills).
+    #[test]
+    fn surveil_1_keeps_a_land_while_behind_on_lands() {
+        let mut state = state_with_lands(2);
+        let ai = PlayerId(0);
+        assert_lands_behind(&state, ai, 4);
+        let land = library_land(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![land]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+
+        assert_eq!(kept, vec![land], "a needed land must stay on top");
+    }
+
+    /// CR 701.25a: surveil 2, one card worth drawing and one dud: keep one.
+    #[test]
+    fn surveil_2_keeps_the_good_card_and_mills_the_dud() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let dud = library_dud(&mut state, ai);
+        let fatty = library_fatty(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![dud, fatty]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert_eq!(kept, vec![fatty]);
+    }
+
+    /// CR 701.25a: surveil 2, both cards worth drawing: keep both, best first.
+    ///
+    /// FAILS AT dce458309: the arm keeps a fixed `2 / 2 = 1` card.
+    #[test]
+    fn surveil_2_keeps_both_cards_worth_drawing_best_first() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let bear = library_bear(&mut state, ai);
+        let fatty = library_fatty(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![bear, fatty]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert_eq!(
+            kept,
+            vec![fatty, bear],
+            "both stay on top, the higher-value card drawn first"
+        );
+    }
+
+    /// CR 701.25a: surveil 2, two duds: keep none.
+    ///
+    /// FAILS AT dce458309: the arm keeps a fixed `2 / 2 = 1` card.
+    #[test]
+    fn surveil_2_mills_both_duds() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let duds = vec![library_dud(&mut state, ai), library_dud(&mut state, ai)];
+        state.waiting_for = surveil_prompt(ai, duds);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert!(kept.is_empty(), "two 0.0-value cards must both be milled");
+    }
+
+    /// CR 701.22a: scry 1 revealing a card under the Dig arm's floor bottoms it.
+    ///
+    /// FAILS AT dce458309: the scry arm submits every card, so nothing is ever
+    /// put on the bottom.
+    #[test]
+    fn scry_1_bottoms_a_card_below_the_dig_floor() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let dud = library_dud(&mut state, ai);
+        state.waiting_for = scry_prompt(ai, vec![dud]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert!(kept.is_empty(), "a 0.0-value card must go to the bottom");
+    }
+
+    /// CR 701.22a: scry 1 revealing a card worth drawing keeps it on top.
+    #[test]
+    fn scry_1_keeps_a_card_worth_drawing_on_top() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let fatty = library_fatty(&mut state, ai);
+        state.waiting_for = scry_prompt(ai, vec![fatty]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert_eq!(kept, vec![fatty]);
+    }
+
+    /// CR 701.22a + CR 305.2: past the plan's land target, scry bottoms a land.
+    ///
+    /// FAILS AT dce458309 (scry never bottoms).
+    #[test]
+    fn scry_1_bottoms_an_excess_land_while_flooded() {
+        let mut state = state_with_lands(7);
+        let ai = PlayerId(0);
+        assert_lands_behind(&state, ai, -1);
+        let land = library_land(&mut state, ai);
+        state.waiting_for = scry_prompt(ai, vec![land]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+
+        assert!(
+            kept.is_empty(),
+            "a land past the land target must go to the bottom"
+        );
+    }
+
+    /// Scry and surveil read one keep test: the same pile gets the same
+    /// partition from both arms (top set for scry = top set for surveil).
+    #[test]
+    fn scry_and_surveil_partition_the_same_pile_identically() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let pile = vec![library_dud(&mut state, ai), library_fatty(&mut state, ai)];
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+
+        state.waiting_for = scry_prompt(ai, pile.clone());
+        let scry_top = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+        state.waiting_for = surveil_prompt(ai, pile.clone());
+        let surveil_top = kept_on_top(deterministic_choice(&state, ai, &config, &[], None));
+
+        assert_eq!(
+            scry_top,
+            vec![pile[1]],
+            "scry keeps the fatty, bottoms the dud"
+        );
+        assert_eq!(
+            scry_top, surveil_top,
+            "both arms must agree on the keep set"
+        );
+    }
+
+    /// The engine issues only `[]`, the whole pile, and each single card for a
+    /// scry or surveil prompt (`select_cards_variants`), and the contract gate
+    /// turns an unissued answer into `None`, which halts the AI controller. A
+    /// value-based keep set for N >= 3 can fall outside that domain, so the
+    /// answer must be the issued selection closest to it.
+    ///
+    /// FAILS AT dce458309 on the surveil-4 row: the arm keeps `4 / 2 = 2`
+    /// cards, which is not issued.
+    #[test]
+    fn scry_and_surveil_answers_stay_inside_the_issued_domain_for_wide_looks() {
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let ai = PlayerId(0);
+        let mut offenders = Vec::new();
+
+        type Build = fn(&mut GameState) -> (WaitingFor, ObjectId);
+        let rows: [(&str, Build); 4] = [
+            ("surveil 4, four good", |state| {
+                let pile = vec![
+                    library_bear(state, PlayerId(0)),
+                    library_fatty(state, PlayerId(0)),
+                    library_bear(state, PlayerId(0)),
+                    library_bear(state, PlayerId(0)),
+                ];
+                let best = pile[1];
+                (surveil_prompt(PlayerId(0), pile), best)
+            }),
+            ("surveil 3, two good one dud", |state| {
+                let pile = vec![
+                    library_dud(state, PlayerId(0)),
+                    library_bear(state, PlayerId(0)),
+                    library_fatty(state, PlayerId(0)),
+                ];
+                let best = pile[2];
+                (surveil_prompt(PlayerId(0), pile), best)
+            }),
+            ("scry 3, two good one dud", |state| {
+                let pile = vec![
+                    library_bear(state, PlayerId(0)),
+                    library_dud(state, PlayerId(0)),
+                    library_fatty(state, PlayerId(0)),
+                ];
+                let best = pile[2];
+                (scry_prompt(PlayerId(0), pile), best)
+            }),
+            ("scry 3, one good two duds", |state| {
+                let pile = vec![
+                    library_dud(state, PlayerId(0)),
+                    library_fatty(state, PlayerId(0)),
+                    library_dud(state, PlayerId(0)),
+                ];
+                let best = pile[1];
+                (scry_prompt(PlayerId(0), pile), best)
+            }),
+        ];
+
+        for (name, build) in rows {
+            let mut state = make_state();
+            let (prompt, best) = build(&mut state);
+            state.waiting_for = prompt;
+            let contract = AiDecisionContract::issue(&state, ai);
+            let mut rng = SmallRng::seed_from_u64(42);
+            match choose_action(&state, ai, &config, &mut rng) {
+                None => offenders.push(format!("{name}: answered None while owing a decision")),
+                Some(action) if !contract.contains_action(&state, &action) => {
+                    offenders.push(format!("{name}: answered with unissued {action:?}"));
+                }
+                Some(GameAction::SelectCards { cards }) if cards.first() != Some(&best) => {
+                    offenders.push(format!("{name}: best card not drawn first, kept {cards:?}"));
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "scry/surveil answers must come from the issued domain and keep the \
+             best card on top:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Outcome at the real chooser and the real handler: `choose_action`
+    /// answers a surveil 1 over a valuable card, the engine applies it, and the
+    /// card is still on top of the library rather than in the graveyard.
+    ///
+    /// FAILS AT dce458309: the card is milled.
+    #[test]
+    fn surveil_1_through_choose_action_leaves_a_valuable_card_on_top() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        let fatty = library_fatty(&mut state, ai);
+        library_dud(&mut state, ai);
+        state.waiting_for = surveil_prompt(ai, vec![fatty]);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let action =
+            choose_action(&state, ai, &config, &mut rng).expect("the AI owes the surveil decision");
+        engine::game::engine::apply_as_current(&mut state, action)
+            .expect("the engine must accept the surveil answer");
+
+        assert_eq!(
+            state.objects[&fatty].zone,
+            Zone::Library,
+            "the fatty must not be milled"
+        );
+        assert_eq!(
+            state.players[0].library.front(),
+            Some(&fatty),
+            "the fatty must be the next card drawn"
+        );
+    }
+
+    // ======================================================================
     // Issue #6942 — selection escapes must answer out of the issued contract.
     //
     // Every row below drives `fallback_action` (or `deterministic_choice`) —
