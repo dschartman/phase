@@ -11,8 +11,9 @@ use engine::types::player::PlayerId;
 use engine::types::statics::CrewAction;
 use engine::types::zones::{ExileCostSourceZone, Zone};
 
-use crate::card_value::cost_card_value;
+use crate::card_value::{cost_card_value, intrinsic_value, keep_prices, keep_tier, KeepTier};
 use crate::features::DeckFeatures;
+use crate::plan::PlanState;
 
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
@@ -60,7 +61,9 @@ impl PaymentSelectionPolicy {
             return 0.0;
         };
         let WaitingFor::PayCost {
+            player,
             kind,
+            choices,
             min_count,
             resume,
             ..
@@ -73,9 +76,28 @@ impl PaymentSelectionPolicy {
             return 0.0;
         }
 
+        // CR 118.1 + CR 701.9b: a discard cost gives up cards in the cleanup
+        // discard's keep order (`card_value::keep_prices`), keyed on the
+        // discarding player's own plan, as the CR 514.1 arm keys it. Every
+        // other kind is priced per card by `payment_cost`.
+        let is_discard = matches!(kind, PayCostKind::Discard);
+        let plan = ctx
+            .context
+            .session
+            .plan
+            .get(player)
+            .filter(|_| is_discard)
+            .map(|snapshot| PlanState::realize(ctx.state, *player, snapshot));
+        let discard_prices = is_discard.then(|| keep_prices(ctx.state, choices, plan));
         let cost: f64 = cards
             .iter()
-            .map(|&id| payment_cost(ctx.state, id, kind, ctx.penalties()))
+            .map(|&id| match &discard_prices {
+                Some(prices) => prices
+                    .iter()
+                    .find(|(card, _)| *card == id)
+                    .map_or_else(|| intrinsic_value(ctx.state, id), |(_, price)| *price),
+                None => payment_cost(ctx.state, id, kind, ctx.penalties()),
+            })
             .sum();
         let extra_count = cards.len().saturating_sub(*min_count);
         let extra_penalty = extra_count as f64 * 0.35;
@@ -85,7 +107,7 @@ impl PaymentSelectionPolicy {
             CostResume::ManaAbility { .. } => 0.8,
         };
 
-        let needed_land_penalty = if discard_spends_last_playable_land(ctx, kind, cards) {
+        let needed_land_penalty = if discard_spends_last_playable_land(ctx, kind, cards, plan) {
             ctx.penalties().payment_selection_needed_land_penalty
         } else {
             0.0
@@ -104,11 +126,22 @@ impl PaymentSelectionPolicy {
 /// it can actually play in every replay.
 /// Hand counts and land-drop counters are not substitutes for either legality
 /// check.
+///
+/// A land the discarding player's plan counts as surplus
+/// (`card_value::KeepTier::Surplus`, past the deck's land target) is not
+/// protected: CR 305.2 limits a player to one land play a turn, and past the
+/// target that play adds nothing the plan wants, so the keep order's "a surplus
+/// land goes before any spell" stands. On or below the target, and with no
+/// plan, the last playable land is protected as before.
 fn discard_spends_last_playable_land(
     ctx: &PolicyContext<'_>,
     kind: &PayCostKind,
     selected: &[ObjectId],
+    plan: Option<PlanState>,
 ) -> bool {
+    let protected_land = |id: ObjectId| {
+        is_land(ctx.state, id) && keep_tier(ctx.state, id, plan) != KeepTier::Surplus
+    };
     let (
         WaitingFor::PayCost {
             player,
@@ -123,7 +156,7 @@ fn discard_spends_last_playable_land(
     if *player != ctx.ai_player || cards != selected || !matches!(kind, PayCostKind::Discard) {
         return false;
     }
-    if !selected.iter().copied().any(|id| is_land(ctx.state, id)) {
+    if !selected.iter().copied().any(protected_land) {
         return false;
     }
 
@@ -169,7 +202,7 @@ fn discard_spends_last_playable_land(
     selected
         .iter()
         .copied()
-        .filter(|&land| is_land(ctx.state, land))
+        .filter(|&land| protected_land(land))
         .any(|land| {
             sibling_land_plays
                 .iter()
@@ -424,7 +457,11 @@ fn payment_cost(
     penalties: &crate::config::PolicyPenalties,
 ) -> f64 {
     match kind {
-        PayCostKind::Discard => cost_card_value(state, obj_id),
+        // A discard is priced in keep order across the whole prompt by
+        // `PaymentSelectionPolicy::score` (`card_value::keep_prices`); one
+        // card alone has no keep rank, so this arm is its intrinsic value,
+        // the price `keep_prices` gives a card with no plan authority.
+        PayCostKind::Discard => intrinsic_value(state, obj_id),
         // CR 701.20a + CR 701.20b: Revealing doesn't move the card — it stays
         // in hand — so the real resource cost is ~0, mirroring Behold's
         // reveal-from-hand branch.
@@ -879,6 +916,7 @@ mod tests {
             &policy_context,
             &PayCostKind::Discard,
             &[forced_land],
+            None,
         ),);
         assert_eq!(production_discard_score(&forced, vec![forced_land]), -3.0);
         engine::game::engine::apply(
@@ -926,6 +964,7 @@ mod tests {
             &policy_context,
             &PayCostKind::Discard,
             &[land],
+            None,
         ));
         assert_eq!(production_discard_score(&prohibited, vec![land]), -3.0);
     }
@@ -995,6 +1034,7 @@ mod tests {
                 &policy_context,
                 &PayCostKind::Discard,
                 &[first_land],
+                None,
             ),
             "discarding a land is not the final-land loss while a sibling payment leaves two land plays"
         );
@@ -1065,6 +1105,7 @@ mod tests {
                 &policy_context,
                 &PayCostKind::Discard,
                 &[first_land, spell],
+                None,
             ),
             "a two-card payment that still leaves another legal land play is not a final-land loss"
         );
