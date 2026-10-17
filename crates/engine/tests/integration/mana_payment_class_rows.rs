@@ -348,7 +348,9 @@ fn drive(row: &Row) -> (bool, String) {
         if step(&mut b.r, cast) {
             answer(&mut b, &mut done);
             for _ in 0..6 {
-                if b.r.state().stack.is_empty() {
+                // CR 608.2n: a spell paused mid-resolution has left the stack list but is
+                // still resolving; the cast is read once its resolution has ended.
+                if b.r.state().stack.is_empty() && b.r.state().resolving_stack_entry.is_none() {
                     break;
                 }
                 if matches!(b.r.state().waiting_for, WaitingFor::Priority { .. }) {

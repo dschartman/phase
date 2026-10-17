@@ -147,17 +147,37 @@ fn record_illegal_target_slots(
 pub(super) fn abandon_active_resolution_carrier(
     state: &mut GameState,
     disposition: super::lifecycle::DelayedTerminalDisposition,
+    events: &mut Vec<GameEvent>,
 ) {
     super::priority::clear_priority_passes(state);
     let _ = state
         .clear_active_ability_continuation()
         .expect("resolution abandonment cannot clear a buried ability continuation");
+    deliver_abandoned_deferred_spell(state, events);
     finish_resolving_stack_entry(state, disposition);
     state.resolution_source_relatch = None;
-    // CR 608.2n: an abandoned resolution owes no final move any more.
-    state.deferred_spell_delivery = None;
     state.deferred_entry_events.clear();
     state.pending_token_battlefield_entry = None;
+}
+
+/// CR 608.2n + CR 800.4a: an instant or sorcery whose paused resolution is
+/// abandoned still leaves the stack. Make the move it was holding back
+/// (`DeferredSpellDelivery`) while its carrier is installed, so it is not left in
+/// the stack zone with no stack entry, and a departing owner's CR 800.4a sweep
+/// then finds it in its zone. The abandoning caller hands priority on, so no
+/// new choice can be asked for this move: it is made directly, without the
+/// replacement consult `deliver_deferred_spell` runs.
+fn deliver_abandoned_deferred_spell(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    let Some(pending) = state.deferred_spell_delivery.take() else {
+        return;
+    };
+    let Some((_, casting_variant)) = deferring_spell_carrier(state, pending.object_id) else {
+        return;
+    };
+    if spell_still_on_stack(state, pending.object_id) {
+        super::zones::move_to_zone(state, pending.object_id, pending.destination, events);
+    }
+    finish_spell_stack_exit(state, pending.object_id, casting_variant, events);
 }
 
 /// CR 405.1: Add an object to the stack.
@@ -1001,7 +1021,7 @@ pub(crate) fn restore_alternative_spell_normal_face(
 /// redirects (the Invoke Calamity rider) and board-wide RIP/Leyline redirects
 /// fire, then record a Rod of Absorption link and apply an exile-instead
 /// consequence rider when the spell landed in exile. Shared by `resolve_top`
-/// and the deferred delivery after a free-cast window
+/// and the deferred delivery after a mid-resolution pause
 /// (`deliver_deferred_spell`). A `NeedsChoice` result means the move is parked
 /// for a CR 616.1 ordering choice.
 fn deliver_resolved_spell_off_stack(
@@ -1124,10 +1144,10 @@ fn finish_spell_stack_exit(
     }
 }
 
-/// CR 608.2n + CR 608.2g: deliver a spell whose move was held back while it was
-/// paused on its own free-cast window (`DeferredSpellDelivery`), once that
-/// window and the instructions behind it are done and its carrier is about to
-/// settle. A spell its own instructions already moved off the stack ("Exile
+/// CR 608.2n + CR 608.2c: deliver a spell whose move was held back while its
+/// resolution was paused on a choice, its own free-cast window included
+/// (`DeferredSpellDelivery`), once that choice and the instructions behind it
+/// are done and its carrier is about to settle. A spell its own instructions already moved off the stack ("Exile
 /// Invoke Calamity") stays where they put it; its stack-exit bookkeeping still
 /// runs, as in `resolve_top`.
 pub(super) fn deliver_deferred_spell(state: &mut GameState, events: &mut Vec<GameEvent>) {
@@ -1136,19 +1156,7 @@ pub(super) fn deliver_deferred_spell(state: &mut GameState, events: &mut Vec<Gam
     };
     // Only the deferring spell's own carrier consumes the record; any other
     // carrier leaves it in place.
-    let Some((controller, casting_variant)) = state
-        .resolving_stack_entry
-        .as_ref()
-        .filter(|entry| entry.id == pending.object_id)
-        .and_then(|entry| match &entry.kind {
-            StackEntryKind::Spell {
-                casting_variant, ..
-            } => Some((entry.controller, *casting_variant)),
-            StackEntryKind::ActivatedAbility { .. }
-            | StackEntryKind::TriggeredAbility { .. }
-            | StackEntryKind::KeywordAction { .. }
-            | StackEntryKind::CombatDamage { .. } => None,
-        })
+    let Some((controller, casting_variant)) = deferring_spell_carrier(state, pending.object_id)
     else {
         return;
     };
@@ -1171,6 +1179,27 @@ pub(super) fn deliver_deferred_spell(state: &mut GameState, events: &mut Vec<Gam
         return;
     }
     finish_spell_stack_exit(state, pending.object_id, casting_variant, events);
+}
+
+/// The controller and casting variant of the resolving carrier when it is the
+/// spell `spell_id` whose final move is deferred (`DeferredSpellDelivery`).
+fn deferring_spell_carrier(
+    state: &GameState,
+    spell_id: ObjectId,
+) -> Option<(PlayerId, CastingVariant)> {
+    state
+        .resolving_stack_entry
+        .as_ref()
+        .filter(|entry| entry.id == spell_id)
+        .and_then(|entry| match &entry.kind {
+            StackEntryKind::Spell {
+                casting_variant, ..
+            } => Some((entry.controller, *casting_variant)),
+            StackEntryKind::ActivatedAbility { .. }
+            | StackEntryKind::TriggeredAbility { .. }
+            | StackEntryKind::KeywordAction { .. }
+            | StackEntryKind::CombatDamage { .. } => None,
+        })
 }
 
 /// CR 608.2n / CR 608.3 / CR 608.3e: Predicate guard for post-resolution
@@ -2375,6 +2404,12 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         }
     );
     if is_spell {
+        // CR 608.2n + CR 608.2c: an instant or sorcery is put into its zone "as
+        // the final part" of its resolution. A resolution that paused for any
+        // choice it opened (a creature type, a surveil split, a "may", the
+        // free-cast window above) keeps its carrier past this call, and has not
+        // reached that part.
+        let resolution_paused = !resolving_carrier_settles_now(state);
         let end_procedure_exiles_resolving_object = ability.as_ref().is_some_and(|ability| {
             matches!(ability.effect, Effect::EndTheTurn)
                 || (matches!(ability.effect, Effect::EndCombatPhase)
@@ -2455,13 +2490,15 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // CR 608.2n: Non-permanent spells are put into owner's graveyard.
             Zone::Graveyard
         };
-        // CR 608.2n + CR 608.2g: the spell is put into its zone "as the final
-        // part" of its resolution, which its open free-cast window and the
+        // CR 608.2n + CR 608.2c: the spell is put into its zone "as the final
+        // part" of its resolution, which the choice it paused on and the
         // instructions parked behind it have not reached. Record the
-        // destination selected above; the continuation's completion delivers
-        // it (`deliver_deferred_spell`). A permanent spell keeps its earlier
-        // handling: it stays where it is.
-        if paused_on_free_cast_window && dest != Zone::Battlefield {
+        // destination selected above; the carrier's settle once those are done
+        // delivers it (`deliver_deferred_spell`), so a later instruction that
+        // counts a graveyard does not see the spell there. A permanent spell
+        // keeps its earlier handling: it stays where it is.
+        let defer_final_move = resolution_paused && dest != Zone::Battlefield;
+        if defer_final_move {
             state.deferred_spell_delivery = Some(crate::types::game_state::DeferredSpellDelivery {
                 object_id: entry.id,
                 destination: dest,
@@ -2992,7 +3029,10 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // the source via `SelfRef`), the post-resolution default move must
             // be skipped — otherwise the spell card travels exile→graveyard
             // and undoes its own self-exile clause (issue #323).
-            if !paused_on_free_cast_window && spell_still_on_stack(state, entry.id) {
+            if !paused_on_free_cast_window
+                && !defer_final_move
+                && spell_still_on_stack(state, entry.id)
+            {
                 // CR 608.2n + CR 614.6: route the spell's stack → graveyard/exile
                 // default move through the pipeline — see
                 // `deliver_resolved_spell_off_stack`.
@@ -3026,7 +3066,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             }
         }
 
-        if !paused_on_free_cast_window {
+        if !paused_on_free_cast_window && !defer_final_move {
             finish_spell_stack_exit(state, entry.id, casting_variant, events);
         }
 
@@ -3447,16 +3487,26 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // resolution frame, including a direct optional-choice frame. In particular,
     // a self-moving trigger needs that carrier to establish its CR 400.7j
     // re-entry link after an accepted choice (Ajani, Nacatl Pariah).
-    if super::triggers::resolution_completion_can_settle(state)
-        && state.active_spell_resolution().is_none()
-        && state.pending_resolution_completion.is_none()
-    {
+    if resolving_carrier_settles_now(state) {
         finish_resolving_stack_entry(
             state,
             super::lifecycle::DelayedTerminalDisposition::Resolved,
         );
         state.resolution_source_relatch = None;
     }
+}
+
+/// CR 608.2c + CR 608.2n: whether the carrier `resolve_top` installed settles
+/// before that call returns, i.e. the resolution followed all of its
+/// instructions without pausing on a choice. One predicate for both questions
+/// `resolve_top` asks of it, so a spell's final move is deferred exactly when
+/// its carrier outlives the call, and is delivered by that carrier's settle
+/// (`deliver_deferred_spell`).
+fn resolving_carrier_settles_now(state: &GameState) -> bool {
+    super::triggers::resolution_completion_can_settle(state)
+        && state.active_spell_resolution().is_none()
+        && state.pending_resolution_completion.is_none()
+        && state.deferred_spell_delivery.is_none()
 }
 
 /// CR 113.3b + CR 113.7a: Resolve an activated keyword ability from the stack.

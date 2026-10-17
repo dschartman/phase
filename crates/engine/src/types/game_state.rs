@@ -6891,12 +6891,13 @@ pub enum BatchCompletion {
 /// the terminal batch belongs to the still-stashed resolving Ripple ability;
 /// the post-announcement boundary then combines this cast's triggers with the
 /// earlier accepted casts' parked observers before ordering the one batch.
-/// CR 608.2n + CR 608.2g: the move of a resolving instant or sorcery to the
+/// CR 608.2n + CR 608.2c: the move of a resolving instant or sorcery to the
 /// zone it goes to "as the final part" of its resolution, held back while the
-/// spell is paused on its own during-resolution free-cast window (Finale of
-/// Promise, Collected Conjuring). The spell stays on the stack until the window
-/// and the rest of its instructions are done; the destination is the one
-/// `resolve_top` selected.
+/// resolution is paused on a choice it opened: a creature type (Kindred
+/// Judgment), a surveil split, a "may", or its own during-resolution free-cast
+/// window (CR 608.2g: Finale of Promise, Collected Conjuring). The spell stays on
+/// the stack until that choice and the rest of its instructions are done; the
+/// destination is the one `resolve_top` selected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredSpellDelivery {
     pub object_id: ObjectId,

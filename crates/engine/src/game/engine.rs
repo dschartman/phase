@@ -8686,9 +8686,10 @@ pub(super) fn resume_pending_continuation_if_priority(
             }
         }
     }
-    // CR 608.2n + CR 608.2g: a spell held on the stack by its own free-cast
-    // window is put into its zone as the final part of its resolution, now
-    // that the window and everything parked behind it are done.
+    // CR 608.2n + CR 608.2c: a spell held on the stack by a mid-resolution
+    // choice (its own free-cast window included) is put into its zone as the
+    // final part of its resolution, now that the choice and everything parked
+    // behind it are done.
     if matches!(state.waiting_for, WaitingFor::Priority { .. })
         && resolution_instructions_are_done(state)
     {
@@ -8739,8 +8740,8 @@ fn resolving_stack_entry_can_settle(state: &GameState) -> bool {
 }
 
 /// CR 608.2c + CR 608.2n: whether the carrier's resolution has followed all of
-/// its instructions. Its carrier still may not settle while a spell paused on
-/// its own free-cast window owes its final move (`deferred_spell_delivery`):
+/// its instructions. Its carrier still may not settle while a spell paused
+/// mid-resolution owes its final move (`deferred_spell_delivery`):
 /// only a site that can deliver that move (`stack::deliver_deferred_spell`,
 /// which needs the event stream) may do so first.
 pub(super) fn resolution_instructions_are_done(state: &GameState) -> bool {

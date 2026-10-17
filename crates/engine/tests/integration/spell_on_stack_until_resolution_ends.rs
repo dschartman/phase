@@ -415,3 +415,42 @@ fn a_spell_paused_on_any_resolution_prompt_reaches_its_graveyard_when_resolution
         );
     }
 }
+
+/// CR 800.4a + CR 608.2n: when a player leaves a multiplayer game while their
+/// own spell is paused on their own choice, that resolution is abandoned, and
+/// the spell, like every other object they own, leaves the game (it is
+/// exiled). The held-back move off the stack is delivered as the resolution is
+/// abandoned, so the departing owner's sweep finds the spell and it is not left
+/// in the stack zone with no stack entry.
+#[test]
+fn a_paused_spell_of_a_player_who_leaves_the_game_is_exiled_with_their_objects() {
+    use engine::game::elimination::eliminate_player;
+
+    let mut scenario = GameScenario::new_n_player(3, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P1, "Llanowar Elves", 1, 1)
+        .with_subtypes(vec!["Elf"]);
+    let judgment = scenario
+        .add_spell_to_hand_from_oracle(P0, "Kindred Judgment", false, KINDRED_JUDGMENT)
+        .id();
+    let mut runner = scenario.build();
+    with_p0_priority(&mut runner);
+
+    cast_and_resolve_to_prompt(&mut runner, judgment);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }),
+        "reach: Kindred Judgment is paused on its caster's creature-type choice"
+    );
+    assert_eq!(zone(&runner, judgment), Zone::Stack);
+
+    eliminate_player(runner.state_mut(), P0, &mut Vec::new());
+
+    assert_eq!(
+        zone(&runner, judgment),
+        Zone::Exile,
+        "CR 800.4a: the departed owner's spell leaves the game with their other objects"
+    );
+    assert!(runner.state().resolving_stack_entry.is_none());
+    assert!(runner.state().deferred_spell_delivery.is_none());
+}

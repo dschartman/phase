@@ -373,7 +373,7 @@ pub fn eliminate_players_simultaneously(
 
     if let Some(winner) = game_over_winner {
         if staged_optional_sacrifice_decline.is_some() {
-            finish_abandoned_source_bound_resolution_carrier(state);
+            finish_abandoned_source_bound_resolution_carrier(state, events);
         }
         // Terminal: drop trigger scaffolding the client would otherwise show as
         // a stuck stack / ordering prompt.
@@ -1121,7 +1121,7 @@ fn do_eliminate(
 
     abandon_source_bound_resolution_prompt(state, player, events);
     retire_pending_zone_change_contexts_owned_by(state, player);
-    abandon_change_zone_family_for_controller(state, player);
+    abandon_change_zone_family_for_controller(state, player, events);
 
     crate::game::planechase::preserve_phenomenon_stack_abilities_for_handoff(state, planar_handoff);
 
@@ -1585,7 +1585,7 @@ fn retire_pending_zone_change_contexts_owned_by(state: &mut GameState, player: P
 fn abandon_source_bound_resolution_prompt(
     state: &mut GameState,
     player: PlayerId,
-    events: &mut [GameEvent],
+    events: &mut Vec<GameEvent>,
 ) {
     let selecting_resolution_sacrifice = matches!(
         &state.waiting_for,
@@ -1662,16 +1662,20 @@ fn abandon_source_bound_resolution_prompt(
         .expect("parked optional sacrifice payment must own its resume cursor");
     }
 
-    finish_abandoned_source_bound_resolution_carrier(state);
+    finish_abandoned_source_bound_resolution_carrier(state, events);
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
 }
 
-fn finish_abandoned_source_bound_resolution_carrier(state: &mut GameState) {
+fn finish_abandoned_source_bound_resolution_carrier(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) {
     crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+        events,
     );
 }
 
@@ -1680,7 +1684,11 @@ fn finish_abandoned_source_bound_resolution_carrier(state: &mut GameState) {
 /// the captured source context, so abandonment removes the owner and its tail
 /// together. `PendingBatchDeliveries` is intentionally not included: it is a
 /// shared per-object batch and retains the existing prune/resume rules.
-fn abandon_change_zone_family_for_controller(state: &mut GameState, player: PlayerId) {
+fn abandon_change_zone_family_for_controller(
+    state: &mut GameState,
+    player: PlayerId,
+    events: &mut Vec<GameEvent>,
+) {
     let Some(pending) = state
         .active_change_zone_frame()
         .and_then(|frame| frame.pending.as_ref())
@@ -1697,6 +1705,7 @@ fn abandon_change_zone_family_for_controller(state: &mut GameState, player: Play
     crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+        events,
     );
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),

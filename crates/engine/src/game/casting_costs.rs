@@ -3589,7 +3589,7 @@ fn sacrifice_selection_member_is_current(
 /// object reusing the same ObjectId, and discard the optional payoff tail.
 pub(crate) fn abandon_stale_resolution_sacrifice_cursor(
     state: &mut GameState,
-    events: &mut [GameEvent],
+    events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
     let stale = match state.pending_cost_move_resume.as_ref() {
         Some(PendingCostMoveResume::SacrificeForCost {
@@ -3621,6 +3621,7 @@ pub(crate) fn abandon_stale_resolution_sacrifice_cursor(
     stack::abandon_active_resolution_carrier(
         state,
         super::lifecycle::DelayedTerminalDisposition::Removed,
+        events,
     );
     state.waiting_for = WaitingFor::Priority {
         player: state.active_player,
@@ -3990,6 +3991,7 @@ pub(crate) fn resume_sacrifice_for_cost(
             stack::abandon_active_resolution_carrier(
                 state,
                 super::lifecycle::DelayedTerminalDisposition::Removed,
+                events,
             );
             state.waiting_for = WaitingFor::Priority {
                 player: state.active_player,

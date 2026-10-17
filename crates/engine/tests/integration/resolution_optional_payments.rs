@@ -1760,6 +1760,27 @@ fn eliminated_resolution_sacrifice_payer_declines_real_stack_replacement_pause()
 
     eliminate_player(runner.state_mut(), P1, &mut Vec::new());
 
+    // CR 608.2n + CR 614.1a: the spell is put into its owner's graveyard only as the final
+    // part of its resolution, which the elimination lets it reach now, with Graveyard Warden
+    // back on the battlefield, so the Warden's optional exile is offered for the spell's own
+    // move. Decline it.
+    let WaitingFor::ReplacementChoice { candidates, .. } = &runner.state().waiting_for else {
+        panic!(
+            "the spell's final move must offer the Warden's replacement, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    let decline = candidates
+        .iter()
+        .position(|candidate| candidate.description == "Decline")
+        .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement { index: decline },
+    )
+    .unwrap();
+
     assert!(runner.state().active_optional_effect_frame().is_none());
     assert!(runner.state().active_ability_continuation().is_none());
     assert!(runner.state().resolving_stack_entry.is_none());

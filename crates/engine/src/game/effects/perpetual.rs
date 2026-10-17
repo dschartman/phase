@@ -1579,6 +1579,15 @@ mod tests {
                         .act(GameAction::OrderTriggers { order: vec![0] })
                         .ok();
                 }
+                // CR 608.2n: "Put the rest on the bottom" is still part of the resolution; the
+                // spell reaches its graveyard only after it.
+                WaitingFor::EffectZoneChoice { cards, count, .. } => {
+                    runner
+                        .act(GameAction::SelectCards {
+                            cards: cards.iter().take(count).copied().collect(),
+                        })
+                        .expect("place the rest on the bottom");
+                }
                 _ if runner.state().stack.is_empty() => return,
                 _ => {
                     runner.act(GameAction::PassPriority).ok();

@@ -780,6 +780,31 @@ fn run_on(
                     }
                     events.extend(runner.act(GameAction::PassPriority).expect("pass").events);
                 }
+                // CR 608.2n: answer the player-effect prompts so a same-chain clause's spell
+                // finishes resolving (and reaches its graveyard) as a delayed payload's spell
+                // already has: the first cards for a discard or dig, none kept on top for a
+                // scry or surveil (so the answer is visible in the player's library).
+                WaitingFor::DiscardChoice { cards, count, .. } => {
+                    runner
+                        .act(GameAction::SelectCards {
+                            cards: cards.iter().take(count).copied().collect(),
+                        })
+                        .expect("discard pick");
+                }
+                WaitingFor::DigChoice {
+                    cards, keep_count, ..
+                } => {
+                    runner
+                        .act(GameAction::SelectCards {
+                            cards: cards.iter().take(keep_count).copied().collect(),
+                        })
+                        .expect("dig pick");
+                }
+                WaitingFor::ScryChoice { .. } | WaitingFor::SurveilChoice { .. } => {
+                    runner
+                        .act(GameAction::SelectCards { cards: vec![] })
+                        .expect("keep none on top");
+                }
                 WaitingFor::OptionalEffectChoice { player, .. } if decide.is_some() => {
                     asked.push(format!("optional:{}", player.0));
                     runner
