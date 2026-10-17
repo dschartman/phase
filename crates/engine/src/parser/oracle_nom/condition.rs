@@ -25142,6 +25142,68 @@ mod tests {
         }
     }
 
+    /// CR 722.3a: "<source> is prepared" / "<source> isn't prepared" is a
+    /// game-state condition over the source permanent's prepared designation
+    /// (Woodwork Prodigy, Paradox Shaper, Stingerquill Voxmancer: "if this
+    /// creature isn't prepared"). Every subject spelling and both polarities
+    /// parse fully, and each parsed condition reads the live designation: it is
+    /// evaluated against the same permanent unprepared and then prepared.
+    #[test]
+    fn parse_inner_condition_source_prepared_reads_the_designation() {
+        use crate::game::game_object::PreparedState;
+        use crate::game::layers::evaluate_condition_for_test;
+        use crate::game::zones::create_object;
+        use crate::types::card_type::CoreType;
+        use crate::types::game_state::GameState;
+        use crate::types::identifiers::CardId;
+        use crate::types::player::PlayerId;
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Prepared Source".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+        }
+
+        // (text, true when the source is prepared)
+        let rows = [
+            ("~ is prepared", true),
+            ("this creature is prepared", true),
+            ("it is prepared", true),
+            ("~ isn't prepared", false),
+            ("~ isn\u{2019}t prepared", false),
+            ("~ is not prepared", false),
+            ("this creature isn't prepared", false),
+            ("this permanent isn't prepared", false),
+            ("it isn't prepared", false),
+        ];
+        for (text, holds_when_prepared) in rows {
+            let (rest, condition) =
+                parse_inner_condition(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert!(rest.is_empty(), "{text}: leftover {rest:?}");
+
+            state.objects.get_mut(&source).unwrap().prepared = None;
+            assert_eq!(
+                evaluate_condition_for_test(&state, &condition, PlayerId(0), source),
+                !holds_when_prepared,
+                "{text}: evaluated against an unprepared source"
+            );
+            state.objects.get_mut(&source).unwrap().prepared = Some(PreparedState);
+            assert_eq!(
+                evaluate_condition_for_test(&state, &condition, PlayerId(0), source),
+                holds_when_prepared,
+                "{text}: evaluated against a prepared source"
+            );
+        }
+    }
+
     /// CR 401.1 + CR 401.5: Vampire Nocturnus's "the top card of your library is
     /// black" parses to a top-of-library color gate. Full-shape assert on the
     /// `HasColor` filter (bare color, no article, no " card" suffix).
