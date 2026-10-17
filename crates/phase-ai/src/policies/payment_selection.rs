@@ -479,6 +479,7 @@ mod tests {
     use super::*;
     use crate::config::AiConfig;
     use crate::context::AiContext;
+    use crate::test_support::{context_with_plans, default_deck_plan};
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::zones::create_object;
     use engine::types::ability::{
@@ -487,7 +488,7 @@ mod tests {
     };
     use engine::types::game_state::{CastingVariant, PendingCast, StackEntry, StackEntryKind};
     use engine::types::identifiers::CardId;
-    use engine::types::mana::ManaCost;
+    use engine::types::mana::{ManaCost, ManaCostShard};
     use engine::types::phase::Phase;
 
     const AI: PlayerId = PlayerId(0);
@@ -1067,6 +1068,302 @@ mod tests {
             ),
             "a two-card payment that still leaves another legal land play is not a final-land loss"
         );
+    }
+
+    // --- discard cost give-up order: `card_value::keep_key` / `cmp_keep` ---
+    //
+    // The rule under test, stated once: at a `PayCost` discard the AI gives up
+    // cards in the cleanup discard's keep order. A land past the plan's land
+    // target (`KeepTier::Surplus`) goes before any spell; a land below the
+    // target (`KeepTier::NeededManaSource`) is kept over any spell; exactly on
+    // the target, or with no plan, a land is an `Ordinary` card priced by
+    // `intrinsic_value` (3.0). Among spells the lower `intrinsic_value` goes.
+    // The last-playable-land penalty is unchanged and still applies on top.
+    //
+    // Every fixture spends the turn's land drop first (CR 305.2b), so no
+    // retained land is "the last playable land" unless a row says so, and the
+    // plan is the derived `default_deck_plan` (land target 6), never a
+    // hand-built `PlanState`.
+
+    fn spell_in_hand(
+        state: &mut GameState,
+        name: &str,
+        core: CoreType,
+        shards: Vec<ManaCostShard>,
+        generic: u32,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            AI,
+            name.to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(core);
+        obj.mana_cost = ManaCost::Cost { shards, generic };
+        obj.base_mana_cost = obj.mana_cost.clone();
+        id
+    }
+
+    fn creature_in_hand(state: &mut GameState, name: &str, power: i32, generic: u32) -> ObjectId {
+        let id = spell_in_hand(
+            state,
+            name,
+            CoreType::Creature,
+            vec![ManaCostShard::Green],
+            generic,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.base_power = Some(power);
+        obj.power = Some(power);
+        obj.base_toughness = Some(power);
+        obj.toughness = Some(power);
+        id
+    }
+
+    /// A main-phase discard prompt on the AI's own turn with `lands_in_play`
+    /// lands on its battlefield and the land drop already spent.
+    fn land_drop_spent_with_lands_in_play(lands_in_play: usize) -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = AI;
+        for i in 0..lands_in_play {
+            make_land(&mut state, &format!("Island {i}"), Zone::Battlefield);
+        }
+        state.lands_played_this_turn = state.max_lands_per_turn;
+        state
+    }
+
+    /// `PaymentSelectionPolicy` with the AI's derived plan in the session —
+    /// the production shape, where `AiSession::plan` is always populated.
+    fn plan_aware_discard_score(state: &GameState, cards: Vec<ObjectId>) -> f64 {
+        let config = AiConfig::default();
+        let context = context_with_plans(state, AI, &config, &[(AI, default_deck_plan())]);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::SelectCards { cards },
+            metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Selection),
+        };
+        PaymentSelectionPolicy.score(&PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: AI,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        })
+    }
+
+    /// The card the policy gives up first among single-card selections.
+    fn given_up(state: &GameState, choices: &[ObjectId]) -> ObjectId {
+        choices
+            .iter()
+            .copied()
+            .max_by(|a, b| {
+                plan_aware_discard_score(state, vec![*a])
+                    .partial_cmp(&plan_aware_discard_score(state, vec![*b]))
+                    .unwrap()
+            })
+            .unwrap()
+    }
+
+    fn assert_land_target(state: &GameState, lands_behind: i8) {
+        assert_eq!(
+            crate::plan::PlanState::realize(state, AI, &default_deck_plan()).lands_behind,
+            lands_behind,
+            "fixture must sit at the stated distance from the derived land target"
+        );
+    }
+
+    #[test]
+    fn discard_cost_past_the_land_target_gives_up_the_surplus_land_before_any_spell() {
+        for lands_in_play in [7, 10] {
+            for (name, core, shards, generic) in [
+                (
+                    "One-Mana Instant",
+                    CoreType::Instant,
+                    vec![ManaCostShard::Blue],
+                    0,
+                ),
+                (
+                    "Three-Mana Enchantment",
+                    CoreType::Enchantment,
+                    vec![ManaCostShard::Blue],
+                    2,
+                ),
+                (
+                    "Six-Mana Sorcery",
+                    CoreType::Sorcery,
+                    vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                    4,
+                ),
+            ] {
+                let mut state = land_drop_spent_with_lands_in_play(lands_in_play);
+                assert_land_target(&state, 6 - lands_in_play as i8);
+                let land = make_land(&mut state, "Spare Island", Zone::Hand);
+                let spell = spell_in_hand(&mut state, name, core, shards, generic);
+                install_discard_payment(&mut state, vec![land, spell]);
+
+                assert_eq!(
+                    given_up(&state, &[land, spell]),
+                    land,
+                    "{lands_in_play} lands in play against a target of 6: the surplus land \
+                     goes before {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discard_cost_below_the_land_target_keeps_the_needed_land_over_any_spell() {
+        // CR 305.2: the land is the only way to reach the plan's land schedule,
+        // and the price does not read castability — whether casting the spell
+        // this turn beats the land is the search continuation's call, not the
+        // give-up order's. The 3/3 is the row the flat 3.0 land price got
+        // wrong: it priced the creature above the needed land.
+        let mut state = land_drop_spent_with_lands_in_play(4);
+        assert_land_target(&state, 2);
+        let land = make_land(&mut state, "Needed Forest", Zone::Hand);
+        let instant = spell_in_hand(
+            &mut state,
+            "One-Mana Instant",
+            CoreType::Instant,
+            vec![ManaCostShard::Blue],
+            0,
+        );
+        let creature = creature_in_hand(&mut state, "Three-Mana 3/3", 3, 2);
+        for spell in [instant, creature] {
+            let mut prompt = state.clone();
+            install_discard_payment(&mut prompt, vec![land, spell]);
+            assert_eq!(
+                given_up(&prompt, &[land, spell]),
+                spell,
+                "four lands in play against a target of 6: the needed land is kept over {}",
+                prompt.objects[&spell].name
+            );
+        }
+    }
+
+    #[test]
+    fn discard_cost_on_the_land_target_prices_the_land_as_an_ordinary_card() {
+        // Exactly on the target the land is `KeepTier::Ordinary` and competes on
+        // `intrinsic_value` (3.0): a cheaper spell goes first, a bigger card is
+        // given up before the land. Pinned so the boundary is explicit.
+        let mut state = land_drop_spent_with_lands_in_play(6);
+        assert_land_target(&state, 0);
+        let land = make_land(&mut state, "Sixth-Target Island", Zone::Hand);
+        let cheap = spell_in_hand(
+            &mut state,
+            "Three-Mana Enchantment",
+            CoreType::Enchantment,
+            vec![ManaCostShard::Blue],
+            2,
+        );
+        let big = creature_in_hand(&mut state, "Three-Mana 3/3", 3, 2);
+
+        let mut cheap_prompt = state.clone();
+        install_discard_payment(&mut cheap_prompt, vec![land, cheap]);
+        assert_eq!(given_up(&cheap_prompt, &[land, cheap]), cheap);
+
+        let mut big_prompt = state.clone();
+        install_discard_payment(&mut big_prompt, vec![land, big]);
+        assert_eq!(given_up(&big_prompt, &[land, big]), land);
+    }
+
+    #[test]
+    fn discard_cost_between_two_spells_gives_up_the_lower_keep_key() {
+        let mut state = land_drop_spent_with_lands_in_play(7);
+        let one_mana = spell_in_hand(
+            &mut state,
+            "One-Mana Instant",
+            CoreType::Instant,
+            vec![ManaCostShard::Blue],
+            0,
+        );
+        let four_mana = spell_in_hand(
+            &mut state,
+            "Four-Mana Sorcery",
+            CoreType::Sorcery,
+            vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            2,
+        );
+        // `{2/B}{2/B}{2/B}`: mana value 6 (CR 202.3f), three pips. The keep
+        // order prices it on `intrinsic_value` (1.5), below the four-mana
+        // sorcery (2.0); the old `cost_card_value` price (3.0) kept it.
+        let hybrid = spell_in_hand(
+            &mut state,
+            "Two-Hybrid Sorcery",
+            CoreType::Sorcery,
+            vec![
+                ManaCostShard::TwoBlack,
+                ManaCostShard::TwoBlack,
+                ManaCostShard::TwoBlack,
+            ],
+            0,
+        );
+        for (low, high) in [(one_mana, four_mana), (hybrid, four_mana)] {
+            let mut prompt = state.clone();
+            install_discard_payment(&mut prompt, vec![low, high]);
+            assert_eq!(
+                given_up(&prompt, &[low, high]),
+                low,
+                "{} has the lower keep key and goes before {}",
+                prompt.objects[&low].name,
+                prompt.objects[&high].name
+            );
+        }
+    }
+
+    /// A main-phase prompt on the AI's own turn with `lands_in_play` lands in
+    /// play and the land drop still open, holding one land and an eight-mana
+    /// sorcery: the land in hand is the only land the AI could play. The
+    /// sorcery's value (4.0) sits above the land's (3.0) and within the
+    /// guard's 2.0, so the guard, not the price, decides when it applies.
+    fn land_drop_open_with_one_land_and_a_dear_spell(
+        lands_in_play: usize,
+    ) -> (GameState, ObjectId, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = AI;
+        for i in 0..lands_in_play {
+            make_land(&mut state, &format!("Island {i}"), Zone::Battlefield);
+        }
+        let land = make_land(&mut state, "Last Playable Island", Zone::Hand);
+        let spell = spell_in_hand(
+            &mut state,
+            "Eight-Mana Sorcery",
+            CoreType::Sorcery,
+            vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            6,
+        );
+        install_discard_payment(&mut state, vec![land, spell]);
+        (state, land, spell)
+    }
+
+    #[test]
+    fn discard_cost_past_the_land_target_gives_up_the_surplus_land_even_when_it_is_the_last_playable_one(
+    ) {
+        // CR 305.2: one land play a turn, and past the plan's target that play
+        // adds nothing the plan wants. The last-playable-land guard protects a
+        // land only when the plan does not count it as surplus.
+        let (state, land, spell) = land_drop_open_with_one_land_and_a_dear_spell(7);
+        assert_land_target(&state, -1);
+        assert_eq!(given_up(&state, &[land, spell]), land);
+    }
+
+    #[test]
+    fn discard_cost_on_the_land_target_keeps_the_last_playable_land_over_a_dearer_spell() {
+        // Guard: on the target (and below it, and with no plan) the
+        // last-playable-land penalty still protects the land.
+        let (state, land, spell) = land_drop_open_with_one_land_and_a_dear_spell(6);
+        assert_land_target(&state, 0);
+        assert_eq!(given_up(&state, &[land, spell]), spell);
     }
 
     #[test]
