@@ -5,17 +5,24 @@
 //! (`policies::mulligan::keepables_by_land_count`). Operates on *parts*
 //! (`subtypes` + `abilities`) so a `GameObject` view and a `CardFace` view share
 //! a single implementation, mirroring the `*_parts` pattern in `features`.
+//!
+//! [`UnmetColors`] is the colour gap between a hand and a battlefield, shared
+//! by land-play sequencing and the keep order's choice of the next land drop.
 
 use engine::ai_support::CandidateAction;
-use engine::game::mana_payment::{land_subtype_to_mana_type, outer_cost_color_demand, ColorDemand};
+use engine::game::mana_payment::{
+    land_subtype_to_mana_type, mana_type_to_demand_index, outer_cost_color_demand, ColorDemand,
+};
 use engine::game::mana_sources::mana_color_to_type;
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, CostCategory, Effect, ManaProduction,
 };
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaType;
+use engine::types::player::PlayerId;
 
 /// Distinct colored-mana types a land can produce, unioning (a) intrinsic mana
 /// from its basic land subtypes (a typed dual like "Land — Plains Island" makes
@@ -43,6 +50,109 @@ pub fn land_produced_color_types(
         collect_mana_production_colors(&mut colors, produced);
     }
     colors
+}
+
+/// The colour gap between `player`'s near-term hand and their battlefield
+/// lands: per colour, how many sources one castable hand card needs
+/// ([`hand_color_demand`]) against how many of their lands produce it.
+///
+/// One measure, two readers: `policies::land_sequencing` credits a `PlayLand`
+/// candidate with the colours it covers, and `card_value::keep_tier` uses the
+/// same count to pick which land in hand is the next land drop, so the land
+/// the keep order protects is the land the AI would play.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnmetColors {
+    supply: ColorDemand,
+    demand: ColorDemand,
+}
+
+impl UnmetColors {
+    pub(crate) fn for_player(state: &GameState, player: PlayerId) -> Self {
+        let (supply, land_count) = land_color_supply(state, player);
+        Self {
+            supply,
+            demand: hand_color_demand(state, player, land_count),
+        }
+    }
+
+    /// How many of the colours in `produced` the hand demands and the
+    /// battlefield cannot yet produce. Uncapped; a caller caps it if it needs to.
+    pub(crate) fn covered(&self, produced: &[ManaType]) -> usize {
+        produced
+            .iter()
+            .copied()
+            .filter_map(mana_type_to_demand_index)
+            .filter(|&index| self.demand[index] > self.supply[index])
+            .count()
+    }
+}
+
+/// [`UnmetColors::covered`] for one producer. Ordered so a colourless producer
+/// pays for nothing: `produced` is read first, and only a land that produces at
+/// least one colour triggers the battlefield and hand scans.
+pub(crate) fn unmet_hand_colors_covered(
+    state: &GameState,
+    player: PlayerId,
+    produced: &[ManaType],
+) -> usize {
+    if produced.is_empty() {
+        return 0;
+    }
+    UnmetColors::for_player(state, player).covered(produced)
+}
+
+/// One battlefield walk yielding both halves of the color-demand comparison:
+/// how many of `player`'s lands produce each color, and how many lands they
+/// control (the castability threshold the hand scan uses).
+fn land_color_supply(state: &GameState, player: PlayerId) -> (ColorDemand, u32) {
+    let mut supply = [0u32; 5];
+    let mut lands = 0;
+    for obj in state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+    {
+        if obj.controller != player || !obj.card_types.core_types.contains(&CoreType::Land) {
+            continue;
+        }
+        lands += 1;
+        for color in land_produced_color_types(&obj.card_types.subtypes, &obj.abilities) {
+            if let Some(index) = mana_type_to_demand_index(color) {
+                supply[index] += 1;
+            }
+        }
+    }
+    (supply, lands)
+}
+
+/// CR 107.4b: element-wise MAX colored-pip demand over the nonland cards in
+/// `player`'s hand that are within one land drop of being castable.
+///
+/// MAX, not sum: demand asks "how many sources of this color does one castable
+/// card need," which is what a land drop can answer this turn — summing would
+/// let a hand of three one-pip green cards claim three unmet green sources.
+/// Castability is the same count-based check `ramp_timing` uses (CR 202.3 mana
+/// value against lands controlled plus this turn's drop) — deliberately never an
+/// affordability sweep, which is far too expensive per candidate.
+fn hand_color_demand(state: &GameState, player: PlayerId, land_count: u32) -> ColorDemand {
+    let mut demand = [0u32; 5];
+    let Some(hand) = state.players.get(player.0 as usize).map(|p| &p.hand) else {
+        return demand;
+    };
+    for obj in hand.iter().filter_map(|id| state.objects.get(id)) {
+        if obj.card_types.core_types.contains(&CoreType::Land)
+            || obj.mana_cost.mana_value() > land_count + 1
+        {
+            continue;
+        }
+        for (slot, needed) in demand
+            .iter_mut()
+            .zip(outer_cost_color_demand(&obj.mana_cost))
+        {
+            *slot = (*slot).max(needed);
+        }
+    }
+    demand
 }
 
 /// Union the colors of a single `ManaProduction` into `colors` (deduplicated,

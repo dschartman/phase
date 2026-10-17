@@ -90,8 +90,10 @@ pub(crate) fn controlled_mana_sources(state: &GameState, player: PlayerId) -> us
 
 impl PlanSnapshot {
     /// The number of lands this deck's curve wants in play once its mana is
-    /// mature — the value `expected_lands` plateaus at (6 for a default deck,
-    /// 7 for a `wants_ramp_curve` deck; see `curves::expected_lands_for`).
+    /// mature — the value `expected_lands` plateaus at: the deck's own land
+    /// density over the cards seen by then (6 for 17 lands in 40 cards or 24
+    /// in 60), plus one for a deck that puts extra lands into play; see
+    /// `curves::expected_lands_for`.
     ///
     /// **Turn-agnostic, deliberately, and that IS the shipped semantics.**
     /// `expected_lands[i]` is indexed by the player's *own* turn ordinal —
@@ -268,10 +270,25 @@ mod tests {
         }
     }
 
+    /// A deck that puts extra lands into play (land fetch, extra land drops).
+    fn land_ramp_features() -> DeckFeatures {
+        DeckFeatures {
+            mana_ramp: ManaRampFeature {
+                extra_landdrop_count: 4,
+                commitment: 0.6,
+                land_commitment: 0.6,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// The land target is read off the REAL derivation, not a hand-built
     /// snapshot: `derive_snapshot` is the only producer of every `plan` entry
-    /// in an `AiSession`, so these two values (6 and 7) are the only land
-    /// targets production can present to `realize`.
+    /// in an `AiSession`. With no deck composition (hand-built features) the
+    /// plateau is the default 6; a deck that puts extra lands into play
+    /// plateaus one higher; a deck whose ramp is mana dorks does not, since a
+    /// dork adds mana and not lands (CR 305.2).
     #[test]
     fn land_target_is_the_derived_schedule_plateau() {
         let baseline = derive_snapshot(&DeckFeatures::default());
@@ -286,8 +303,24 @@ mod tests {
             "the plateau IS the terminal slot — the schedule is monotone"
         );
 
-        let ramp = derive_snapshot(&ramp_features());
-        assert_eq!(ramp.land_target(), 7, "a ramp deck plateaus at 7 lands");
+        let land_ramp = derive_snapshot(&land_ramp_features());
+        assert_eq!(
+            land_ramp.land_target(),
+            7,
+            "a deck that adds lands plateaus at 7 lands"
+        );
+
+        let dork_ramp = derive_snapshot(&ramp_features());
+        assert_eq!(
+            dork_ramp.land_target(),
+            6,
+            "mana dorks add mana, not lands: the land target stays 6"
+        );
+        assert_eq!(
+            dork_ramp.mana_target(),
+            7,
+            "the dorks still raise the mana target"
+        );
     }
 
     /// The shipped semantics, pinned: `realize` reads the deck's mature land

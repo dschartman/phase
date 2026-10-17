@@ -1115,10 +1115,12 @@ mod tests {
     //
     // The rule under test, stated once: at a `PayCost` discard the AI gives up
     // cards in the cleanup discard's keep order. A land past the plan's land
-    // target (`KeepTier::Surplus`) goes before any spell; a land below the
-    // target (`KeepTier::NeededManaSource`) is kept over any spell; exactly on
-    // the target, or with no plan, a land is an `Ordinary` card priced by
-    // `intrinsic_value` (3.0). Among spells the lower `intrinsic_value` goes.
+    // target (`KeepTier::Surplus`) goes before any spell; below the target the
+    // land that makes the next land drop (`KeepTier::NeededManaSource`) is kept
+    // over any spell and any further land is an `Ordinary` card (CR 305.2: one
+    // land a turn); exactly on the target, or with no plan, a land is an
+    // `Ordinary` card priced by `intrinsic_value` (3.0). Among spells the lower
+    // `intrinsic_value` goes.
     // The last-playable-land penalty is unchanged and still applies on top.
     //
     // Every fixture spends the turn's land drop first (CR 305.2b), so no

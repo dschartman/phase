@@ -14515,7 +14515,9 @@ mod tests {
 
     /// MAIN TEST. CR 514.1 + CR 701.9a: while the discarding player is behind
     /// their own land schedule, cleanup discard surrenders a creature rather
-    /// than a mana rock or a land.
+    /// than a mana rock or the land that makes the next land drop. (A second
+    /// land in hand is an ordinary card, CR 305.2; see
+    /// `discard_to_hand_size_below_the_target_gives_up_a_second_land_before_a_fatty`.)
     ///
     /// FAILS ON BASE: the pre-change arm sorts on the raw scalar, whose minimum
     /// is the MV-3 rock at 1.5 (vs. Swamp 3.0, 5/5 creature 15.5).
@@ -14526,7 +14528,7 @@ mod tests {
         land_on_battlefield(&mut state, ai);
 
         let rock = mana_rock_in_hand(&mut state, ai);
-        let swamps = [land_in_hand(&mut state, ai), land_in_hand(&mut state, ai)];
+        let swamps = [land_in_hand(&mut state, ai)];
         let fatties: Vec<_> = (0..4).map(|_| fatty_in_hand(&mut state, ai)).collect();
         state.waiting_for = discard_waiting_for(&state, ai, 1);
 
