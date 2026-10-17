@@ -351,6 +351,22 @@ pub(crate) fn outcome_is_lethal(target: &GameObject, outcome: &DamageOutcome) ->
     u32::try_from(reduced).is_ok_and(|threshold| marked >= threshold)
 }
 
+/// Does lowering `target`'s toughness by `reduction` (a -X/-X effect, CR
+/// 613.4c) kill it at the next state-based action check? For the SBAs a
+/// toughness reduction reads exactly like -1/-1 counters with no damage added:
+/// 0 or less toughness is CR 704.5f, through indestructible; otherwise damage
+/// already marked against the reduced toughness is CR 704.5g. Reads the
+/// object's current toughness, so bonuses already in effect count.
+pub(crate) fn toughness_reduction_is_lethal(target: &GameObject, reduction: u32) -> bool {
+    outcome_is_lethal(
+        target,
+        &DamageOutcome {
+            minus_counters: reduction,
+            ..DamageOutcome::default()
+        },
+    )
+}
+
 /// CR 122.1a: `target`'s toughness once this spell's -1/-1 counters (CR 120.3d)
 /// are on it. The single authority for the counter-reduced toughness — it is
 /// both the CR 704.5g lethal-damage threshold and, clamped at 0, the size of the
