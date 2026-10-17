@@ -184,10 +184,25 @@ fn reject_reason(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
 /// receive any of its upside. A soft no-target penalty still lets softmax spend
 /// a card to enhance an opponent's creature, which is never a useful line when
 /// the spell supplies no separate damage, removal, or AI-directed resource.
+///
+/// Reads only what the spell does when it resolves: its spell-kind abilities
+/// ([`action_ability_definitions`]), not [`PolicyContext::effects`], whose
+/// `CastSpell` arm also walks a permanent's activated abilities. CR 608.3 +
+/// CR 113.6 + CR 602.2: a permanent spell resolves by becoming a permanent,
+/// and its activated abilities work only from the battlefield, each activated
+/// later by its own action. Reading them here rejected Liliana the Repentant
+/// (an Exhaust reanimation) and Tomik, Orzhov Lawmage (a `{T}` flying grant)
+/// whenever their controller had no creature, so neither was ever cast onto an
+/// empty board.
 fn beneficial_creature_spell_has_no_friendly_recipient(ctx: &PolicyContext<'_>) -> bool {
-    let effects = ctx.effects();
+    let effects: Vec<&Effect> = action_ability_definitions(ctx)
+        .into_iter()
+        .flat_map(collect_definition_effects)
+        .collect();
     let has_beneficial_creature_effect = effects.iter().any(|effect| {
-        matches!(effect_polarity(effect), EffectPolarity::Beneficial) && targets_creatures(effect)
+        matches!(effect_polarity(effect), EffectPolarity::Beneficial)
+            && targets_creatures(effect)
+            && recipient_is_on_battlefield(effect)
     });
     if !has_beneficial_creature_effect {
         return false;
@@ -212,6 +227,25 @@ fn beneficial_creature_spell_has_no_friendly_recipient(ctx: &PolicyContext<'_>) 
     }) && !effects
         .iter()
         .any(|effect| untargeted_effect_confirms_ai_payoff(ctx, effect))
+}
+
+/// CR 115.1 + CR 400.1: does this effect act on an object on the
+/// battlefield? Only then can a creature the AI controls on the battlefield be
+/// its recipient. A `ChangeZone` out of another zone (Generous Revival's
+/// "return target creature card from your graveyard") acts on a card in that
+/// zone, and a target filter confined to other zones selects nothing on the
+/// battlefield, so the AI's board says nothing about who receives it.
+fn recipient_is_on_battlefield(effect: &Effect) -> bool {
+    if matches!(
+        effect,
+        Effect::ChangeZone { origin: Some(origin), .. } if *origin != Zone::Battlefield
+    ) {
+        return false;
+    }
+    let zones = extract_target_filter(effect)
+        .map(TargetFilter::extract_zones)
+        .unwrap_or_default();
+    zones.is_empty() || zones.contains(&Zone::Battlefield)
 }
 
 fn cast_has_unpayable_self_etb_may_cost(ctx: &PolicyContext<'_>) -> bool {
