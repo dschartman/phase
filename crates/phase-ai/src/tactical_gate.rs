@@ -8704,4 +8704,153 @@ mod tests {
             assert_eq!(gate_cast(state, growth), GateDecision::Reject);
         }
     }
+
+    // --- Negative-toughness pumps outside combat must kill something ---
+
+    /// CR 704.5f: a -3/-3 that leaves every opposing creature above zero
+    /// toughness kills nothing, and outside a combat window there is no
+    /// attack or block for the shrink to swing. Last Gasp shape against
+    /// Traxos (1/5, the only opposing creature at seed 42 T23-T24), in the
+    /// windows of the forced replay: own main phases, own draw step, the
+    /// opponent's end step.
+    #[test]
+    fn negative_toughness_pump_spell_rejected_when_no_opposing_creature_dies_outside_combat() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Traxos", 1, 5);
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+
+        for (phase, active) in [
+            (Phase::PreCombatMain, P0),
+            (Phase::PostCombatMain, P0),
+            (Phase::Draw, P0),
+            (Phase::End, P1),
+        ] {
+            set_priority_window(state, phase, active);
+            assert_eq!(
+                gate_cast(state, gasp),
+                GateDecision::Reject,
+                "Last Gasp that kills nothing was a candidate in {phase:?}"
+            );
+        }
+    }
+
+    /// CR 704.5g: damage already marked counts. A 1/5 with 2 damage is a 1/2
+    /// with 2 damage after -3/-3 and dies; with 1 damage it survives. CR
+    /// 702.12b: an indestructible creature ignores lethal damage, so the same
+    /// 2 damage does not make the shrink lethal on it.
+    #[test]
+    fn negative_toughness_pump_spell_lethality_counts_marked_damage() {
+        let mut scenario = GameScenario::new();
+        let traxos = scenario.add_creature(P1, "Traxos", 1, 5).id();
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        state.objects.get_mut(&traxos).unwrap().damage_marked = 2;
+        assert_ne!(
+            gate_cast(state, gasp),
+            GateDecision::Reject,
+            "-3/-3 on a 1/5 with 2 damage is lethal (CR 704.5g)"
+        );
+
+        state.objects.get_mut(&traxos).unwrap().damage_marked = 1;
+        assert_eq!(
+            gate_cast(state, gasp),
+            GateDecision::Reject,
+            "-3/-3 on a 1/5 with 1 damage leaves it alive"
+        );
+
+        let traxos_object = state.objects.get_mut(&traxos).unwrap();
+        traxos_object.damage_marked = 2;
+        traxos_object.keywords.push(Keyword::Indestructible);
+        assert_eq!(
+            gate_cast(state, gasp),
+            GateDecision::Reject,
+            "indestructible ignores the lethal-damage SBA (CR 702.12b)"
+        );
+    }
+
+    /// CR 613.4c: lethality reads the creature's current toughness, with
+    /// bonuses already in effect, not its printed value. A printed 2/2 under
+    /// an anthem for +2/+2 is a 4/4, which -3/-3 does not kill; without the
+    /// anthem the same printed 2/2 dies.
+    #[test]
+    fn negative_toughness_pump_spell_lethality_reads_current_toughness() {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+        scenario.add_enchantment_from_oracle(P1, "Anthem", "Creatures you control get +2/+2.");
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        engine::game::layers::evaluate_layers(state);
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        let bear_object = state.objects.get(&bear).unwrap();
+        assert_eq!(
+            (bear_object.base_toughness, bear_object.toughness),
+            (Some(2), Some(4)),
+            "fixture: the anthem should make the printed 2/2 a 4/4"
+        );
+        assert_eq!(gate_cast(state, gasp), GateDecision::Reject);
+    }
+
+    /// Inside combat the shrink can swing damage without killing anything, so
+    /// lethality is not required there. CR 510.1a: an attacker shrunk from 4
+    /// to 1 power deals 1, which stops lethal damage to an AI at 4 life
+    /// (opponent's declare blockers and combat damage steps, no blockers).
+    /// CR 510.1c: a blocking 1/5 shrunk to 1/2 dies to the AI's 2/2 attacker.
+    #[test]
+    fn negative_toughness_pump_spell_in_combat_not_rejected_for_killing_nothing() {
+        let mut scenario = GameScenario::new();
+        scenario.with_life(P0, 4);
+        let attacker = scenario.add_creature(P1, "Attacker", 4, 5).id();
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+
+        for phase in [Phase::DeclareBlockers, Phase::CombatDamage] {
+            set_priority_window(state, phase, P1);
+            state.combat = Some(CombatState {
+                attackers: vec![AttackerInfo::attacking_player(attacker, P0)],
+                ..Default::default()
+            });
+            assert_ne!(
+                gate_cast(state, gasp),
+                GateDecision::Reject,
+                "a shrink that stops lethal damage was rejected in {phase:?}"
+            );
+        }
+
+        let mut scenario = GameScenario::new();
+        let ours = scenario.add_creature(P0, "Our Bear", 2, 2).id();
+        let traxos = scenario.add_creature(P1, "Traxos", 1, 5).id();
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::DeclareBlockers, P0);
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(ours, P1)],
+            blocker_assignments: [(ours, vec![traxos])].into_iter().collect(),
+            blocker_to_attacker: [(traxos, vec![ours])].into_iter().collect(),
+            ..Default::default()
+        });
+        assert_ne!(
+            gate_cast(state, gasp),
+            GateDecision::Reject,
+            "a shrink that lets our attacker kill its blocker was rejected"
+        );
+    }
 }
