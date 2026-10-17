@@ -144,9 +144,14 @@ fn commitment(
         _ => 0,
     };
     let extra = match &authority.extra_cost {
-        Some(extra) if extra.mode == CastCostMode::Additional => {
-            super::self_cost::real_self_cost(state, player, object_id, &extra.cost, penalties)
-        }
+        Some(extra) if extra.mode == CastCostMode::Additional => super::self_cost::real_self_cost(
+            state,
+            player,
+            object_id,
+            &extra.cost,
+            penalties,
+            super::self_cost::DiscardPrice::PerCard,
+        ),
         _ => 0.0,
     };
     let counter = match authority.enters_with_counter {

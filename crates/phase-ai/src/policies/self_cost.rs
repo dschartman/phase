@@ -45,24 +45,29 @@ use engine::game::effects::counters::{preview_counter_addition, CounterAdditionP
 use engine::game::effects::draw::{preview_draw_delivery, DrawDeliveryPreview};
 use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::game_object::GameObject;
+use engine::game::keywords::effective_flashback_cost;
 use engine::game::players;
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, CostCategory, Effect, QuantityExpr, TargetFilter,
+    AbilityCondition, AbilityCost, AbilityDefinition, AdditionalCost, CostCategory, Effect,
+    QuantityExpr, TargetFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::counter::{CounterMatch, CounterType};
 use engine::types::game_state::GameState;
 use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
+use engine::types::keywords::FlashbackCost;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 use crate::ability_chain::collect_chain_effects;
+use crate::card_value;
 use crate::config::PolicyPenalties;
 use crate::eval::board_stats;
 use crate::features::landfall::ability_searches_library_for_land;
 use crate::features::mana_ramp::target_filter_references_land;
 use crate::features::DeckFeatures;
+use crate::plan::PlanState;
 
 use super::effect_classify::{
     aggregate_player_impact_in, extract_target_filter, filter_admits_player, lethal_to_creature,
@@ -191,6 +196,22 @@ fn self_counter_removal_cost(cost: &AbilityCost) -> Option<(u32, &CounterType)> 
     }
 }
 
+/// How [`real_self_cost`] prices a "discard a card" leg.
+///
+/// The two answer different questions, as pay-life's price and
+/// [`cost_is_material`]'s life count do. A bound on a trivial payoff asks
+/// whether a card is spent at all, so it counts cards. A comparison against a
+/// priced payoff asks what the card spent is worth, so it prices the card.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DiscardPrice {
+    /// `self_cost_discard_per_card` per card, whatever the card.
+    PerCard,
+    /// CR 118.1 + CR 701.9b: the card the keep order gives up, measured in
+    /// expected draws ([`discard_given_up_cost`]), read against the
+    /// discarding player's plan.
+    GivenUp(Option<PlanState>),
+}
+
 /// Price the self-inflicted portion of `cost` in card-equivalent units.
 /// `Composite` sums its sub-costs (you pay them all); `OneOf` takes the minimum
 /// (the payer chooses the cheapest). Out-of-scope sub-costs (mana, tap) price 0.
@@ -200,6 +221,7 @@ pub(crate) fn real_self_cost(
     source_id: ObjectId,
     cost: &AbilityCost,
     penalties: &PolicyPenalties,
+    discard: DiscardPrice,
 ) -> f64 {
     match cost {
         AbilityCost::Sacrifice(sacrifice) => {
@@ -214,9 +236,34 @@ pub(crate) fn real_self_cost(
                 * pay_life_criticality_mult(state, ai_player)
         }
         // Discard `count` is a QuantityExpr (unlike `Exile.count`).
-        AbilityCost::Discard { count, .. } => {
-            let cards = resolve_quantity(state, count, ai_player, source_id).max(0) as f64;
-            cards * penalties.self_cost_discard_per_card
+        AbilityCost::Discard {
+            count,
+            filter,
+            selection,
+            self_scope,
+        } => {
+            let cards = resolve_quantity(state, count, ai_player, source_id).max(0) as usize;
+            match discard {
+                // CR 701.9b: only a chosen discard from hand gives up the card
+                // the keep order picks. A random discard or "discard this card"
+                // keeps the per-card price.
+                DiscardPrice::GivenUp(plan)
+                    if self_scope.is_from_hand() && selection.is_chosen() =>
+                {
+                    discard_given_up_cost(
+                        state,
+                        ai_player,
+                        source_id,
+                        cards,
+                        filter.as_ref(),
+                        plan,
+                        penalties,
+                    )
+                }
+                DiscardPrice::PerCard | DiscardPrice::GivenUp(_) => {
+                    cards as f64 * penalties.self_cost_discard_per_card
+                }
+            }
         }
         // `Exile.count` is a plain `u32` here, so multiply directly —
         // `resolve_quantity` takes a `&QuantityExpr` and does not apply. Hand
@@ -228,12 +275,12 @@ pub(crate) fn real_self_cost(
         },
         AbilityCost::Composite { costs } => costs
             .iter()
-            .map(|c| real_self_cost(state, ai_player, source_id, c, penalties))
+            .map(|c| real_self_cost(state, ai_player, source_id, c, penalties, discard))
             .sum(),
         AbilityCost::OneOf { costs } => {
             let min = costs
                 .iter()
-                .map(|c| real_self_cost(state, ai_player, source_id, c, penalties))
+                .map(|c| real_self_cost(state, ai_player, source_id, c, penalties, discard))
                 .fold(f64::INFINITY, f64::min);
             if min.is_finite() {
                 min
@@ -242,6 +289,93 @@ pub(crate) fn real_self_cost(
             }
         }
         _ => 0.0,
+    }
+}
+
+/// CR 118.1 + CR 701.9b: the price of discarding `count` cards from the AI's
+/// hand to pay a cost, in expected draws.
+///
+/// The cards are the ones the keep order gives up
+/// ([`card_value::given_up_value`]) among the hand cards the cost admits (not
+/// the source, CR 118.3; matching the cost's filter). Their value is divided by
+/// [`card_value::expected_draw_value`], so a card as good as an average draw
+/// costs exactly one card, the flat price this replaces, and a lone card worth
+/// four draws costs four. With no library to measure against, or fewer
+/// admissible cards than the cost demands, the missing part keeps the per-card
+/// price.
+fn discard_given_up_cost(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    count: usize,
+    filter: Option<&TargetFilter>,
+    plan: Option<PlanState>,
+    penalties: &PolicyPenalties,
+) -> f64 {
+    let per_card = penalties.self_cost_discard_per_card;
+    let Some(expected_draw) = card_value::expected_draw_value(state, ai_player) else {
+        return count as f64 * per_card;
+    };
+    let filter_ctx = FilterContext::from_source(state, source_id);
+    let pool: Vec<ObjectId> = state.players[ai_player.0 as usize]
+        .hand
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id != source_id
+                && filter.is_none_or(|filter| matches_target_filter(state, id, filter, &filter_ctx))
+        })
+        .collect();
+    let given_up = count.min(pool.len());
+    card_value::given_up_value(state, &pool, given_up, plan) / expected_draw * per_card
+        + (count - given_up) as f64 * per_card
+}
+
+/// CR 601.2f + CR 702.34a: the mandatory non-mana cost a cast of `object`
+/// pays that includes a discard from hand, or `None`.
+///
+/// Two sites carry such a cost: a `Required` additional cost (Thrill of
+/// Possibility's "As an additional cost to cast this spell, discard a card")
+/// and a flashback cost, which functions only from the graveyard (Twinned
+/// Vision's "Flashback—{1}{U/R}{U/R}, Discard a card"). CR 601.2f composes the
+/// two when both exist; the discard legs would then draw on one hand twice,
+/// which a sum of per-leg prices cannot represent, so that shape stands down.
+/// Declinable and chosen additional costs (CR 601.2b) never force the loss.
+pub(crate) fn mandatory_cast_discard_cost(
+    state: &GameState,
+    object: &GameObject,
+) -> Option<AbilityCost> {
+    let additional = match &object.additional_cost {
+        Some(AdditionalCost::Required(cost)) => Some(cost.clone()),
+        Some(
+            AdditionalCost::Optional { .. }
+            | AdditionalCost::Kicker { .. }
+            | AdditionalCost::Choice(_, _),
+        )
+        | None => None,
+    };
+    let flashback = (object.zone == Zone::Graveyard)
+        .then(|| effective_flashback_cost(state, object.id))
+        .flatten()
+        .and_then(|cost| match cost {
+            FlashbackCost::NonMana(cost) => Some(cost),
+            FlashbackCost::Mana(_) => None,
+        });
+    let cost = match (additional, flashback) {
+        (Some(cost), None) | (None, Some(cost)) => cost,
+        (None, None) | (Some(_), Some(_)) => return None,
+    };
+    discards_from_hand(&cost).then_some(cost)
+}
+
+/// True when `cost` charges a discard from hand on every payment path: a
+/// `Composite` leg, or every leg of a `OneOf`.
+fn discards_from_hand(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::Discard { self_scope, .. } => self_scope.is_from_hand(),
+        AbilityCost::Composite { costs } => costs.iter().any(discards_from_hand),
+        AbilityCost::OneOf { costs } => !costs.is_empty() && costs.iter().all(discards_from_hand),
+        _ => false,
     }
 }
 
@@ -262,10 +396,11 @@ pub(crate) fn real_self_cost(
 /// to).
 ///
 /// Every other cost shape is `false`, for two different reasons. Discard and
-/// hand-exile already price at `self_cost_discard_per_card` (1.0) per card,
-/// which is exactly the caller's real-cost floor, so listing them would change
-/// no verdict. Sacrifice is deliberately excluded: it is priced against the
-/// specific permanent the cost would consume, and the cheap end of that range
+/// hand-exile already price at `self_cost_discard_per_card` (1.0) per card on
+/// the bound path ([`DiscardPrice::PerCard`]), which is exactly the caller's
+/// real-cost floor, so listing them would change no verdict. Sacrifice is
+/// deliberately excluded: it is priced against the specific permanent the cost
+/// would consume, and the cheap end of that range
 /// (`sacrifice_token_cost`) sits *below* the floor on purpose, so that cracking
 /// a Clue, Food or Treasure stays available — a count bound has no meaning
 /// there, because the resource is not fungible the way life is.
@@ -450,7 +585,110 @@ pub(crate) fn appraise_benefit(
     penalties: &PolicyPenalties,
 ) -> BenefitAppraisal {
     let effects = collect_chain_effects(ability);
-    let classified = classify_effects(state, ai_player, source_id, ability, &effects);
+    appraise_effects(state, ai_player, source_id, ability, &effects, penalties)
+}
+
+/// [`appraise_benefit`] for a spell about to be cast from `origin`: the payoff
+/// of the effects that cast performs.
+///
+/// CR 601.2a + CR 614.1a: a sub-ability that replaces its parent "instead"
+/// (`AbilityCondition::ConditionInstead`) is decided by where the spell is cast
+/// from when its condition reads only that ([`cast_origin_holds`]); Twinned
+/// Vision cast by flashback from the graveyard draws two, not one. Any other
+/// conditional or branching shape is `Unpriced`, so the comparison stands down.
+pub(crate) fn appraise_cast_benefit(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    ability: &AbilityDefinition,
+    origin: Zone,
+    penalties: &PolicyPenalties,
+) -> BenefitAppraisal {
+    match effects_cast_from(ability, origin) {
+        Some(effects) => {
+            appraise_effects(state, ai_player, source_id, ability, &effects, penalties)
+        }
+        None => BenefitAppraisal::Unpriced,
+    }
+}
+
+/// The effects a spell performs when cast from `origin`, in chain order, or
+/// `None` when the chain carries a condition, branch or mode that `origin`
+/// alone does not decide.
+fn effects_cast_from(ability: &AbilityDefinition, origin: Zone) -> Option<Vec<&Effect>> {
+    let unbranched =
+        |node: &AbilityDefinition| node.else_ability.is_none() && node.mode_abilities.is_empty();
+    if ability.condition.is_some() || !unbranched(ability) {
+        return None;
+    }
+    let mut effects: Vec<&Effect> = vec![&ability.effect];
+    let mut next = ability.sub_ability.as_deref();
+    while let Some(node) = next {
+        if !unbranched(node) {
+            return None;
+        }
+        match &node.condition {
+            None => effects.push(&node.effect),
+            // CR 614.1a: "instead" replaces the parent instruction.
+            Some(AbilityCondition::ConditionInstead { inner }) => {
+                if cast_origin_holds(inner, origin)? {
+                    effects.pop();
+                    effects.push(&node.effect);
+                }
+            }
+            Some(_) => return None,
+        }
+        next = node.sub_ability.as_deref();
+    }
+    Some(effects)
+}
+
+/// CR 601.2a: whether `condition` holds for a spell cast from `origin`, read
+/// in three-valued logic: `Some` when the cast's origin decides it, `None`
+/// when any other fact would be needed. A conjunction with a false conjunct is
+/// false and a disjunction with a true disjunct is true, whatever the other
+/// terms read, which is what decides "if this spell wasn't cast from your
+/// hand" (`Not(And[WasCast{Hand}, owned by you])`) from the origin alone.
+fn cast_origin_holds(condition: &AbilityCondition, origin: Zone) -> Option<bool> {
+    match condition {
+        AbilityCondition::WasCast { zone } => Some(zone.is_none_or(|zone| zone == origin)),
+        AbilityCondition::Not { condition } => cast_origin_holds(condition, origin).map(|b| !b),
+        AbilityCondition::And { conditions } => {
+            let terms: Vec<_> = conditions
+                .iter()
+                .map(|c| cast_origin_holds(c, origin))
+                .collect();
+            if terms.contains(&Some(false)) {
+                Some(false)
+            } else {
+                terms.iter().all(|t| *t == Some(true)).then_some(true)
+            }
+        }
+        AbilityCondition::Or { conditions } => {
+            let terms: Vec<_> = conditions
+                .iter()
+                .map(|c| cast_origin_holds(c, origin))
+                .collect();
+            if terms.contains(&Some(true)) {
+                Some(true)
+            } else {
+                terms.iter().all(|t| *t == Some(false)).then_some(false)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The shared walk behind [`appraise_benefit`] and [`appraise_cast_benefit`].
+fn appraise_effects(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    ability: &AbilityDefinition,
+    effects: &[&Effect],
+    penalties: &PolicyPenalties,
+) -> BenefitAppraisal {
+    let classified = classify_effects(state, ai_player, source_id, ability, effects);
     let mut total = 0.0;
     let mut any_nontrivial = false;
     let mut any_unmodeled = false;
@@ -1187,9 +1425,16 @@ pub(crate) fn synergy_justifies_self_cost(
     features: &DeckFeatures,
     ability: &AbilityDefinition,
 ) -> bool {
-    ability.cost.as_ref().is_some_and(|cost| {
-        !contains_sacrifice_cost(cost) && synergy_justifies_cost(features, cost)
-    })
+    ability
+        .cost
+        .as_ref()
+        .is_some_and(|cost| synergy_justifies_cost_tree(features, cost))
+}
+
+/// [`synergy_justifies_self_cost`] for a cost that is not an ability's own,
+/// such as the mandatory cost of a cast.
+pub(crate) fn synergy_justifies_cost_tree(features: &DeckFeatures, cost: &AbilityCost) -> bool {
+    !contains_sacrifice_cost(cost) && synergy_justifies_cost(features, cost)
 }
 
 /// A sacrifice leaf remains a real cost even when nested in a composite or a
