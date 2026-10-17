@@ -4,6 +4,7 @@ use engine::ai_support::{
     is_targeted_exchange_root, targeted_exchange_verdict, AiDecisionContext, CandidateAction,
     TargetedExchangeVerdict,
 };
+use engine::game::ability_utils::modal_spell_mode_ability_refs;
 use engine::game::casting::{
     activated_ability_definitions, activation_source_and_activator_are_structurally_eligible,
     cast_spell_face_choice_available, effective_spell_cost,
@@ -339,7 +340,59 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    let effects = ctx.effects();
+    // CR 601.2b + CR 700.2a: a modal spell's modes are chosen as it is cast,
+    // so each mode is gated on its own and the cast survives when any mode
+    // does. Flattening every mode into one effect list would let a counter
+    // mode with nothing to counter veto a castable removal or draw mode, and
+    // a removal mode with no live target veto an untargeted mode.
+    if let Some(modes) = modal_spell_mode_effects(ctx) {
+        return best_mode_decision(
+            modes
+                .iter()
+                .map(|effects| assess_cast_effects(ctx, effects)),
+        );
+    }
+    assess_cast_effects(ctx, &ctx.effects())
+}
+
+/// The effects of each mode of a modal spell being cast, one list per mode,
+/// or `None` when the candidate is not a modal spell cast whose modes the
+/// engine indexes as its spell-kind abilities (`modal_spell_mode_ability_refs`).
+/// A count mismatch between the modal header and those abilities fails back to
+/// the flattened reading rather than guessing which ability is which mode.
+fn modal_spell_mode_effects<'a>(ctx: &PolicyContext<'a>) -> Option<Vec<Vec<&'a Effect>>> {
+    let GameAction::CastSpell { .. } = &ctx.candidate.action else {
+        return None;
+    };
+    let object = ctx.source_object()?;
+    let modal = object.modal.as_ref()?;
+    let modes: Vec<Vec<&'a Effect>> = modal_spell_mode_ability_refs(object)
+        .map(crate::cast_facts::collect_definition_effects)
+        .collect();
+    (modal.mode_count > 0 && modes.len() == modal.mode_count).then_some(modes)
+}
+
+/// The cast is kept when any mode is: the most permissive verdict wins
+/// (`Allow` over the mildest `AllowWithPenalty` over `Reject`).
+fn best_mode_decision(decisions: impl Iterator<Item = GateDecision>) -> GateDecision {
+    decisions.fold(GateDecision::Reject, |best, decision| {
+        match (best, decision) {
+            (GateDecision::Allow, _) | (_, GateDecision::Allow) => GateDecision::Allow,
+            (GateDecision::AllowWithPenalty(a), GateDecision::AllowWithPenalty(b)) => {
+                GateDecision::AllowWithPenalty(a.max(b))
+            }
+            (GateDecision::AllowWithPenalty(p), GateDecision::Reject)
+            | (GateDecision::Reject, GateDecision::AllowWithPenalty(p)) => {
+                GateDecision::AllowWithPenalty(p)
+            }
+            (GateDecision::Reject, GateDecision::Reject) => GateDecision::Reject,
+        }
+    })
+}
+
+/// Effect-level futility checks for one cast or activation reading: the whole
+/// effect list of a non-modal candidate, or one mode of a modal spell.
+fn assess_cast_effects(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> GateDecision {
     if effects.is_empty() {
         return GateDecision::Allow;
     }
@@ -357,16 +410,24 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    if is_redundant_creature_only_removal(ctx, &effects) {
+    if is_redundant_creature_only_removal(ctx, effects) {
         return GateDecision::Reject;
     }
 
-    if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(&effects) {
+    if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(effects) {
         let source_is_spell = ctx.source_object().is_some_and(|source| {
             source.card_types.core_types.contains(&CoreType::Instant)
                 || source.card_types.core_types.contains(&CoreType::Sorcery)
         });
-        if source_is_spell {
+        if source_is_spell && toughness_bonus < 0 {
+            // CR 704.5f: a -X/-X spell kills any creature whose toughness it
+            // takes to 0 or less, in whatever window it resolves, so it is
+            // creature removal, not a combat trick. It has already passed the
+            // removal path above (`is_redundant_creature_only_removal`: a live
+            // opposing target that is not already dying); the pump-window
+            // rejection, which prices a temporary stat change by the combat
+            // it can swing, does not apply.
+        } else if source_is_spell {
             let facts = TacticalFacts::derive(ctx.state, ctx.ai_player);
             if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
                 return GateDecision::Reject;
@@ -391,7 +452,7 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
                     facts.window,
                     TacticalWindow::CombatAfterBlocks | TacticalWindow::CombatDamage
                 )
-                && self_pump_on_unblocked_attacker(ctx.state, ctx.ai_player, source_id, &effects);
+                && self_pump_on_unblocked_attacker(ctx.state, ctx.ai_player, source_id, effects);
             if !mana_sink_into_open_board {
                 if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
                     return GateDecision::Reject;
