@@ -15348,6 +15348,39 @@ mod tests {
         assert!(!fatties.contains(&chosen));
     }
 
+    /// CR 514.1 + CR 305.2: below the land target only the next land drop is
+    /// needed. Two lands on the battlefield (target 6, four behind) and two
+    /// lands plus two 15.5 fatties in hand, discard one: the second land is an
+    /// ordinary card at 3.0 and goes; the fatties and the next drop stay.
+    #[test]
+    fn discard_to_hand_size_below_the_target_gives_up_a_second_land_before_a_fatty() {
+        let mut state = commander_discard_state();
+        let ai = PlayerId(0);
+        for _ in 0..2 {
+            land_on_battlefield(&mut state, ai);
+        }
+        let lands = [land_in_hand(&mut state, ai), land_in_hand(&mut state, ai)];
+        let fatties: Vec<_> = (0..2).map(|_| fatty_in_hand(&mut state, ai)).collect();
+        state.waiting_for = discard_waiting_for(&state, ai, 1);
+
+        let plan = default_deck_plan();
+        assert_eq!(
+            crate::plan::PlanState::realize(&state, ai, &plan).lands_behind,
+            4,
+            "fixture premise: four lands behind the derived target"
+        );
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, plan)]);
+
+        let chosen = selected_card(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+
+        assert!(
+            lands.contains(&chosen),
+            "one land drop a turn: the second land goes before a fatty"
+        );
+        assert!(!fatties.contains(&chosen));
+    }
+
     /// The sibling direction: while the manabase itself is short, an accelerant
     /// IS promoted. Without this, F13 alone would be satisfied by deleting the
     /// accelerant branch entirely.

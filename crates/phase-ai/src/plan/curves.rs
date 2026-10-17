@@ -526,4 +526,141 @@ mod tests {
             "turn 4 threats should not be bumped by aggro_pressure"
         );
     }
+
+    // --- the land target a real deck derives (`DeckFeatures::analyze`) ---
+
+    use engine::game::bracket_estimate::CommanderBracketTier;
+    use engine::game::DeckEntry;
+    use engine::types::ability::{
+        AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction,
+        QuantityExpr, StaticDefinition,
+    };
+    use engine::types::card::CardFace;
+    use engine::types::card_type::{CardType, CoreType};
+    use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
+    use engine::types::statics::StaticMode;
+
+    fn face(name: &str, core_types: Vec<CoreType>, subtypes: Vec<&str>) -> CardFace {
+        CardFace {
+            name: name.to_string(),
+            card_type: CardType {
+                supertypes: Vec::new(),
+                core_types,
+                subtypes: subtypes.into_iter().map(str::to_string).collect(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn basics(subtype: &str, count: u32) -> DeckEntry {
+        DeckEntry {
+            card: face(subtype, vec![CoreType::Land], vec![subtype]),
+            count,
+        }
+    }
+
+    /// A vanilla 2/2 for {1}{B}.
+    fn bears(count: u32) -> DeckEntry {
+        let mut card = face("Bear", vec![CoreType::Creature], Vec::new());
+        card.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 1,
+        };
+        card.power = Some(engine::types::ability::PtValue::Fixed(2));
+        card.toughness = Some(engine::types::ability::PtValue::Fixed(2));
+        DeckEntry { card, count }
+    }
+
+    /// Murmuring Volume's mana half (MTGJSON: "{T}: Add one mana of any
+    /// color."), a {3} artifact: the one mana rock in each FRA sealed deck.
+    fn murmuring_volume() -> DeckEntry {
+        let mut card = face("Murmuring Volume", vec![CoreType::Artifact], vec!["Book"]);
+        card.mana_cost = ManaCost::generic(3);
+        let mut tap = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: ManaProduction::AnyOneColor {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    color_options: vec![
+                        ManaColor::White,
+                        ManaColor::Blue,
+                        ManaColor::Black,
+                        ManaColor::Red,
+                        ManaColor::Green,
+                    ],
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: Vec::new(),
+                grants: Vec::new(),
+                expiry: None,
+                target: None,
+            },
+        );
+        tap.cost = Some(AbilityCost::Tap);
+        card.abilities.push(tap);
+        DeckEntry { card, count: 1 }
+    }
+
+    /// An Exploration-shaped enchantment: "You may play an additional land on
+    /// each of your turns." (CR 305.2: the extra land drop).
+    fn explorations(count: u32) -> DeckEntry {
+        let mut card = face("Exploration", vec![CoreType::Enchantment], Vec::new());
+        card.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 0,
+        };
+        card.static_abilities
+            .push(StaticDefinition::new(StaticMode::MayPlayAdditionalLand));
+        DeckEntry { card, count }
+    }
+
+    fn derived(deck: &[DeckEntry]) -> (DeckFeatures, PlanSnapshot) {
+        let features = DeckFeatures::analyze(deck, CommanderBracketTier::Core);
+        let snapshot = derive_snapshot(&features);
+        (features, snapshot)
+    }
+
+    /// The FRA sealed shape: 40 cards, 17 lands, one mana rock. About six lands
+    /// are among the opening hand and first eight draws (17/40 of 15 cards),
+    /// so the mature land target is 6. The rock adds mana, not land drops (CR 305.2), so it
+    /// must not raise the land schedule the way an extra land drop does.
+    #[test]
+    fn a_forty_card_seventeen_land_deck_with_one_mana_rock_targets_six_lands() {
+        let deck = vec![
+            basics("Swamp", 8),
+            basics("Island", 7),
+            basics("Forest", 2),
+            murmuring_volume(),
+            bears(22),
+        ];
+        let (features, snapshot) = derived(&deck);
+        assert_eq!(features.mana_ramp.dork_count, 1, "premise: one mana rock");
+        assert_eq!(
+            snapshot.land_target(),
+            6,
+            "17 lands in 40 cards target 6 lands in play; one rock does not make it 7 \
+             (ramp commitment {:.3})",
+            features.mana_ramp.commitment
+        );
+    }
+
+    /// The land target follows the deck's own land density: a 60-card deck
+    /// with 20 lands draws five by the time a 24-land deck draws six.
+    #[test]
+    fn the_land_target_follows_the_deck_land_count() {
+        let (_, standard) = derived(&[basics("Swamp", 24), bears(36)]);
+        assert_eq!(standard.land_target(), 6, "24 lands in 60 cards: 6");
+        let (_, light) = derived(&[basics("Swamp", 20), bears(40)]);
+        assert_eq!(light.land_target(), 5, "20 lands in 60 cards: 5");
+    }
+
+    /// Guard: extra land drops still raise the land target by one (CR 305.2),
+    /// in a 60-card and in a 40-card deck.
+    #[test]
+    fn extra_land_drops_still_raise_the_land_target() {
+        let (_, sixty) = derived(&[basics("Forest", 24), explorations(4), bears(32)]);
+        assert_eq!(sixty.land_target(), 7);
+        let (_, forty) = derived(&[basics("Forest", 17), explorations(2), bears(21)]);
+        assert_eq!(forty.land_target(), 7);
+    }
 }

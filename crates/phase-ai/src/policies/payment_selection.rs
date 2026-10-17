@@ -1292,6 +1292,44 @@ mod tests {
     }
 
     #[test]
+    fn discard_cost_below_the_land_target_gives_up_a_second_land_before_a_bigger_spell() {
+        // CR 305.2: one land drop a turn, so below the target only the next drop
+        // is needed. With two lands and a 3/3 in hand, a single-card discard gives
+        // up one of the lands (an ordinary card at 3.0, below the 3/3's 9.0) and
+        // keeps the other; a spell worth less than a land still goes first.
+        let mut state = land_drop_spent_with_lands_in_play(4);
+        assert_land_target(&state, 2);
+        let first = make_land(&mut state, "First Forest", Zone::Hand);
+        let second = make_land(&mut state, "Second Forest", Zone::Hand);
+        let creature = creature_in_hand(&mut state, "Three-Mana 3/3", 3, 2);
+        let instant = spell_in_hand(
+            &mut state,
+            "One-Mana Instant",
+            CoreType::Instant,
+            vec![ManaCostShard::Blue],
+            0,
+        );
+
+        let mut prompt = state.clone();
+        install_discard_payment(&mut prompt, vec![first, second, creature]);
+        let gone = given_up(&prompt, &[first, second, creature]);
+        assert!(
+            gone == first || gone == second,
+            "four lands in play against a target of 6, two lands in hand: a land goes \
+             before the 3/3, got {}",
+            prompt.objects[&gone].name
+        );
+
+        let mut cheap = state.clone();
+        install_discard_payment(&mut cheap, vec![first, second, instant]);
+        assert_eq!(
+            given_up(&cheap, &[first, second, instant]),
+            instant,
+            "the second land is priced by value: a spell worth less than a land still goes first"
+        );
+    }
+
+    #[test]
     fn discard_cost_on_the_land_target_prices_the_land_as_an_ordinary_card() {
         // Exactly on the target the land is `KeepTier::Ordinary` and competes on
         // `intrinsic_value` (3.0): a cheaper spell goes first, a bigger card is
