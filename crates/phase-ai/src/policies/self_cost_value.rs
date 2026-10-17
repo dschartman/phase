@@ -11,7 +11,28 @@
 //! (unpriceable effect, or an unmodeled rider in the chain) is left alone.
 //!
 //! This policy is the **single authority** for the cost-vs-benefit question on
-//! every self-cost activation, mana-costed sacrifice outlets included.
+//! every self-cost activation, mana-costed sacrifice outlets included, and on a
+//! cast whose mandatory cost discards a card from hand (a flashback cost such as
+//! Twinned Vision's, or a required additional cost).
+//!
+//! # A discard is priced by the card it gives up
+//!
+//! CR 118.1 + CR 701.9b: a "discard a card" cost spends the card the keep
+//! order surrenders, the one `payment_selection` then discards at the `PayCost`
+//! prompt. When the payoff is priced, the comparison charges that card's value
+//! in expected draws (`self_cost::DiscardPrice::GivenUp`): a card as good as an
+//! average draw costs one card, the old flat price, and a lone 4/4 in a library
+//! of lands costs four, so a loot that would throw it away for one draw is a
+//! certified loss. The draw is priced as an expected card (the library's mean
+//! value), never as the card on top. The bound on a trivial payoff still counts
+//! cards (`DiscardPrice::PerCard`): any card spent for nothing is a loss,
+//! whatever it is worth.
+//!
+//! Known limit: the search below this policy draws the real top card of the
+//! AI's own library, which determinization never resamples
+//! (`determinize.rs`, "Why the AI's own zones are never resampled"). This
+//! policy's veto does not depend on it; the search's ranking of a loot that
+//! survives the veto does.
 //!
 //! # Why the underwater arm is categorical and not graduated
 //!
@@ -65,19 +86,21 @@
 //! as an absence of evidence, so it keeps the graduated branch. Its activation
 //! *timing* is a separate policy's job, not this one's.
 
-use engine::types::ability::AbilityTag;
+use engine::types::ability::{AbilityKind, AbilityTag};
 use engine::types::actions::GameAction;
 use engine::types::game_state::GameState;
+use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use super::self_cost::{
-    appraise_benefit, cost_is_material, real_self_cost, self_cost_in_scope,
-    self_counter_cost_preview, synergy_justifies_self_cost, BenefitAppraisal,
-    SelfCounterCostPreview,
+    appraise_benefit, appraise_cast_benefit, cost_is_material, mandatory_cast_discard_cost,
+    real_self_cost, self_cost_in_scope, self_counter_cost_preview, synergy_justifies_cost_tree,
+    synergy_justifies_self_cost, BenefitAppraisal, DiscardPrice, SelfCounterCostPreview,
 };
 use crate::features::DeckFeatures;
+use crate::plan::PlanState;
 
 /// At or above this priced self-cost, a trivial-benefit activation is a real
 /// loss and is rejected. Below it, a trivial-benefit activation is only
@@ -92,8 +115,10 @@ impl TacticalPolicy for SelfCostValuePolicy {
         PolicyId::SelfCostValue
     }
 
+    /// An activation, and a cast whose mandatory cost discards
+    /// ([`mandatory_cast_discard_cost`]).
     fn decision_kinds(&self) -> &'static [DecisionKind] {
-        &[DecisionKind::ActivateAbility]
+        &[DecisionKind::ActivateAbility, DecisionKind::CastSpell]
     }
 
     fn activation(
@@ -107,154 +132,229 @@ impl TacticalPolicy for SelfCostValuePolicy {
     }
 
     fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
-        let GameAction::ActivateAbility {
-            source_id,
-            ability_index: _,
-        } = &ctx.candidate.action
-        else {
-            return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
-        };
-
-        let Some(ability) = ctx.effective_activated_ability() else {
-            return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
-        };
-
-        if let Some(verdict) = counter_replenishment_verdict(
-            self_counter_cost_preview(ctx.state, ctx.ai_player, *source_id, &ability),
-            ctx.penalties(),
-        ) {
-            return verdict;
+        match &ctx.candidate.action {
+            GameAction::ActivateAbility { source_id, .. } => activation_verdict(ctx, *source_id),
+            GameAction::CastSpell { object_id, .. } => cast_verdict(ctx, *object_id),
+            _ => PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na")),
         }
+    }
+}
 
-        if ability.ability_tag == Some(AbilityTag::Cycling) {
-            return PolicyVerdict::neutral(PolicyReason::new("self_cost_cycling_deferred"));
-        }
+fn activation_verdict(ctx: &PolicyContext<'_>, source_id: ObjectId) -> PolicyVerdict {
+    let Some(ability) = ctx.effective_activated_ability() else {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
+    };
 
-        let Some(cost) = ability.cost.as_ref() else {
-            return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
-        };
+    if let Some(verdict) = counter_replenishment_verdict(
+        self_counter_cost_preview(ctx.state, ctx.ai_player, source_id, &ability),
+        ctx.penalties(),
+    ) {
+        return verdict;
+    }
 
-        if !self_cost_in_scope(cost) {
-            return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
-        }
+    if ability.ability_tag == Some(AbilityTag::Cycling) {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_cycling_deferred"));
+    }
 
-        let features = ctx
-            .context
-            .session
-            .features
-            .get(&ctx.ai_player)
-            .cloned()
-            .unwrap_or_default();
+    let Some(cost) = ability.cost.as_ref() else {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
+    };
 
-        if synergy_justifies_self_cost(&features, &ability) {
-            return PolicyVerdict::neutral(PolicyReason::new("self_cost_synergy_justified"));
-        }
+    if !self_cost_in_scope(cost) {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
+    }
 
-        let cost_value =
-            real_self_cost(ctx.state, ctx.ai_player, *source_id, cost, ctx.penalties());
+    if synergy_justifies_self_cost(&ai_features(ctx), &ability) {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_synergy_justified"));
+    }
 
-        let cost_milli = (cost_value * 1000.0) as i64;
+    // The bound on a trivial payoff counts cards; the comparison against a
+    // priced payoff prices the card given up (see `DiscardPrice`).
+    let cost_value = real_self_cost(
+        ctx.state,
+        ctx.ai_player,
+        source_id,
+        cost,
+        ctx.penalties(),
+        DiscardPrice::PerCard,
+    );
 
-        match appraise_benefit(
-            ctx.state,
-            ctx.ai_player,
-            *source_id,
-            &ability,
-            ctx.penalties(),
-        ) {
-            BenefitAppraisal::Trivial { any_unmodeled } => {
-                // Two independent grounds for the same categorical veto. The
-                // priced one applies to every chain that reached here. The
-                // materiality one is restricted to Trivial-PROPER chains: with
-                // an unmodeled effect in the chain, "trivial" is an absence of
-                // evidence rather than a finding, and a bound may not rest on
-                // it. See the module docs for why the second is a life count.
-                if cost_value >= REAL_COST_FLOOR
-                    || (!any_unmodeled
-                        && cost_is_material(
-                            ctx.state,
-                            ctx.ai_player,
-                            *source_id,
-                            cost,
-                            ctx.penalties(),
-                        ))
-                {
-                    return PolicyVerdict::reject(
-                        PolicyReason::new("self_cost_trivial_benefit")
-                            .with_fact("cost_milli", cost_milli)
-                            .with_fact("benefit", 0),
-                    );
-                }
-                // Trivial payoff, but the priced self-cost is below the
-                // real-loss floor: deprioritize with an auto-banded negative
-                // delta. No trivial self-cost play may resolve to
-                // `self_cost_benefit_present`, and the `self_cost_marginal`
-                // reason deliberately does NOT claim a benefit.
-                PolicyVerdict::score(
-                    -cost_value,
-                    PolicyReason::new("self_cost_marginal").with_fact("cost_milli", cost_milli),
-                )
+    let cost_milli = (cost_value * 1000.0) as i64;
+
+    match appraise_benefit(
+        ctx.state,
+        ctx.ai_player,
+        source_id,
+        &ability,
+        ctx.penalties(),
+    ) {
+        BenefitAppraisal::Trivial { any_unmodeled } => {
+            // Two independent grounds for the same categorical veto. The
+            // priced one applies to every chain that reached here. The
+            // materiality one is restricted to Trivial-PROPER chains: with
+            // an unmodeled effect in the chain, "trivial" is an absence of
+            // evidence rather than a finding, and a bound may not rest on
+            // it. See the module docs for why the second is a life count.
+            if cost_value >= REAL_COST_FLOOR
+                || (!any_unmodeled
+                    && cost_is_material(ctx.state, ctx.ai_player, source_id, cost, ctx.penalties()))
+            {
+                return PolicyVerdict::reject(
+                    PolicyReason::new("self_cost_trivial_benefit")
+                        .with_fact("cost_milli", cost_milli)
+                        .with_fact("benefit", 0),
+                );
             }
-            BenefitAppraisal::Priced { value } => {
-                let net = value - cost_value;
-                let benefit_milli = (value * 1000.0) as i64;
-                // Cost and benefit are summed from different coefficients, so an
-                // exact-cover trade can land a few ULPs below zero. This veto is
-                // categorical, so that rounding must not decide the boundary.
-                if net >= -f64::EPSILON * value.abs().max(cost_value.abs()).max(1.0) {
-                    // Inclusive boundary: net == 0 covers. A 0/1 creature token
-                    // prices at `max(creature_combat_value(0,1) = 1.0, 0.5) =
-                    // 1.0` against draw(1) = 1.0 — exactly 0. Cracking it is
-                    // intended; the comparison means "not a loss", and an
-                    // exact-cover crack is allowed. Neutral rather than
-                    // positive: `CardAdvantagePolicy`/`DrawPayoffPolicy` already
-                    // reward the draw on this same candidate, so a positive
-                    // delta here would double-count.
-                    //
-                    // NOTE: tap state is deliberately NOT part of this boundary.
-                    // `sacrifice_cost` prices the permanent intrinsically, so a
-                    // tapped 1/1 token still costs 2.5 and stays underwater. The
-                    // earlier tapped-discounted reading put it at exactly 0 here
-                    // and made this arm the escape hatch a whole board drained
-                    // through. Fixed at the give-up authority, not at this
-                    // boundary.
-                    PolicyVerdict::neutral(
-                        PolicyReason::new("self_cost_benefit_covers_cost")
-                            .with_fact("cost_milli", cost_milli)
-                            .with_fact("benefit_milli", benefit_milli),
-                    )
-                } else {
-                    // net < 0: a CERTIFIED losing trade — the chain was fully
-                    // priced, the quantity read, the cost bound
-                    // filter-faithfully, and every modeled justification
-                    // (synergy payoff on board, life pressure, unpriceable or
-                    // unmodeled value, counter replenishment, cycling, cEDH
-                    // bracket) already declined to stand the comparison down.
-                    //
-                    // Categorical, not graduated: under repeated softmax
-                    // sampling any finite negative is eventually selected while
-                    // fodder remains (measured — see the module docs and
-                    // `policies::tests::sac_outlet_drain_repro`), so a graduated
-                    // "discouragement" here means "do it eventually", the
-                    // opposite of what this verdict certifies.
-                    //
-                    // There is no threshold constant in the restraint: the
-                    // boundary is the sign of the net, inclusive at zero. The
-                    // magnitudes that set WHERE that sign flips
-                    // (`creature_combat_value`'s 1.5*P + T, `SINGLE_CARD_VALUE`,
-                    // `sacrifice_token_cost`, the per-life coefficient) live in
-                    // eval, which is where calibration belongs.
-                    PolicyVerdict::reject(
-                        PolicyReason::new("self_cost_benefit_underwater")
-                            .with_fact("cost_milli", cost_milli)
-                            .with_fact("benefit_milli", benefit_milli),
-                    )
-                }
-            }
-            BenefitAppraisal::Unpriced => {
-                PolicyVerdict::neutral(PolicyReason::new("self_cost_benefit_present"))
-            }
+            // Trivial payoff, but the priced self-cost is below the
+            // real-loss floor: deprioritize with an auto-banded negative
+            // delta. No trivial self-cost play may resolve to
+            // `self_cost_benefit_present`, and the `self_cost_marginal`
+            // reason deliberately does NOT claim a benefit.
+            PolicyVerdict::score(
+                -cost_value,
+                PolicyReason::new("self_cost_marginal").with_fact("cost_milli", cost_milli),
+            )
         }
+        BenefitAppraisal::Priced { value } => priced_verdict(
+            value,
+            real_self_cost(
+                ctx.state,
+                ctx.ai_player,
+                source_id,
+                cost,
+                ctx.penalties(),
+                DiscardPrice::GivenUp(discarding_plan(ctx)),
+            ),
+        ),
+        BenefitAppraisal::Unpriced => {
+            PolicyVerdict::neutral(PolicyReason::new("self_cost_benefit_present"))
+        }
+    }
+}
+
+/// CR 601.2f + CR 702.34a: a cast whose mandatory cost discards a card from
+/// hand (a flashback cost such as Twinned Vision's, or a required additional
+/// cost) is the same trade as a loot: the card given up against what the
+/// spell delivers. Only a payoff priced in full is compared; any other payoff
+/// leaves the cast to the rest of the scoring.
+fn cast_verdict(ctx: &PolicyContext<'_>, object_id: ObjectId) -> PolicyVerdict {
+    let Some(object) = ctx.state.objects.get(&object_id) else {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
+    };
+    let Some(cost) = mandatory_cast_discard_cost(ctx.state, object) else {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
+    };
+    let Some(spell) = object
+        .abilities
+        .iter()
+        .find(|ability| ability.kind == AbilityKind::Spell)
+    else {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
+    };
+    if synergy_justifies_cost_tree(&ai_features(ctx), &cost) {
+        return PolicyVerdict::neutral(PolicyReason::new("self_cost_synergy_justified"));
+    }
+    match appraise_cast_benefit(
+        ctx.state,
+        ctx.ai_player,
+        object_id,
+        spell,
+        object.zone,
+        ctx.penalties(),
+    ) {
+        BenefitAppraisal::Priced { value } => priced_verdict(
+            value,
+            real_self_cost(
+                ctx.state,
+                ctx.ai_player,
+                object_id,
+                &cost,
+                ctx.penalties(),
+                DiscardPrice::GivenUp(discarding_plan(ctx)),
+            ),
+        ),
+        BenefitAppraisal::Trivial { .. } | BenefitAppraisal::Unpriced => {
+            PolicyVerdict::neutral(PolicyReason::new("self_cost_cast_payoff_unpriced"))
+        }
+    }
+}
+
+fn ai_features(ctx: &PolicyContext<'_>) -> DeckFeatures {
+    ctx.context
+        .session
+        .features
+        .get(&ctx.ai_player)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The AI's own plan, which the keep order a discard cost follows reads, as
+/// `policies::payment_selection` reads it at the `PayCost` prompt.
+fn discarding_plan(ctx: &PolicyContext<'_>) -> Option<PlanState> {
+    ctx.context
+        .session
+        .plan
+        .get(&ctx.ai_player)
+        .map(|snapshot| PlanState::realize(ctx.state, ctx.ai_player, snapshot))
+}
+
+/// The comparison of a fully priced payoff against its self-cost.
+fn priced_verdict(value: f64, cost_value: f64) -> PolicyVerdict {
+    let net = value - cost_value;
+    let cost_milli = (cost_value * 1000.0) as i64;
+    let benefit_milli = (value * 1000.0) as i64;
+    // Cost and benefit are summed from different coefficients, so an
+    // exact-cover trade can land a few ULPs below zero. This veto is
+    // categorical, so that rounding must not decide the boundary.
+    if net >= -f64::EPSILON * value.abs().max(cost_value.abs()).max(1.0) {
+        // Inclusive boundary: net == 0 covers. A 0/1 creature token
+        // prices at `max(creature_combat_value(0,1) = 1.0, 0.5) =
+        // 1.0` against draw(1) = 1.0 — exactly 0. Cracking it is
+        // intended; the comparison means "not a loss", and an
+        // exact-cover crack is allowed. Neutral rather than
+        // positive: `CardAdvantagePolicy`/`DrawPayoffPolicy` already
+        // reward the draw on this same candidate, so a positive
+        // delta here would double-count.
+        //
+        // NOTE: tap state is deliberately NOT part of this boundary.
+        // `sacrifice_cost` prices the permanent intrinsically, so a
+        // tapped 1/1 token still costs 2.5 and stays underwater. The
+        // earlier tapped-discounted reading put it at exactly 0 here
+        // and made this arm the escape hatch a whole board drained
+        // through. Fixed at the give-up authority, not at this
+        // boundary.
+        PolicyVerdict::neutral(
+            PolicyReason::new("self_cost_benefit_covers_cost")
+                .with_fact("cost_milli", cost_milli)
+                .with_fact("benefit_milli", benefit_milli),
+        )
+    } else {
+        // net < 0: a CERTIFIED losing trade — the chain was fully
+        // priced, the quantity read, the cost bound
+        // filter-faithfully, and every modeled justification
+        // (synergy payoff on board, life pressure, unpriceable or
+        // unmodeled value, counter replenishment, cycling, cEDH
+        // bracket) already declined to stand the comparison down.
+        //
+        // Categorical, not graduated: under repeated softmax
+        // sampling any finite negative is eventually selected while
+        // fodder remains (measured — see the module docs and
+        // `policies::tests::sac_outlet_drain_repro`), so a graduated
+        // "discouragement" here means "do it eventually", the
+        // opposite of what this verdict certifies.
+        //
+        // There is no threshold constant in the restraint: the
+        // boundary is the sign of the net, inclusive at zero. The
+        // magnitudes that set WHERE that sign flips
+        // (`creature_combat_value`'s 1.5*P + T, `SINGLE_CARD_VALUE`,
+        // `sacrifice_token_cost`, the per-life coefficient, the given-up
+        // card's value in expected draws) live in eval and `card_value`,
+        // which is where calibration belongs.
+        PolicyVerdict::reject(
+            PolicyReason::new("self_cost_benefit_underwater")
+                .with_fact("cost_milli", cost_milli)
+                .with_fact("benefit_milli", benefit_milli),
+        )
     }
 }
 
@@ -2800,6 +2900,7 @@ mod tests {
                 .as_ref()
                 .expect("fixture ability has a cost"),
             &config.policy_penalties,
+            DiscardPrice::PerCard,
         );
 
         assert_eq!(
@@ -2833,6 +2934,7 @@ mod tests {
                 .as_ref()
                 .expect("fixture ability has a cost"),
             &config.policy_penalties,
+            DiscardPrice::PerCard,
         );
 
         assert_eq!(
@@ -2885,6 +2987,7 @@ mod tests {
             source,
             ability.cost.as_ref().expect("fixture ability has a cost"),
             &config.policy_penalties,
+            DiscardPrice::PerCard,
         );
 
         assert_eq!(cost, 26.0, "10.0 board value + 4.0 mana value + 12.0 tax");
