@@ -21,7 +21,15 @@
 //! **Which discard seams are tiered.** Among discard seams, [`keep_tier`]
 //! reaches exactly one `deterministic_choice` arm: the CR 514.1 cleanup discard
 //! (`WaitingFor::DiscardToHandSize`); it also reaches the scry and surveil arms
-//! through [`worth_drawing`]. It has one further consumer, which is a
+//! through [`worth_drawing`]. It reaches one scored discard seam, through
+//! [`keep_prices`]: the CR 118.1 + CR 701.9b discard cost
+//! (`WaitingFor::PayCost { kind: Discard }`, priced by
+//! `policies::payment_selection`), so a loot or a flashback that discards
+//! gives up cards in the cleanup discard's order. The evidence for widening it
+//! there: in the 2026-10-17 FRA signals run, 137 of 176 PayCost discards that
+//! kept a land and pitched a castable spell were decided by the flat land
+//! price alone (`deck-builder/sims/fra-phase/2026-10-17-signals-r2/
+//! investigation-discard-signal.md`). It has one further consumer, which is a
 //! policy rather than a `deterministic_choice` arm: the CR 601.2f sacrifice-cost
 //! cast gate (`policies::sacrifice_cost_mana_gate`), which reads the tier of
 //! *battlefield* objects. That does not collide with the sentence below, because
@@ -40,7 +48,7 @@
 //! the tier does NOT apply to them. That division is deliberate: the eval path
 //! carries its own mana-source signal, and widening the tier to every discard
 //! family without evidence would be speculative. "The discard bug is fixed"
-//! means the cleanup family, not all discard.
+//! means the cleanup family and the discard cost, not all discard.
 
 use std::cmp::Ordering;
 
@@ -182,6 +190,67 @@ pub(crate) fn cmp_keep(a: &(KeepTier, f64), b: &(KeepTier, f64)) -> Ordering {
         .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
 }
 
+/// The [`cmp_keep`] order as prices, for a give-up decision that is *scored*
+/// rather than sorted: the CR 118.1 + CR 701.9b discard cost at
+/// `WaitingFor::PayCost` (`policies::payment_selection`). There each
+/// candidate selection is priced by a policy and the price competes with the
+/// search continuation, so a comparator cannot be used directly; this is the
+/// same order the CR 514.1 cleanup discard sorts by, expressed as one scalar
+/// per card.
+///
+/// Construction: sort `pool` by [`keep_key`] / [`cmp_keep`] (first surrendered
+/// first), and give the i-th card the i-th smallest [`intrinsic_value`] in the
+/// pool. Cards with equal keys share a price, and a card whose key is strictly
+/// greater than its predecessor's prices at least [`KEEP_PRICE_STEP`] above it,
+/// so the order is strict wherever `cmp_keep` is. Three properties follow, and
+/// each is pinned by a test:
+///
+/// - **Order.** For `a`, `b` in `pool`, `cmp_keep(key(a), key(b))` is the
+///   order of their prices. A surplus land prices below every spell, a land
+///   the plan still needs above every spell.
+/// - **Fail-safe.** When every card is `Ordinary` (no plan authority, or on
+///   curve with no mana source in the pool) each card's price is its own
+///   `intrinsic_value`, exactly.
+/// - **Scale.** The prices are the pool's own values rearranged, so the
+///   cheapest card to give up always costs the pool's lowest value. The
+///   price of paying the cost at all, which reaches the activation that
+///   demanded it through the search, does not move with the reordering.
+pub(crate) fn keep_prices(
+    state: &GameState,
+    pool: &[ObjectId],
+    plan: Option<PlanState>,
+) -> Vec<(ObjectId, f64)> {
+    let mut keyed: Vec<_> = pool
+        .iter()
+        .map(|&id| (id, keep_key(state, id, plan)))
+        .collect();
+    keyed.sort_by(|a, b| cmp_keep(&a.1, &b.1));
+    let mut values: Vec<f64> = keyed.iter().map(|(_, key)| key.1).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+
+    let mut prices: Vec<(ObjectId, f64)> = Vec::with_capacity(keyed.len());
+    let mut previous: Option<((KeepTier, f64), f64)> = None;
+    for ((id, key), value) in keyed.into_iter().zip(values) {
+        let price = match previous {
+            None => value,
+            Some((prev_key, prev_price)) => match cmp_keep(&prev_key, &key) {
+                Ordering::Less => value.max(prev_price + KEEP_PRICE_STEP),
+                Ordering::Equal | Ordering::Greater => prev_price,
+            },
+        };
+        prices.push((id, price));
+        previous = Some((key, price));
+    }
+    prices
+}
+
+/// The smallest price gap [`keep_prices`] puts between two cards that
+/// [`cmp_keep`] orders strictly but whose values tie (a surplus land at 3.0
+/// against a six-pip spell at 3.0). A tenth of a card: enough to order the
+/// selection when the search continuations tie, too small to outweigh a
+/// continuation that differs.
+pub(crate) const KEEP_PRICE_STEP: f64 = 0.1;
+
 /// The [`intrinsic_value`] floor below which a looked-at card is not worth
 /// keeping. The `DigChoice` up-to arm takes nothing when its best card scores
 /// under it, and [`worth_drawing`] reads the same floor, so dig, scry and
@@ -239,7 +308,9 @@ pub(crate) fn intrinsic_value(state: &GameState, obj_id: ObjectId) -> f64 {
     value
 }
 
-/// Cost-side card valuation. Diverges from [`intrinsic_value`] on two axes, both
+/// Cost-side card valuation for every `PayCostKind` that spends a card from a
+/// non-battlefield zone **except `Discard`**, which is priced in keep order by
+/// [`keep_prices`]. Diverges from [`intrinsic_value`] on two axes, both
 /// deliberate and both currently load-bearing for shipped behaviour:
 ///
 /// 1. **Mana-cost proxy.** This function uses `ManaCost::mana_value()`, which
@@ -259,8 +330,8 @@ pub(crate) fn intrinsic_value(state: &GameState, obj_id: ObjectId) -> f64 {
 /// counting `{2/B}` as one pip is arguably the better proxy for a card you will
 /// cast for `{B}`. Converging the two is a **declared behaviour change** across
 /// 11 production `intrinsic_value` call sites (10 in `search.rs`, 1 here in
-/// [`keep_key`]; 3 further hits in `search.rs` are test assertions) and 7
-/// `PayCostKind` arms spanning 13 `cost_card_value` call sites, with a named
+/// [`keep_key`]; 3 further hits in `search.rs` are test assertions) and 6
+/// `PayCostKind` arms spanning 12 `cost_card_value` call sites, with a named
 /// regression:
 /// the `DigChoice` `up_to` path tests `value < 0.1`, and under `mana_value()` a
 /// bare `{X}` spell scores 0.0 and would select nothing where it currently
@@ -509,6 +580,85 @@ mod tests {
             cmp_keep(&(KeepTier::Surplus, 3.0), &(KeepTier::Ordinary, 0.5)),
             Ordering::Less
         );
+    }
+
+    fn spell_card(state: &mut GameState, name: &str, generic: u32) -> ObjectId {
+        let id = card_in_hand(state, name);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.mana_cost = engine::types::mana::ManaCost::generic(generic);
+        id
+    }
+
+    fn price_of(prices: &[(ObjectId, f64)], id: ObjectId) -> f64 {
+        prices.iter().find(|(card, _)| *card == id).unwrap().1
+    }
+
+    /// Order: `keep_prices` ranks a mixed pool exactly as `cmp_keep` sorts it,
+    /// on every plan sign, and the scale property holds (the prices are the
+    /// pool's own values rearranged, so the minimum is the pool's minimum).
+    #[test]
+    fn keep_prices_rank_a_pool_exactly_as_cmp_keep_sorts_it() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let rock = rock_card(&mut state);
+        let one = spell_card(&mut state, "One", 2);
+        let five = spell_card(&mut state, "Five", 10);
+        let pool = [land, rock, one, five];
+
+        for (lands_behind, mana_behind) in [(-2_i8, -2_i8), (0, 0), (2, 2), (-1, 3), (3, -1)] {
+            let plan = behind(lands_behind, mana_behind);
+            let prices = keep_prices(&state, &pool, plan);
+            for &a in &pool {
+                for &b in &pool {
+                    let by_key = cmp_keep(&keep_key(&state, a, plan), &keep_key(&state, b, plan));
+                    let by_price = price_of(&prices, a)
+                        .partial_cmp(&price_of(&prices, b))
+                        .unwrap();
+                    assert_eq!(
+                        by_key, by_price,
+                        "plan ({lands_behind}, {mana_behind}): price order must be keep order"
+                    );
+                }
+            }
+            let lowest = pool
+                .iter()
+                .map(|&id| intrinsic_value(&state, id))
+                .fold(f64::INFINITY, f64::min);
+            let cheapest = prices.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            assert_eq!(
+                cheapest, lowest,
+                "the cheapest give-up costs the pool minimum"
+            );
+        }
+    }
+
+    /// Fail-safe: with no plan authority every card is `Ordinary`, and each
+    /// card's price is its own `intrinsic_value`, ties included.
+    #[test]
+    fn keep_prices_are_intrinsic_values_when_every_card_is_ordinary() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let second_land = land_card(&mut state);
+        let six = spell_card(&mut state, "Six", 6);
+        let one = spell_card(&mut state, "One", 2);
+        let pool = [land, second_land, six, one];
+        let prices = keep_prices(&state, &pool, None);
+        for &id in &pool {
+            assert_eq!(price_of(&prices, id), intrinsic_value(&state, id));
+        }
+    }
+
+    /// A tie in value across a tier boundary still orders: the surplus land
+    /// (3.0) and a six-mana spell (3.0) are a step apart.
+    #[test]
+    fn keep_prices_order_a_value_tie_across_tiers() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let six = spell_card(&mut state, "Six", 6);
+        let prices = keep_prices(&state, &[land, six], behind(-1, 0));
+        assert_eq!(price_of(&prices, land), 3.0);
+        assert_eq!(price_of(&prices, six), 3.0 + KEEP_PRICE_STEP);
     }
 
     /// A missing object is not a mana source and never sorts ahead of a real card.
