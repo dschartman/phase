@@ -10851,4 +10851,310 @@ mod tests {
         assert_parses_as_temporary_pump(state, dragon);
         assert_eq!(gate_activation(state, dragon), GateDecision::Reject);
     }
+
+    // --- Modal spells gated per mode; negative-toughness pumps as removal ---
+
+    const THEORIX_CHARM_ORACLE: &str = "Choose one —\n\
+        • Counter target noncreature spell unless its controller pays {2}.\n\
+        • Target creature gets -2/-2 until end of turn.\n\
+        • Mill three cards, then draw a card.";
+    const ICY_RECEPTION_ORACLE: &str = "Choose one —\n\
+        • Counter target creature or legendary spell unless its controller pays {3}.\n\
+        • Target creature gets -5/-0 until end of turn.";
+    const ALL_COUNTER_MODAL_ORACLE: &str = "Choose one —\n\
+        • Counter target creature spell.\n\
+        • Counter target noncreature spell.";
+    const LAST_GASP_ORACLE: &str = "Target creature gets -3/-3 until end of turn.";
+
+    fn gate_spell_cast(state: &GameState, spell: ObjectId) -> GateDecision {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: spell,
+                card_id: state.objects.get(&spell).unwrap().card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        let context = AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assess_candidate(&ctx)
+    }
+
+    /// A spell of the AI's own on the stack (the "only our own items" case).
+    fn push_own_spell(state: &mut GameState) {
+        state.stack.push_back(StackEntry {
+            id: ObjectId(400),
+            source_id: ObjectId(401),
+            controller: P0,
+            kind: StackEntryKind::Spell {
+                ability: Some(Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    Vec::new(),
+                    ObjectId(401),
+                    P0,
+                ))),
+                card_id: CardId(401),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+    }
+
+    fn assert_modal_with_modes(state: &GameState, spell: ObjectId, modes: usize) {
+        let object = state.objects.get(&spell).unwrap();
+        assert_eq!(
+            object.modal.as_ref().map(|modal| modal.mode_count),
+            Some(modes),
+            "fixture Oracle text no longer parses as a {modes}-mode modal spell"
+        );
+    }
+
+    /// CR 601.2b + CR 700.2a: the mode is chosen as the spell is cast, so a
+    /// counter mode with nothing to counter does not make the -2/-2 or the
+    /// mill-and-draw mode unavailable. Theorix Charm shape, own main phase,
+    /// opposing 3/1 on the battlefield, empty stack (audit seed 42 T15-T19).
+    #[test]
+    fn modal_spell_with_counter_mode_not_rejected_on_empty_stack() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Campus Crier", 3, 1);
+        let charm = scenario
+            .add_spell_to_hand_from_oracle(P0, "Theorix Charm", true, THEORIX_CHARM_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_modal_with_modes(state, charm, 3);
+        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+
+        // CR 601.2b: the same holds in an upkeep window on the AI's own turn.
+        set_priority_window(state, Phase::Upkeep, P0);
+        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+    }
+
+    /// Same shape with only the AI's own spell on the stack: still no opposing
+    /// item to counter, still castable for its other modes.
+    #[test]
+    fn modal_spell_with_counter_mode_not_rejected_over_own_stack_item() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Campus Crier", 3, 1);
+        let charm = scenario
+            .add_spell_to_hand_from_oracle(P0, "Theorix Charm", true, THEORIX_CHARM_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        push_own_spell(state);
+
+        assert_modal_with_modes(state, charm, 3);
+        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+    }
+
+    /// A modal spell whose non-counter mode needs no target (mill and draw)
+    /// stays castable with no creature anywhere: the redundant-removal check
+    /// must read the -2/-2 mode on its own, not veto the whole card.
+    #[test]
+    fn modal_spell_untargeted_mode_survives_no_creature_board() {
+        let mut scenario = GameScenario::new();
+        let charm = scenario
+            .add_spell_to_hand_from_oracle(P0, "Theorix Charm", true, THEORIX_CHARM_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_modal_with_modes(state, charm, 3);
+        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+    }
+
+    /// Icy Reception shape: counter mode plus a -5/-0. At the opponent's
+    /// declare-attackers step, before blocks, the -5/-0 mode is a live combat
+    /// trick on the attacker, so the counter mode must not veto the cast.
+    #[test]
+    fn modal_counter_or_shrink_allowed_before_blocks_on_opponents_attack() {
+        let mut scenario = GameScenario::new();
+        let attacker = scenario.add_creature(P1, "Attacker", 5, 5).id();
+        let icy = scenario
+            .add_spell_to_hand_from_oracle(P0, "Icy Reception", true, ICY_RECEPTION_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::DeclareAttackers, P1);
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, P0)],
+            ..Default::default()
+        });
+
+        assert_modal_with_modes(state, icy, 2);
+        assert_ne!(gate_spell_cast(state, icy), GateDecision::Reject);
+    }
+
+    /// Icy Reception in its own postcombat main with nothing on the stack: the
+    /// counter mode has nothing to counter and the -5/-0 mode has no combat
+    /// to change, so every mode is futile and the cast is still rejected.
+    #[test]
+    fn modal_counter_or_shrink_rejected_when_every_mode_is_futile() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let icy = scenario
+            .add_spell_to_hand_from_oracle(P0, "Icy Reception", true, ICY_RECEPTION_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PostCombatMain, P0);
+
+        assert_modal_with_modes(state, icy, 2);
+        assert_eq!(gate_spell_cast(state, icy), GateDecision::Reject);
+    }
+
+    /// CR 701.6a: a spell whose every mode counters has nothing to do while no
+    /// opposing item is on the stack. Holds for the modal and the plain shape.
+    #[test]
+    fn all_counter_spells_rejected_without_opposing_stack_item() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let modal = scenario
+            .add_spell_to_hand_from_oracle(P0, "Two-Way Denial", true, ALL_COUNTER_MODAL_ORACLE)
+            .id();
+        let plain = scenario
+            .add_spell_to_hand_from_oracle(P0, "Counterspell", true, "Counter target spell.")
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_modal_with_modes(state, modal, 2);
+        assert_eq!(gate_spell_cast(state, modal), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, plain), GateDecision::Reject);
+
+        push_own_spell(state);
+        assert_eq!(gate_spell_cast(state, modal), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, plain), GateDecision::Reject);
+    }
+
+    /// CR 704.5f: a -3/-3 on a 2/2 puts its toughness at or below zero and the
+    /// state-based action kills it in any window, so a fixed negative-toughness
+    /// pump is creature removal, not a combat trick. Last Gasp shape, empty
+    /// stack, in the windows the audit saw it gated: own main phase, own draw
+    /// step (seed 42 T27), and the opponent's end step.
+    #[test]
+    fn negative_toughness_pump_spell_is_removal_outside_combat() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Proft, Consulting Detective", 2, 2);
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+
+        for (phase, active) in [
+            (Phase::PreCombatMain, P0),
+            (Phase::PostCombatMain, P0),
+            (Phase::Draw, P0),
+            (Phase::End, P1),
+        ] {
+            set_priority_window(state, phase, active);
+            assert_ne!(
+                gate_spell_cast(state, gasp),
+                GateDecision::Reject,
+                "Last Gasp with a live opposing creature target was gated in {phase:?}"
+            );
+        }
+    }
+
+    /// The removal path keeps its redundant-removal check: with no opposing
+    /// creature (only our own), a -3/-3 has no useful target and is rejected.
+    #[test]
+    fn negative_toughness_pump_spell_without_opposing_creature_rejected() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+    }
+
+    /// The removal path keeps the stack-aware redundancy too: the only opposing
+    /// creature is already dying to a spell on the stack.
+    #[test]
+    fn negative_toughness_pump_spell_on_already_dying_creature_rejected() {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.stack.push_back(StackEntry {
+            id: ObjectId(410),
+            source_id: ObjectId(411),
+            controller: P0,
+            kind: StackEntryKind::Spell {
+                ability: Some(Box::new(ResolvedAbility::new(
+                    Effect::Destroy {
+                        target: TargetFilter::Any,
+                        cant_regenerate: false,
+                    },
+                    vec![TargetRef::Object(bear)],
+                    ObjectId(411),
+                    P0,
+                ))),
+                card_id: CardId(411),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+
+        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+    }
+
+    /// A positive pump outside a combat window is still rejected (own
+    /// postcombat main, no combat, empty stack).
+    #[test]
+    fn positive_pump_spell_still_rejected_outside_combat() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Bear", 2, 2);
+        scenario.add_creature(P1, "Other Bear", 2, 2);
+        let growth = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Giant Growth",
+                true,
+                "Target creature gets +3/+3 until end of turn.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        for (phase, active) in [
+            (Phase::PostCombatMain, P0),
+            (Phase::Draw, P0),
+            (Phase::End, P1),
+        ] {
+            set_priority_window(state, phase, active);
+            assert_eq!(gate_spell_cast(state, growth), GateDecision::Reject);
+        }
+    }
 }
