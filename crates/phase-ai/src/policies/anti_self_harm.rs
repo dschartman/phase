@@ -3419,6 +3419,275 @@ mod tests {
         ));
     }
 
+    /// Stage `card_name` in the AI's hand with its real parse (activated
+    /// abilities and triggers), at zero mana cost, on the AI's own precombat
+    /// main phase with priority, and return the engine-offered cast candidate.
+    /// The cost is zeroed so the cast is offered without lands; the
+    /// no-friendly-recipient check never reads the cost.
+    fn parsed_card_cast_candidate(
+        state: &mut GameState,
+        card_name: &str,
+        oracle_text: &str,
+        keywords: &[&str],
+        types: &[&str],
+        core_types: &[CoreType],
+        power_toughness: Option<(i32, i32)>,
+    ) -> (ObjectId, CandidateAction) {
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let keywords_owned: Vec<String> = keywords.iter().map(|k| (*k).to_string()).collect();
+        let types_owned: Vec<String> = types.iter().map(|t| (*t).to_string()).collect();
+        let parsed = parse_oracle_text(oracle_text, card_name, &keywords_owned, &types_owned, &[]);
+        let card_id = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            card_name.to_string(),
+            Zone::Hand,
+        );
+        let card = state.objects.get_mut(&card_id).unwrap();
+        card.card_types.core_types.extend_from_slice(core_types);
+        if let Some((power, toughness)) = power_toughness {
+            card.power = Some(power);
+            card.toughness = Some(toughness);
+        }
+        card.mana_cost = ManaCost::zero();
+        *Arc::make_mut(&mut card.abilities) = parsed.abilities;
+        for trigger in parsed.triggers {
+            card.trigger_definitions.push(trigger.clone());
+            Arc::make_mut(&mut card.base_trigger_definitions).push(trigger);
+        }
+        card.materialize_base_trigger_definitions();
+
+        let candidate = engine::ai_support::candidate_actions(state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == card_id)
+            })
+            .unwrap_or_else(|| panic!("the engine must offer the cast of {card_name}"));
+        (card_id, candidate)
+    }
+
+    /// The policies that reject `candidate`, by id and reason. Empty means the
+    /// registry's aggregate score (`PolicyRegistry::score`) is finite.
+    fn rejecting_policies(
+        state: &GameState,
+        candidate: &CandidateAction,
+    ) -> Vec<(PolicyId, String)> {
+        shared_registry_verdicts_for(state, candidate)
+            .into_iter()
+            .filter_map(|(id, verdict)| match verdict {
+                PolicyVerdict::Reject { reason } => Some((id, reason.kind.to_string())),
+                PolicyVerdict::Score { .. } => None,
+            })
+            .collect()
+    }
+
+    fn rejects_for_no_friendly_recipient(state: &GameState, candidate: &CandidateAction) -> bool {
+        rejecting_policies(state, candidate)
+            .iter()
+            .any(|(id, kind)| {
+                *id == PolicyId::AntiSelfHarm
+                    && kind == "anti_self_harm_beneficial_creature_spell_no_friendly_recipient"
+            })
+    }
+
+    const LILIANA_THE_REPENTANT_ORACLE: &str =
+        "Whenever another creature or planeswalker you control enters, mill two cards.\n\
+         Exhaust — {5}{B}: Return target creature or planeswalker card from your graveyard to \
+         the battlefield. Put a +1/+1 counter on Liliana. Activate only as a sorcery. (Activate \
+         each exhaust ability only once.)";
+
+    const TOMIK_ORACLE: &str = "Flying\n\
+         Planeswalkers you control have \"No more than one creature can attack this planeswalker \
+         each combat.\"\n\
+         {T}: Target creature with a +1/+1 counter on it gains flying until end of turn.";
+
+    const GENEROUS_REVIVAL_ORACLE: &str =
+        "Return target creature card with mana value 3 or less from your graveyard to the \
+         battlefield with an additional +1/+1 counter on it.\n\
+         Flashback {4}{W} (You may cast this card from your graveyard for its flashback cost. \
+         Then exile it.)";
+
+    /// CR 608.3 + CR 113.6 + CR 602.2: a permanent spell resolves by becoming a
+    /// permanent, and its activated abilities function only once it is on the
+    /// battlefield, where each is activated later by its own action. Liliana the Repentant's only `abilities`
+    /// entry is her Exhaust activation (return a creature card from the
+    /// graveyard, then a +1/+1 counter on herself), so it says nothing about
+    /// whether casting her helps anyone. With no creature of her controller's
+    /// on the battlefield she was rejected as a "creature-benefit spell with no
+    /// friendly recipient" and never cast (seeds 1076, 1109).
+    #[test]
+    fn liliana_the_repentant_cast_is_scored_without_a_friendly_creature() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+        let (_, candidate) = parsed_card_cast_candidate(
+            &mut state,
+            "Liliana the Repentant",
+            LILIANA_THE_REPENTANT_ORACLE,
+            &["Exhaust", "Mill"],
+            &["Creature"],
+            &[CoreType::Creature],
+            Some((2, 2)),
+        );
+
+        let rejects = rejecting_policies(&state, &candidate);
+        assert!(
+            rejects.is_empty(),
+            "casting Liliana must carry a finite score with no friendly creature; \
+             rejected by {rejects:?}"
+        );
+    }
+
+    /// Same class as Liliana: Tomik's only `abilities` entry is a `{T}`
+    /// activation granting flying to a target creature.
+    #[test]
+    fn tomik_orzhov_lawmage_cast_is_scored_without_a_friendly_creature() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+        let (_, candidate) = parsed_card_cast_candidate(
+            &mut state,
+            "Tomik, Orzhov Lawmage",
+            TOMIK_ORACLE,
+            &["Flying"],
+            &["Creature"],
+            &[CoreType::Creature],
+            Some((2, 3)),
+        );
+
+        let rejects = rejecting_policies(&state, &candidate);
+        assert!(
+            rejects.is_empty(),
+            "casting Tomik must carry a finite score with no friendly creature; \
+             rejected by {rejects:?}"
+        );
+    }
+
+    /// CR 115.1 + CR 400.1: Generous Revival's target is a creature CARD in a
+    /// graveyard, not a creature on the battlefield, so whether the AI
+    /// controls a creature on the battlefield is not a question about its
+    /// recipient. An empty battlefield is when a reanimation matters most.
+    #[test]
+    fn generous_revival_cast_is_scored_with_a_creature_card_in_the_graveyard() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+        let dead_card_id = CardId(state.next_object_id);
+        let dead_id = create_object(
+            &mut state,
+            dead_card_id,
+            PlayerId(0),
+            "Graft Surgeon".to_string(),
+            Zone::Graveyard,
+        );
+        let dead = state.objects.get_mut(&dead_id).unwrap();
+        dead.card_types.core_types.push(CoreType::Creature);
+        dead.power = Some(2);
+        dead.toughness = Some(2);
+        dead.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 1,
+        };
+        let (_, candidate) = parsed_card_cast_candidate(
+            &mut state,
+            "Generous Revival",
+            GENEROUS_REVIVAL_ORACLE,
+            &["Flashback"],
+            &["Sorcery"],
+            &[CoreType::Sorcery],
+            None,
+        );
+
+        let rejects = rejecting_policies(&state, &candidate);
+        assert!(
+            rejects.is_empty(),
+            "casting Generous Revival with a creature card in the graveyard must carry a \
+             finite score; rejected by {rejects:?}"
+        );
+    }
+
+    /// The case the check exists for, which must not move: a pump instant
+    /// whose only legal recipient is the opponent's creature.
+    #[test]
+    fn giant_growth_rejected_without_a_friendly_creature_recipient() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+        let (_, candidate) = parsed_card_cast_candidate(
+            &mut state,
+            "Giant Growth",
+            "Target creature gets +3/+3 until end of turn.",
+            &[],
+            &["Instant"],
+            &[CoreType::Instant],
+            None,
+        );
+        assert!(
+            rejects_for_no_friendly_recipient(&state, &candidate),
+            "Giant Growth with no friendly creature must stay rejected: {:?}",
+            rejecting_policies(&state, &candidate)
+        );
+
+        add_creature(&mut state, PlayerId(0), "Friendly Creature", 2, 2);
+        assert!(!rejects_for_no_friendly_recipient(&state, &candidate));
+    }
+
+    /// A protection instant is the same shape: its only recipient is the
+    /// opponent's creature when the AI has none.
+    #[test]
+    fn protection_instant_rejected_without_a_friendly_creature_recipient() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+        let (_, candidate) = parsed_card_cast_candidate(
+            &mut state,
+            "Withstand Death",
+            "Target creature gains indestructible until end of turn. (Damage and effects that \
+             say \"destroy\" don't destroy it. If its toughness is 0 or less, it still dies.)",
+            &[],
+            &["Instant"],
+            &[CoreType::Instant],
+            None,
+        );
+        assert!(
+            rejects_for_no_friendly_recipient(&state, &candidate),
+            "a protection instant with no friendly creature must stay rejected: {:?}",
+            rejecting_policies(&state, &candidate)
+        );
+    }
+
+    /// Documents current behavior, unchanged by the resolution-only reading:
+    /// a permanent spell whose only effect is an ETB pump is not read by the
+    /// no-friendly-recipient check, because that check reads the source's
+    /// `abilities`, and an ETB lives in its triggers. No policy rejects the
+    /// cast, even though with no friendly creature the trigger's only legal
+    /// target is the opponent's creature.
+    #[test]
+    fn etb_pump_permanent_without_a_friendly_creature_is_not_rejected() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+        let (card_id, candidate) = parsed_card_cast_candidate(
+            &mut state,
+            "Test Banner",
+            "When this artifact enters, put a +1/+1 counter on target creature.",
+            &[],
+            &["Artifact"],
+            &[CoreType::Artifact],
+            None,
+        );
+        assert!(
+            !state.objects[&card_id].trigger_definitions.is_empty(),
+            "the fixture must carry the ETB trigger it documents"
+        );
+        let rejects = rejecting_policies(&state, &candidate);
+        assert!(
+            rejects.is_empty(),
+            "an ETB-only pump permanent is not rejected today, by this check or any \
+             other policy; rejected by {rejects:?}"
+        );
+    }
+
     #[test]
     fn requisition_raid_counter_player_slot_prefers_self() {
         let mut state = make_state();
