@@ -88,31 +88,78 @@ fn tempo_class_for(features: &DeckFeatures) -> TempoClass {
     }
 }
 
-fn expected_lands_for(features: &DeckFeatures) -> [u8; SCHEDULE_LEN] {
+/// The mature land target of the deck the fixed schedule was written for (24
+/// lands in 60 cards), and the target when the deck's composition is unknown
+/// (`ManaBaseFeature::default()`, as in hand-built test features).
+const DEFAULT_LAND_PLATEAU: u8 = 6;
+
+/// CR 103.5 + CR 504.1: the cards a player has seen once their mana is mature,
+/// the opening hand of seven plus eight draw steps. The deck's land density
+/// times this is the number of lands it expects to have drawn; 24 lands in 60
+/// cards gives exactly [`DEFAULT_LAND_PLATEAU`].
+const CARDS_SEEN_AT_MATURITY: u32 = 15;
+
+/// Ceiling of the land schedule, with or without the ramp bump.
+const LAND_SCHEDULE_CAP: u8 = 8;
+
+/// Ramp commitment above which a deck plays like a ramp deck: its land
+/// schedule (for `land_commitment`) or its mana schedule (for `commitment`)
+/// is raised.
+const RAMP_SCHEDULE_FLOOR: f32 = 0.3;
+
+/// The number of lands the deck expects in play once its mana is mature: its
+/// land density times [`CARDS_SEEN_AT_MATURITY`], rounded to the nearest land.
+/// 17 lands in 40 cards and 24 in 60 both derive 6; 20 in 60 derives 5.
+fn land_plateau(features: &DeckFeatures) -> u8 {
+    let base = features.mana_base;
+    if base.cards == 0 {
+        return DEFAULT_LAND_PLATEAU;
+    }
+    let seen = u64::from(base.lands) * u64::from(CARDS_SEEN_AT_MATURITY);
+    let cards = u64::from(base.cards);
+    let rounded = (2 * seen + cards) / (2 * cards);
+    u8::try_from(rounded)
+        .unwrap_or(LAND_SCHEDULE_CAP)
+        .clamp(1, LAND_SCHEDULE_CAP)
+}
+
+/// CR 305.2: whether the deck puts more lands into play than its land drops,
+/// through extra land drops or land-fetch spells (`mana_ramp.land_commitment`),
+/// or plays enough lands for landfall to read as its plan. A mana rock or dork
+/// adds mana, not lands, so it does not qualify.
+fn adds_lands(features: &DeckFeatures) -> bool {
+    features.landfall.commitment > 0.5 || features.mana_ramp.land_commitment > RAMP_SCHEDULE_FLOOR
+}
+
+/// One land drop a turn up to the deck's plateau, plus the ramp bump when
+/// `ramp` holds.
+fn land_schedule(features: &DeckFeatures, ramp: bool) -> [u8; SCHEDULE_LEN] {
+    let plateau = land_plateau(features);
     let mut lands = [0u8; SCHEDULE_LEN];
-    // Baseline: one land drop per turn, capped at turn 5 curve.
     for (turn_idx, slot) in lands.iter_mut().enumerate() {
         let turn = (turn_idx + 1) as u8;
-        *slot = turn.min(6);
+        *slot = turn.min(plateau);
     }
-    // A single `wants_ramp_curve` gate prevents double-bumping when both
-    // landfall and mana_ramp are high — both features indicate the same
-    // "play more lands" intention, so one +1 application is correct.
-    // CR 305.2: additional land drops from Azusa-likes raise the per-turn cap.
-    let wants_ramp_curve =
-        features.landfall.commitment > 0.5 || features.mana_ramp.commitment > 0.3;
-    if wants_ramp_curve {
+    // A single gate prevents double-bumping when several ramp axes are high —
+    // they indicate the same "more mana sooner" intention, so one +1 is correct.
+    if ramp {
         for (turn_idx, slot) in lands.iter_mut().enumerate().skip(2) {
             if turn_idx < 4 {
                 *slot = slot.saturating_add(1);
             } else {
                 // Preserve the forward curve — everything from turn 5 onward
                 // inherits the same +1 until the cap.
-                *slot = slot.saturating_add(1).min(8);
+                *slot = slot.saturating_add(1).min(LAND_SCHEDULE_CAP);
             }
         }
     }
     lands
+}
+
+/// Expected lands in play per turn. CR 305.2: one land drop a turn, raised by
+/// one only for a deck that puts extra lands into play ([`adds_lands`]).
+fn expected_lands_for(features: &DeckFeatures) -> [u8; SCHEDULE_LEN] {
+    land_schedule(features, adds_lands(features))
 }
 
 /// Expected available mana per turn — starts from land projections and adds
@@ -120,13 +167,16 @@ fn expected_lands_for(features: &DeckFeatures) -> [u8; SCHEDULE_LEN] {
 ///
 /// CR 106.4: mana pools empty each step; `expected_mana` models per-turn
 /// availability, not accumulated totals. CR 305.2: additional land drops
-/// further raise the ceiling when `wants_ramp_curve`.
+/// further raise the ceiling. The mana schedule takes the ramp bump for any
+/// ramp, a rock or dork included, because those add mana even though they add
+/// no land.
 pub(crate) fn expected_mana_for(features: &DeckFeatures) -> [u8; SCHEDULE_LEN] {
-    let mut mana = expected_lands_for(features);
+    let mana_ramp = features.mana_ramp.commitment > RAMP_SCHEDULE_FLOOR;
+    let mut mana = land_schedule(features, adds_lands(features) || mana_ramp);
     // When significant mana ramp is present, model one extra mana on turns 2
     // and 3 (a dork played on turn 1 starts contributing on turn 2) and two
     // extra mana on turns 4–6 (compounded ramp: dorks + fetch lands).
-    if features.mana_ramp.commitment > 0.3 {
+    if mana_ramp {
         for (turn_idx, slot) in mana.iter_mut().enumerate() {
             let bonus: u8 = match turn_idx + 1 {
                 2 | 3 => 1,

@@ -153,15 +153,10 @@ mod tests {
         crate::plan::derive_snapshot(&crate::features::DeckFeatures::default())
     }
 
+    /// A land-ramp deck (extra land drops): the deck shape whose land schedule
+    /// is raised (CR 305.2). Mana dorks alone raise only the mana schedule.
     fn ramp_plan() -> PlanSnapshot {
-        crate::plan::derive_snapshot(&crate::features::DeckFeatures {
-            mana_ramp: crate::features::ManaRampFeature {
-                dork_count: 8,
-                commitment: 0.96,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
+        crate::test_support::ramp_deck_plan()
     }
 
     /// The two helpers above replaced hand-written schedules

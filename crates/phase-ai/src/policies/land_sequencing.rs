@@ -31,7 +31,6 @@
 
 use engine::ai_support::CandidateAction;
 use engine::game::game_object::GameObject;
-use engine::game::mana_payment::{mana_type_to_demand_index, outer_cost_color_demand, ColorDemand};
 use engine::types::ability::{
     AbilityDefinition, ControllerRef, Effect, ReplacementDefinition, TapStateChange, TargetFilter,
     TriggerDefinition, TriggerEntry, TypeFilter,
@@ -50,7 +49,7 @@ use super::mulligan::modal_back_face;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::ability_chain::collect_chain_effects;
 use crate::features::DeckFeatures;
-use crate::mana_colors::land_produced_color_types;
+use crate::mana_colors::{land_produced_color_types, unmet_hand_colors_covered};
 
 /// Penalty for playing a self-bouncing land while a non-bouncing land is also
 /// currently playable. The non-bounce land's `PlayLand` scores `0.0` here, so
@@ -328,78 +327,12 @@ fn is_etb_self_trigger(trigger: &TriggerDefinition) -> bool {
 }
 
 /// How many colors the played land covers that the AI's near-term hand demands
-/// and its battlefield cannot yet produce, capped at [`COLOR_FIX_CAP`].
-///
-/// Ordered so a colorless land pays for nothing: the candidate's own produced
-/// colors are read first (card-local), and only a land that produces at least
-/// one color triggers the battlefield and hand scans.
+/// and its battlefield cannot yet produce, capped at [`COLOR_FIX_CAP`]. The
+/// count is `mana_colors::unmet_hand_colors_covered`, the same measure the
+/// keep order reads to pick which land in hand is the next land drop.
 fn unmet_colors_covered(ctx: &PolicyContext<'_>, face: &LandFace<'_>) -> usize {
     let produced = land_produced_color_types(face.subtypes, face.abilities);
-    if produced.is_empty() {
-        return 0;
-    }
-    let (supply, land_count) = ai_land_supply(ctx.state, ctx.ai_player);
-    let demand = hand_color_demand(ctx.state, ctx.ai_player, land_count);
-    produced
-        .into_iter()
-        .filter_map(mana_type_to_demand_index)
-        .filter(|&index| demand[index] > supply[index])
-        .count()
-        .min(COLOR_FIX_CAP)
-}
-
-/// One battlefield walk yielding both halves of the color-demand comparison:
-/// how many of the AI's lands produce each color, and how many lands it controls
-/// (the castability threshold the hand scan uses).
-fn ai_land_supply(state: &GameState, player: PlayerId) -> (ColorDemand, u32) {
-    let mut supply = [0u32; 5];
-    let mut lands = 0;
-    for obj in state
-        .battlefield
-        .iter()
-        .filter_map(|id| state.objects.get(id))
-    {
-        if obj.controller != player || !obj.card_types.core_types.contains(&CoreType::Land) {
-            continue;
-        }
-        lands += 1;
-        for color in land_produced_color_types(&obj.card_types.subtypes, &obj.abilities) {
-            if let Some(index) = mana_type_to_demand_index(color) {
-                supply[index] += 1;
-            }
-        }
-    }
-    (supply, lands)
-}
-
-/// CR 107.4b: element-wise MAX colored-pip demand over the nonland cards in the
-/// AI's hand that are within one land drop of being castable.
-///
-/// MAX, not sum: demand asks "how many sources of this color does one castable
-/// card need," which is what a land drop can answer this turn — summing would
-/// let a hand of three one-pip green cards claim three unmet green sources.
-/// Castability is the same count-based check `ramp_timing` uses (CR 202.3 mana
-/// value against lands controlled plus this turn's drop) — deliberately never an
-/// affordability sweep, which is far too expensive per candidate.
-fn hand_color_demand(state: &GameState, player: PlayerId, land_count: u32) -> ColorDemand {
-    let mut demand = [0u32; 5];
-    let Some(hand) = state.players.get(player.0 as usize).map(|p| &p.hand) else {
-        return demand;
-    };
-    for obj in hand.iter().filter_map(|id| state.objects.get(id)) {
-        if obj.card_types.core_types.contains(&CoreType::Land)
-            || obj.mana_cost.mana_value() > land_count + 1
-        {
-            continue;
-        }
-        for (slot, needed) in demand
-            .iter_mut()
-            .zip(outer_cost_color_demand(&obj.mana_cost))
-        {
-            *slot = (*slot).max(needed);
-        }
-    }
-    demand
+    unmet_hand_colors_covered(ctx.state, ctx.ai_player, &produced).min(COLOR_FIX_CAP)
 }
 
 fn bounces_own_land(effect: &&Effect) -> bool {

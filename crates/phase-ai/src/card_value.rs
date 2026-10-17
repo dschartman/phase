@@ -50,12 +50,14 @@
 //! family without evidence would be speculative. "The discard bug is fixed"
 //! means the cleanup family and the discard cost, not all discard.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
+use engine::types::zones::Zone;
 
+use crate::mana_colors::{land_produced_color_types, UnmetColors};
 use crate::plan::PlanState;
 use crate::zone_eval::is_intrinsic_mana_source;
 
@@ -102,7 +104,8 @@ pub(crate) enum KeepTier {
     /// land here, the sort key `(Ordinary, intrinsic)` orders identically to
     /// `intrinsic` alone.
     Ordinary,
-    /// A mana source held while behind the plan's land schedule.
+    /// A mana source held while behind the plan's schedule on its own axis.
+    /// For a land in hand, only the next land drop (CR 305.2: one land a turn).
     NeededManaSource,
 }
 
@@ -157,17 +160,73 @@ pub(crate) fn mana_role(state: &GameState, obj_id: ObjectId) -> ManaRole {
 /// axis says they are past it. On curve — and whenever no plan authority exists
 /// — every card is `Ordinary`, which reproduces the pure-intrinsic ordering
 /// exactly.
+///
+/// CR 305.2: a player normally plays one land a turn, so a deficit of several
+/// lands is closed one land drop at a time. Below the target, only the land in
+/// hand that makes the next land drop ([`is_next_land_drop`]) is
+/// `NeededManaSource`; every further land in that hand is `Ordinary` and
+/// competes with spells on value. A land in any other zone is not competing for
+/// the drop and reads the deficit alone.
 pub(crate) fn keep_tier(state: &GameState, obj_id: ObjectId, plan: Option<PlanState>) -> KeepTier {
-    let deficit = match mana_role(state, obj_id) {
+    let role = mana_role(state, obj_id);
+    let deficit = match role {
         ManaRole::None => return KeepTier::Ordinary,
         ManaRole::LandDrop => plan.map(|p| p.lands_behind),
         ManaRole::Accelerant => plan.map(|p| p.mana_behind),
     };
     match deficit.map(|d| d.cmp(&0)) {
+        Some(Ordering::Greater)
+            if role == ManaRole::LandDrop && !is_next_land_drop(state, obj_id) =>
+        {
+            KeepTier::Ordinary
+        }
         Some(Ordering::Greater) => KeepTier::NeededManaSource,
         Some(Ordering::Less) => KeepTier::Surplus,
         Some(Ordering::Equal) | None => KeepTier::Ordinary,
     }
+}
+
+/// CR 305.1 + CR 305.2: whether this land is the one its owner's hand would
+/// spend the next land drop on. Only a land in a hand competes for the drop; a
+/// land in any other zone reads `true`.
+///
+/// Among the hand's lands the next drop is the one covering the most colours
+/// the near-term hand needs and the battlefield cannot yet produce
+/// ([`UnmetColors`], the measure land-play sequencing credits a `PlayLand`
+/// with), so a Forest that makes a green spell castable is kept over a sixth
+/// Island. Ties go to the lowest object id, so exactly one land is the next
+/// drop.
+fn is_next_land_drop(state: &GameState, obj_id: ObjectId) -> bool {
+    let Some(obj) = state.objects.get(&obj_id) else {
+        return false;
+    };
+    if obj.zone != Zone::Hand {
+        return true;
+    }
+    let Some(hand) = state.players.get(obj.owner.0 as usize).map(|p| &p.hand) else {
+        return true;
+    };
+    let lands: Vec<ObjectId> = hand
+        .iter()
+        .copied()
+        .filter(|&id| mana_role(state, id) == ManaRole::LandDrop)
+        .collect();
+    if lands.len() < 2 {
+        return true;
+    }
+    let unmet = UnmetColors::for_player(state, obj.owner);
+    let colours_fixed = |id: ObjectId| {
+        state.objects.get(&id).map_or(0, |land| {
+            unmet.covered(&land_produced_color_types(
+                &land.card_types.subtypes,
+                &land.abilities,
+            ))
+        })
+    };
+    lands
+        .into_iter()
+        .max_by_key(|&id| (colours_fixed(id), Reverse(id)))
+        == Some(obj_id)
 }
 
 /// The sort key for a minimizing selection: give-up tier first, intrinsic
