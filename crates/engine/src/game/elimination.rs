@@ -528,6 +528,14 @@ pub fn eliminate_players_simultaneously(
             if !players::is_alive(state, waiting_pid) {
                 let next = players::next_player(state, waiting_pid);
                 state.waiting_for = WaitingFor::Priority { player: next };
+                // CR 608.2n + CR 800.4a: when the departed player's prompt was the
+                // last thing the resolution owed, the resolution ends here: a spell
+                // held on the stack is put into its zone as its final part, and the
+                // carrier settles, as at any priority boundary.
+                if super::engine::resolution_instructions_are_done(state) {
+                    super::stack::deliver_deferred_spell(state, events);
+                }
+                super::engine::settle_resolving_stack_entry_after_continuation_resume(state);
             }
         }
 
@@ -782,6 +790,25 @@ fn exile_owned_objects_on_player_left_game(
         Zone::Command,
         Zone::Stack,
     ];
+    // CR 608.2n + CR 608.2m: a spell that is resolving has been popped from the
+    // stack list but is still on the stack until the final part of its
+    // resolution; it is one of the leaving player's objects all the same.
+    let resolving_spell = state
+        .resolving_stack_entry
+        .as_ref()
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                crate::types::game_state::StackEntryKind::Spell { .. }
+            )
+        })
+        .map(|entry| entry.id)
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.zone == Zone::Stack)
+        });
     let mut to_exile: Vec<_> = state
         .battlefield
         .iter()
@@ -791,6 +818,7 @@ fn exile_owned_objects_on_player_left_game(
                 .into_iter()
                 .flat_map(|zone| super::targeting::zone_object_ids(state, zone)),
         )
+        .chain(resolving_spell)
         .filter(|id| state.objects.get(id).is_some_and(|obj| obj.owner == player))
         .collect();
     to_exile.sort_by_key(|id| id.0);

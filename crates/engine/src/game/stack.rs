@@ -2410,6 +2410,10 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         // free-cast window above) keeps its carrier past this call, and has not
         // reached that part.
         let resolution_paused = !resolving_carrier_settles_now(state);
+        // The free-cast window is one such pause (`handles` keeps its carrier),
+        // so for an instant or sorcery `resolution_paused` already covers it;
+        // `paused_on_free_cast_window` below still governs permanent spells.
+        debug_assert!(!paused_on_free_cast_window || resolution_paused);
         let end_procedure_exiles_resolving_object = ability.as_ref().is_some_and(|ability| {
             matches!(ability.effect, Effect::EndTheTurn)
                 || (matches!(ability.effect, Effect::EndCombatPhase)
