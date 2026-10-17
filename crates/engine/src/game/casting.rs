@@ -29333,6 +29333,7 @@ fn filter_prop_reads_chosen_target(prop: &FilterProp, read: TargetRead) -> bool 
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase

@@ -339,6 +339,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
         | FilterProp::Modified
@@ -893,6 +894,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::InTrackedSet { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
         | FilterProp::DealtDamageThisTurn { .. }
@@ -1138,6 +1140,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
         | FilterProp::Modified
@@ -2311,6 +2314,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
@@ -2573,6 +2577,7 @@ fn filter_prop_contains_filter_prop(
             | FilterProp::NotSupertype { .. }
             | FilterProp::Suspected
             | FilterProp::Renowned
+            | FilterProp::Prepared
             | FilterProp::Goaded
             | FilterProp::ToughnessGTPower
             | FilterProp::PowerExceedsBase
@@ -3107,6 +3112,7 @@ fn declared_group_controller(prop: &mut FilterProp) -> Option<&mut ControllerRef
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
@@ -3556,6 +3562,7 @@ fn rewrite_filter_prop(
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
@@ -7827,6 +7834,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::HasSingleTarget
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         // CR 701.15b/c: a spell on the stack carries no goad designation. Fail closed.
         | FilterProp::Goaded
         // CR 700.9: Modified requires on-battlefield attachments/counters,
@@ -9282,6 +9290,8 @@ fn matches_filter_prop(
         FilterProp::Suspected => obj.is_suspected,
         // CR 702.112b: Match permanents with the renowned designation.
         FilterProp::Renowned => obj.is_renowned,
+        // CR 722.3a: Match permanents with the prepared designation.
+        FilterProp::Prepared => obj.prepared.is_some(),
         // CR 701.15b/c: a creature is goaded iff at least one player has goaded it.
         FilterProp::Goaded => !combat::goading_players_for_creature(state, obj.id).is_empty(),
         // CR 700.9: A permanent is modified if it has one or more counters on
@@ -10094,6 +10104,7 @@ fn zone_change_record_matches_property(
         // ZoneChangeRecord first.
         | FilterProp::PrepareSpell
         | FilterProp::Renowned
+        | FilterProp::Prepared
         // CR 701.15b/c: goad is not snapshotted onto the zone-change record
         // (unlike Suspected's `record.is_suspected`). Fail closed.
         | FilterProp::Goaded
@@ -21383,6 +21394,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::NotSupertype { .. }
             | FilterProp::Suspected
             | FilterProp::Renowned
+            | FilterProp::Prepared
             | FilterProp::Goaded
             | FilterProp::ToughnessGTPower
             | FilterProp::PowerExceedsBase

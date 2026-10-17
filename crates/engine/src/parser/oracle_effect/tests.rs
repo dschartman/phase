@@ -66201,6 +66201,7 @@ fn prop_has_chosen_color(p: &FilterProp) -> bool {
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase

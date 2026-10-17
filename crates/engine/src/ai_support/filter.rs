@@ -913,6 +913,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::PowerExceedsBase
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Modified
         | FilterProp::Historic
         | FilterProp::NotHistoric

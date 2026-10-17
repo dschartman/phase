@@ -3551,6 +3551,7 @@ fn filter_prop_recipient_read(prop: &FilterProp) -> RecipientRead {
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
         | FilterProp::Renowned
+        | FilterProp::Prepared
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
         | FilterProp::PowerExceedsBase
