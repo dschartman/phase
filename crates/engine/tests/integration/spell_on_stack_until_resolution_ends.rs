@@ -454,3 +454,96 @@ fn a_paused_spell_of_a_player_who_leaves_the_game_is_exiled_with_their_objects()
     assert!(runner.state().resolving_stack_entry.is_none());
     assert!(runner.state().deferred_spell_delivery.is_none());
 }
+
+/// Rest in Peace, verbatim (MTGJSON).
+const REST_IN_PEACE: &str = "When Rest in Peace enters, exile all graveyards.\nIf a card or token would be put into a graveyard from anywhere, exile it instead.";
+
+/// Diabolic Edict, verbatim (MTGJSON).
+const DIABOLIC_EDICT: &str = "Target player sacrifices a creature of their choice.";
+
+/// Three players; P0 casts Diabolic Edict targeting P1 and the resolution pauses
+/// on P1's sacrifice choice. P2 controls Rest in Peace when `rest_in_peace`.
+fn edict_paused_on_p1_choice(rest_in_peace: bool) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new_n_player(3, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature(P1, "Grizzly Bears", 2, 2);
+    scenario.add_creature(P1, "Hill Giant", 3, 3);
+    if rest_in_peace {
+        scenario.add_enchantment_from_oracle(PlayerId(2), "Rest in Peace", REST_IN_PEACE);
+    }
+    let edict = scenario
+        .add_spell_to_hand_from_oracle(P0, "Diabolic Edict", true, DIABOLIC_EDICT)
+        .id();
+    let mut runner = scenario.build();
+    with_p0_priority(&mut runner);
+    let _ = runner.cast(edict).target_player(P1).commit();
+    for _ in 0..8 {
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+            || runner.state().stack.is_empty()
+        {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority is accepted");
+    }
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { player, .. } if player == P1
+        ),
+        "reach: the Edict is paused on P1's sacrifice choice, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(zone(&runner, edict), Zone::Stack);
+    (runner, edict)
+}
+
+/// CR 800.4a: the spell's owner leaves the game while another player answers
+/// the spell's prompt. The spell is an object that player owns, so it leaves
+/// the game with the rest of their objects (it is exiled), even though it has
+/// been popped from the stack list while it resolves.
+#[test]
+fn a_paused_spell_whose_owner_leaves_at_another_players_prompt_is_exiled() {
+    use engine::game::elimination::eliminate_player;
+
+    let (mut runner, edict) = edict_paused_on_p1_choice(false);
+    eliminate_player(runner.state_mut(), P0, &mut Vec::new());
+    // P1 still answers the sacrifice; the resolution then ends.
+    for _ in 0..8 {
+        let state = runner.state();
+        if matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.stack.is_empty() {
+            break;
+        }
+        let action = engine::ai_support::legal_actions(state)
+            .into_iter()
+            .find(|action| !matches!(action, GameAction::PassPriority))
+            .unwrap_or(GameAction::PassPriority);
+        let _ = runner.act(action);
+    }
+    assert_eq!(
+        zone(&runner, edict),
+        Zone::Exile,
+        "CR 800.4a: the departed owner's spell leaves the game with their other objects"
+    );
+    assert!(runner.state().deferred_spell_delivery.is_none());
+}
+
+/// CR 800.4a + CR 608.2n + CR 614.1a: the player answering the spell's prompt
+/// leaves the game at that prompt. The spell's owner stays, so the spell is not
+/// left in the stack zone: it is put where the rules put it, its owner's
+/// graveyard, or exile under Rest in Peace.
+#[test]
+fn a_paused_spell_whose_chooser_leaves_at_their_own_prompt_reaches_its_zone() {
+    use engine::game::elimination::eliminate_player;
+
+    for (rest_in_peace, expected) in [(false, Zone::Graveyard), (true, Zone::Exile)] {
+        let (mut runner, edict) = edict_paused_on_p1_choice(rest_in_peace);
+        eliminate_player(runner.state_mut(), P1, &mut Vec::new());
+        assert_eq!(
+            zone(&runner, edict),
+            expected,
+            "rest_in_peace={rest_in_peace}: the spell reaches its zone"
+        );
+    }
+}
