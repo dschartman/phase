@@ -360,21 +360,128 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    let effects = ctx.effects();
+    // CR 601.2b + CR 700.2a: a modal spell's modes are chosen as it is cast,
+    // so each mode is gated on its own and the cast survives when any mode
+    // does. Flattening every mode into one effect list would let a counter
+    // mode with nothing to counter veto a castable removal or draw mode, and
+    // a removal mode with no live target veto an untargeted mode.
+    if let Some(modes) = modal_spell_mode_effects(ctx) {
+        return best_mode_decision(modes.iter().map(|(definition, effects)| {
+            if counter_mode_reaches_nothing_foreign(ctx, definition, effects) {
+                GateDecision::Reject
+            } else {
+                assess_cast_effects(ctx, effects)
+            }
+        }));
+    }
+    assess_cast_effects(ctx, &ctx.effects())
+}
+
+/// CR 701.6a + CR 115.1: one mode of a modal spell that is a plain counter is
+/// judged by what it can reach, as `counter_reaches_nothing_foreign` judges a
+/// non-modal counter: futile when every legal target of each of its counters is
+/// a spell the AI controls, or there is none. That front check defers modal
+/// spells, whose mode is not chosen at announcement; here the mode is fixed.
+/// CR 107.3a + CR 601.2b: a mode whose target legality needs an announced X
+/// fails open, as the front check does.
+fn counter_mode_reaches_nothing_foreign(
+    ctx: &PolicyContext<'_>,
+    definition: &AbilityDefinition,
+    effects: &[&Effect],
+) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    if !is_pure_counter_payload(effects) {
+        return false;
+    }
+    let ai = ctx.ai_player;
+    let resolved = build_resolved_from_def(definition, *object_id, ai);
+    if ability_target_legality_needs_chosen_x(&resolved, definition.distribute.as_ref()) {
+        return false;
+    }
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Counter { .. }))
+        .all(|effect| {
+            effect.target_filter().is_some_and(|filter| {
+                find_legal_targets(ctx.state, filter, ai, *object_id)
+                    .iter()
+                    .all(|target| {
+                        matches!(target, TargetRef::Object(id) if is_own_stack_spell(ctx.state, ai, *id))
+                    })
+            })
+        })
+}
+
+/// One mode of a modal spell: its spell-kind ability and that ability's effects.
+type ModeReading<'a> = (&'a AbilityDefinition, Vec<&'a Effect>);
+
+/// Each mode of a modal spell being cast, as its ability and its effects, or
+/// `None` when the candidate is not a modal spell cast whose modes the engine
+/// indexes as its spell-kind abilities (`modal_spell_mode_ability_refs`). A
+/// count mismatch between the modal header and those abilities fails back to
+/// the flattened reading rather than guessing which ability is which mode.
+fn modal_spell_mode_effects<'a>(ctx: &PolicyContext<'a>) -> Option<Vec<ModeReading<'a>>> {
+    let GameAction::CastSpell { .. } = &ctx.candidate.action else {
+        return None;
+    };
+    let object = ctx.source_object()?;
+    let modal = object.modal.as_ref()?;
+    let modes: Vec<ModeReading<'a>> = modal_spell_mode_ability_refs(object)
+        .map(|definition| {
+            (
+                definition,
+                crate::cast_facts::collect_definition_effects(definition),
+            )
+        })
+        .collect();
+    (modal.mode_count > 0 && modes.len() == modal.mode_count).then_some(modes)
+}
+
+/// The cast is kept when any mode is: the most permissive verdict wins
+/// (`Allow` over the mildest `AllowWithPenalty` over `Reject`).
+fn best_mode_decision(decisions: impl Iterator<Item = GateDecision>) -> GateDecision {
+    decisions.fold(GateDecision::Reject, |best, decision| {
+        match (best, decision) {
+            (GateDecision::Allow, _) | (_, GateDecision::Allow) => GateDecision::Allow,
+            (GateDecision::AllowWithPenalty(a), GateDecision::AllowWithPenalty(b)) => {
+                GateDecision::AllowWithPenalty(a.max(b))
+            }
+            (GateDecision::AllowWithPenalty(p), GateDecision::Reject)
+            | (GateDecision::Reject, GateDecision::AllowWithPenalty(p)) => {
+                GateDecision::AllowWithPenalty(p)
+            }
+            (GateDecision::Reject, GateDecision::Reject) => GateDecision::Reject,
+        }
+    })
+}
+
+/// Effect-level futility checks for one cast or activation reading: the whole
+/// effect list of a non-modal candidate, or one mode of a modal spell.
+fn assess_cast_effects(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> GateDecision {
     if effects.is_empty() {
         return GateDecision::Allow;
     }
 
-    if is_redundant_creature_only_removal(ctx, &effects) {
+    if is_redundant_creature_only_removal(ctx, effects) {
         return GateDecision::Reject;
     }
 
-    if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(&effects) {
+    if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(effects) {
         let source_is_spell = ctx.source_object().is_some_and(|source| {
             source.card_types.core_types.contains(&CoreType::Instant)
                 || source.card_types.core_types.contains(&CoreType::Sorcery)
         });
-        if source_is_spell {
+        if source_is_spell && toughness_bonus < 0 {
+            // CR 704.5f: a -X/-X spell kills any creature whose toughness it
+            // takes to 0 or less, in whatever window it resolves, so it is
+            // creature removal, not a combat trick. It has already passed the
+            // removal path above (`is_redundant_creature_only_removal`: a live
+            // opposing target that is not already dying); the pump-window
+            // rejection, which prices a temporary stat change by the combat
+            // it can swing, does not apply.
+        } else if source_is_spell {
             let facts = TacticalFacts::derive(ctx.state, ctx.ai_player);
             if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
                 return GateDecision::Reject;
@@ -399,7 +506,7 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
                     facts.window,
                     TacticalWindow::CombatAfterBlocks | TacticalWindow::CombatDamage
                 )
-                && self_pump_on_unblocked_attacker(ctx.state, ctx.ai_player, source_id, &effects);
+                && self_pump_on_unblocked_attacker(ctx.state, ctx.ai_player, source_id, effects);
             if !mana_sink_into_open_board {
                 if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
                     return GateDecision::Reject;
@@ -10918,6 +11025,28 @@ mod tests {
         });
     }
 
+    /// An activated ability of the AI's own on the stack: an own item that is
+    /// not a spell, so a spell-only counter mode cannot reach it either.
+    fn push_own_ability(state: &mut GameState) {
+        state.stack.push_back(StackEntry {
+            id: ObjectId(402),
+            source_id: ObjectId(403),
+            controller: P0,
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(403),
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    Vec::new(),
+                    ObjectId(403),
+                    P0,
+                )),
+            },
+        });
+    }
+
     fn assert_modal_with_modes(state: &GameState, spell: ObjectId, modes: usize) {
         let object = state.objects.get(&spell).unwrap();
         assert_eq!(
@@ -11020,6 +11149,27 @@ mod tests {
         let mut runner = scenario.build();
         let state = runner.state_mut();
         set_priority_window(state, Phase::PostCombatMain, P0);
+
+        assert_modal_with_modes(state, icy, 2);
+        assert_eq!(gate_spell_cast(state, icy), GateDecision::Reject);
+    }
+
+    /// CR 701.6a + CR 115.1: the counter mode is judged by what it can reach.
+    /// Icy Reception's counter mode targets a creature or legendary spell; with
+    /// only the AI's own activated ability on the stack it reaches nothing, and
+    /// the -5/-0 mode has no combat to change, so the cast is rejected as on an
+    /// empty stack.
+    #[test]
+    fn modal_counter_or_shrink_rejected_over_own_ability_only() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let icy = scenario
+            .add_spell_to_hand_from_oracle(P0, "Icy Reception", true, ICY_RECEPTION_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PostCombatMain, P0);
+        push_own_ability(state);
 
         assert_modal_with_modes(state, icy, 2);
         assert_eq!(gate_spell_cast(state, icy), GateDecision::Reject);
