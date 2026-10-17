@@ -32,7 +32,7 @@ use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
-use crate::card_value::{cmp_keep, intrinsic_value, keep_key};
+use crate::card_value::{cmp_keep, intrinsic_value, keep_key, worth_drawing, KEEP_VALUE_FLOOR};
 use crate::cast_facts::cast_facts_for_action;
 use crate::combat_ai::{
     choose_attackers_with_targets_with_profile_and_deadline_and_threat,
@@ -4054,14 +4054,12 @@ pub(crate) fn deterministic_choice(
     }
 
     // Scry/Dig/Surveil: use card evaluation heuristics
-    if let WaitingFor::ScryChoice { cards, .. } = &state.waiting_for {
-        let mut scored: Vec<_> = cards
-            .iter()
-            .map(|&id| (id, intrinsic_value(state, id)))
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_cards: Vec<_> = scored.iter().map(|(id, _)| *id).collect();
-        return Some(GameAction::SelectCards { cards: top_cards });
+    // CR 701.22a: the scry payload is the keep-on-top set; the rest go to the
+    // bottom of the library.
+    if let WaitingFor::ScryChoice { player, cards } = &state.waiting_for {
+        return Some(keep_on_top_by_value(
+            state, *player, cards, actions, context,
+        ));
     }
 
     if let WaitingFor::DigChoice {
@@ -4079,7 +4077,7 @@ pub(crate) fn deterministic_choice(
             .map(|&id| (id, intrinsic_value(state, id)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let kept: Vec<_> = if *up_to && scored.first().is_some_and(|(_, v)| *v < 0.1) {
+        let kept: Vec<_> = if *up_to && scored.first().is_some_and(|(_, v)| *v < KEEP_VALUE_FLOOR) {
             // Up-to selection with no valuable cards — take nothing
             Vec::new()
         } else {
@@ -4160,18 +4158,12 @@ pub(crate) fn deterministic_choice(
         return Some(GameAction::SelectCards { cards: arrangement });
     }
 
-    if let WaitingFor::SurveilChoice { cards, .. } = &state.waiting_for {
-        let mut scored: Vec<_> = cards
-            .iter()
-            .map(|&id| (id, intrinsic_value(state, id)))
-            .collect();
-        // CR 701.25a: the action is the ordered keep-on-top set; cards left out
-        // are milled. Keep the higher-value half on top (best drawn first) and
-        // let the worse half fall into the graveyard.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let keep_count = scored.len() / 2;
-        let top_cards: Vec<_> = scored.iter().take(keep_count).map(|(id, _)| *id).collect();
-        return Some(GameAction::SelectCards { cards: top_cards });
+    // CR 701.25a: the surveil payload is the keep-on-top set; cards left out
+    // are put into the graveyard.
+    if let WaitingFor::SurveilChoice { player, cards } = &state.waiting_for {
+        return Some(keep_on_top_by_value(
+            state, *player, cards, actions, context,
+        ));
     }
 
     if let WaitingFor::ArrangePlanarDeckTopChoice {
@@ -4931,6 +4923,91 @@ fn is_plan_payoff_name(features: &DeckFeatures, name: &str) -> bool {
             .any(|n| n == name)
 }
 
+/// CR 701.22a + CR 701.25a: the keep-on-top answer shared by the scry and
+/// surveil arms. Both payloads are the keep-on-top set; the cards left out go
+/// to the bottom (scry) or the graveyard (surveil). A card stays on top exactly
+/// when `card_value::worth_drawing` passes it, so the partition follows card
+/// value, not a fixed count.
+///
+/// `player` is the prompt's own player, the one whose plan and board the land
+/// test reads, as in the cleanup-discard arm.
+///
+/// The engine issues only `[]`, the whole pile and each single card for these
+/// prompts (`select_cards_variants`), and `AiDecisionContract` turns any other
+/// selection into `None`, which halts the AI controller. For N >= 3 the ideal
+/// keep set can be unissued, so the answer is the issued selection that
+/// disagrees with the per-card test on the fewest cards; ties go to the one
+/// keeping fewer cards that fail it, then to the higher kept value. When the
+/// ideal set is issued it disagrees on none and wins. With no issued domain
+/// (the rollout path passes none) the ideal set is the answer.
+///
+/// Kept cards are submitted best first, so the most valuable is drawn next;
+/// the contract accepts any order for a `SelectCards`.
+fn keep_on_top_by_value(
+    state: &GameState,
+    player: PlayerId,
+    cards: &[ObjectId],
+    actions: &[GameAction],
+    context: Option<&AiContext>,
+) -> GameAction {
+    let plan_state = context
+        .and_then(|c| c.session.plan.get(&player))
+        .map(|plan| PlanState::realize(state, player, plan));
+    let mut ranked: Vec<_> = cards
+        .iter()
+        .map(|&id| {
+            (
+                id,
+                intrinsic_value(state, id),
+                worth_drawing(state, id, plan_state),
+            )
+        })
+        .collect();
+    // Stable: equal values keep library order.
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let entry = |id: &ObjectId| ranked.iter().position(|(card, _, _)| card == id);
+
+    // (disagreements with the per-card test, kept cards that fail it, kept value)
+    let fit = |selection: &[ObjectId]| {
+        let kept_failing = selection
+            .iter()
+            .filter(|id| entry(id).is_some_and(|i| !ranked[i].2))
+            .count();
+        let dropped_passing = ranked
+            .iter()
+            .filter(|(id, _, worth)| *worth && !selection.contains(id))
+            .count();
+        let kept_value: f64 = selection
+            .iter()
+            .filter_map(|id| entry(id).map(|i| ranked[i].1))
+            .sum();
+        (kept_failing + dropped_passing, kept_failing, kept_value)
+    };
+    let best_issued = issued_selections(actions).min_by(|left, right| {
+        let (left_off, left_failing, left_value) = fit(left);
+        let (right_off, right_failing, right_value) = fit(right);
+        left_off
+            .cmp(&right_off)
+            .then(left_failing.cmp(&right_failing))
+            .then(
+                right_value
+                    .partial_cmp(&left_value)
+                    .unwrap_or(Ordering::Equal),
+            )
+    });
+
+    let mut kept: Vec<ObjectId> = match best_issued {
+        Some(selection) => selection.clone(),
+        None => ranked
+            .iter()
+            .filter(|(_, _, worth)| *worth)
+            .map(|(id, _, _)| *id)
+            .collect(),
+    };
+    kept.sort_by_key(|id| entry(id));
+    GameAction::SelectCards { cards: kept }
+}
+
 /// The card selections the engine issued for the current prompt.
 ///
 /// This is the AI's entire legal answer domain for a selection window:
@@ -5097,8 +5174,7 @@ mod tests {
     use crate::session::SessionCache;
     use crate::test_support::{context_with_plans, default_deck_plan, ramp_deck_plan};
 
-    const PACT_OF_NEGATION_ORACLE: &str =
-        "Counter target spell.\nAt the beginning of your next upkeep, pay {3}{U}{U}. If you don't, you lose the game.";
+    const PACT_OF_NEGATION_ORACLE: &str = "Counter target spell.\nAt the beginning of your next upkeep, pay {3}{U}{U}. If you don't, you lose the game.";
 
     fn integration_card_db() -> CardDatabase {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7128,8 +7204,7 @@ mod tests {
         id
     }
 
-    const SELF_DESTRUCT_ORACLE: &str =
-        "Target creature you control deals X damage to any other target and X damage to itself, where X is its power.";
+    const SELF_DESTRUCT_ORACLE: &str = "Target creature you control deals X damage to any other target and X damage to itself, where X is its power.";
 
     fn self_destruct_state(source_power: i32, recipient_power: i32) -> (GameState, ObjectId) {
         use engine::parser::oracle::parse_oracle_text;
@@ -11981,10 +12056,7 @@ mod tests {
         );
         eprintln!(
             "reflection target ranking: low-life score={:?} probability={:?}; threatening score={:?} probability={:?}",
-            low_life.score,
-            low_life.probability,
-            threatening.score,
-            threatening.probability,
+            low_life.score, low_life.probability, threatening.score, threatening.probability,
         );
         assert!(
             threatening.is_top_ranked

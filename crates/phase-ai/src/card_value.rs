@@ -14,9 +14,14 @@
 //! divergence from [`intrinsic_value`] is visible in one place instead of
 //! hidden in a policy file.
 //!
-//! **Which discard seams are tiered.** [`keep_tier`] reaches exactly one
-//! `deterministic_choice` arm: the CR 514.1 cleanup discard
-//! (`WaitingFor::DiscardToHandSize`). It has one further consumer, which is a
+//! [`worth_drawing`] is the keep-on-top test for scry and surveil: the
+//! scalar at or above [`KEEP_VALUE_FLOOR`] (the floor the `DigChoice` up-to
+//! arm reads) and not a [`KeepTier::Surplus`] mana source.
+//!
+//! **Which discard seams are tiered.** Among discard seams, [`keep_tier`]
+//! reaches exactly one `deterministic_choice` arm: the CR 514.1 cleanup discard
+//! (`WaitingFor::DiscardToHandSize`); it also reaches the scry and surveil arms
+//! through [`worth_drawing`]. It has one further consumer, which is a
 //! policy rather than a `deterministic_choice` arm: the CR 601.2f sacrifice-cost
 //! cast gate (`policies::sacrifice_cost_mana_gate`), which reads the tier of
 //! *battlefield* objects. That does not collide with the sentence below, because
@@ -175,6 +180,32 @@ pub(crate) fn keep_key(
 pub(crate) fn cmp_keep(a: &(KeepTier, f64), b: &(KeepTier, f64)) -> Ordering {
     a.0.cmp(&b.0)
         .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+}
+
+/// The [`intrinsic_value`] floor below which a looked-at card is not worth
+/// keeping. The `DigChoice` up-to arm takes nothing when its best card scores
+/// under it, and [`worth_drawing`] reads the same floor, so dig, scry and
+/// surveil agree on what "worth keeping" means.
+pub(crate) const KEEP_VALUE_FLOOR: f64 = 0.1;
+
+/// CR 701.22a + CR 701.25a: whether a looked-at card is worth leaving on top of
+/// the library to be drawn, rather than putting it on the bottom (scry) or into
+/// the graveyard (surveil).
+///
+/// Two tests, both read from the existing authorities rather than a second
+/// value function:
+/// - the scalar: [`intrinsic_value`] at or above [`KEEP_VALUE_FLOOR`];
+/// - the plan: a mana source in the [`KeepTier::Surplus`] tier is an excess
+///   card. A land scores 3.0 on the scalar, so only this test can bin one; per
+///   CR 305.2 a player normally plays one land a turn, and past the plan's land
+///   target another land is surplus. An accelerant past the mana target is
+///   excess the same way.
+///
+/// `plan == None` (no plan authority, as on the rollout path) leaves every card
+/// `Ordinary`, so the scalar alone decides.
+pub(crate) fn worth_drawing(state: &GameState, obj_id: ObjectId, plan: Option<PlanState>) -> bool {
+    keep_tier(state, obj_id, plan) != KeepTier::Surplus
+        && intrinsic_value(state, obj_id) >= KEEP_VALUE_FLOOR
 }
 
 /// Evaluate a card's value for scry/dig/surveil decisions.
