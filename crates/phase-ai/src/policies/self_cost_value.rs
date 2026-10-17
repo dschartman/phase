@@ -3518,4 +3518,329 @@ mod tests {
         assert_neutral(&verdict, "self_cost_benefit_covers_cost");
         assert_facts(&verdict, 500, 1500);
     }
+
+    // --- Discard cost priced by the card it gives up (2026-10-17) ---------
+    //
+    // CR 118.1 + CR 701.9b: a "discard a card" cost spends the card the keep
+    // order gives up. Its price is that card's value measured in expected
+    // draws (the AI library's mean `intrinsic_value`), so a lone card worth
+    // more than the draw a loot buys is a certified loss. Values below:
+    // land 3.0; creature 1.5 * P + T + 0.5 * pips; noncreature 0.5 * pips.
+    mod discard_priced_by_the_card_given_up {
+        use super::*;
+        use crate::plan::PlanSnapshot;
+        use engine::game::scenario::{GameScenario, P0};
+        use engine::types::game_state::CastPaymentMode;
+        use engine::types::mana::{ManaCost, ManaCostShard};
+
+        fn card(state: &mut GameState, zone: Zone, name: &str) -> ObjectId {
+            create_object(state, CardId(next_id()), AI, name.to_string(), zone)
+        }
+
+        fn land_in(state: &mut GameState, zone: Zone) -> ObjectId {
+            let id = card(state, zone, "Swamp");
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Land);
+            id
+        }
+
+        /// A `p`/`p` creature costing `{generic}`: value 2.5 * p + 0.5 * generic.
+        fn creature_in(state: &mut GameState, zone: Zone, p: i32, generic: u32) -> ObjectId {
+            let id = card(state, zone, "Creature");
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(p);
+            obj.toughness = Some(p);
+            obj.mana_cost = ManaCost::Cost {
+                shards: Vec::new(),
+                generic,
+            };
+            id
+        }
+
+        /// A noncreature spell costing `{generic}`: value 0.5 * generic.
+        fn instant_in(state: &mut GameState, zone: Zone, generic: u32) -> ObjectId {
+            let id = card(state, zone, "Instant");
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = ManaCost::Cost {
+                shards: Vec::new(),
+                generic,
+            };
+            id
+        }
+
+        /// The Murmuring Volume loot: "{2}, {T}, Discard a card: Draw a card."
+        fn volume(state: &mut GameState) -> ObjectId {
+            source_with(
+                state,
+                "Murmuring Volume",
+                &[CoreType::Artifact],
+                activated(
+                    draw(1),
+                    AbilityCost::Composite {
+                        costs: vec![
+                            AbilityCost::Mana {
+                                cost: ManaCost::generic(2),
+                            },
+                            AbilityCost::Tap,
+                            discard_cost(1),
+                        ],
+                    },
+                ),
+            )
+        }
+
+        fn verdict_with_plan(
+            state: &GameState,
+            source: ObjectId,
+            plan: Option<PlanSnapshot>,
+        ) -> PolicyVerdict {
+            let config = AiConfig::default();
+            let mut session = AiSession::empty();
+            session.features.insert(AI, plain_features());
+            if let Some(plan) = plan {
+                session.plan.insert(AI, plan);
+            }
+            let mut context = AiContext::empty(&config.weights);
+            context.session = Arc::new(session);
+            context.player = AI;
+            verdict_for_in(&context, &config, state, source)
+        }
+
+        /// Library of three lands: expected draw 3.0.
+        fn library_of_lands(state: &mut GameState) {
+            for _ in 0..3 {
+                land_in(state, Zone::Library);
+            }
+        }
+
+        /// Library of a land and a 3/3 for {3} (9.0): expected draw 6.0.
+        fn library_averaging_six(state: &mut GameState) {
+            land_in(state, Zone::Library);
+            creature_in(state, Zone::Library, 3, 3);
+        }
+
+        #[test]
+        fn loot_with_one_card_in_hand_is_priced_at_that_cards_value() {
+            // One 3/3 for {3} (9.0) against an expected draw of 3.0: the loot
+            // gives up three draws' worth to buy one.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            creature_in(&mut state, Zone::Hand, 3, 3);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(&state, source, None);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 3000, 1000);
+        }
+
+        #[test]
+        fn loot_with_one_card_worth_less_than_the_expected_draw_covers() {
+            // One {2} instant (1.0) against an expected draw of 3.0.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            instant_in(&mut state, Zone::Hand, 2);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(&state, source, None);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 333, 1000);
+        }
+
+        #[test]
+        fn loot_prices_the_card_the_keep_order_gives_up() {
+            // No plan: every card is Ordinary, so the land (3.0) goes before
+            // the 3/3 (9.0). Expected draw 6.0: the loot costs half a draw.
+            let mut state = GameState::new_two_player(42);
+            library_averaging_six(&mut state);
+            land_in(&mut state, Zone::Hand);
+            creature_in(&mut state, Zone::Hand, 3, 3);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(&state, source, None);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 500, 1000);
+        }
+
+        #[test]
+        fn a_forced_pitch_of_a_good_card_is_priced_at_its_own_value() {
+            // No land on the battlefield, plan target 6: the land in hand is
+            // the next land drop (NeededManaSource), so the keep order gives up
+            // the 3/3. `keep_prices` would price it at the pool's lowest value
+            // (3.0); the loss is the 3/3 itself, 9.0 = 1.5 draws.
+            let mut state = GameState::new_two_player(42);
+            library_averaging_six(&mut state);
+            land_in(&mut state, Zone::Hand);
+            creature_in(&mut state, Zone::Hand, 3, 3);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(
+                &state,
+                source,
+                Some(crate::test_support::default_deck_plan()),
+            );
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 1500, 1000);
+        }
+
+        #[test]
+        fn a_surplus_land_is_priced_at_its_keep_price() {
+            // Eight lands in play against target 6: the land in hand is
+            // Surplus and goes first, at the keep order's price (the pool's
+            // lowest value, the {3} instant's 1.5), not a land's 3.0. Library
+            // {2}, {2}, land, land: expected draw 2.0.
+            let mut state = GameState::new_two_player(42);
+            for _ in 0..8 {
+                land_in(&mut state, Zone::Battlefield);
+            }
+            instant_in(&mut state, Zone::Library, 2);
+            instant_in(&mut state, Zone::Library, 2);
+            land_in(&mut state, Zone::Library);
+            land_in(&mut state, Zone::Library);
+            land_in(&mut state, Zone::Hand);
+            instant_in(&mut state, Zone::Hand, 3);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(
+                &state,
+                source,
+                Some(crate::test_support::default_deck_plan()),
+            );
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 750, 1000);
+        }
+
+        #[test]
+        fn the_draw_is_priced_as_an_expected_card_not_the_known_top_card() {
+            // The same library in two orders: a 3/3 on top, or a land on top.
+            // The policy prices the draw as an expected card either way.
+            let facts = |creature_on_top: bool| {
+                let mut state = GameState::new_two_player(42);
+                if creature_on_top {
+                    land_in(&mut state, Zone::Library);
+                    creature_in(&mut state, Zone::Library, 3, 3);
+                } else {
+                    creature_in(&mut state, Zone::Library, 3, 3);
+                    land_in(&mut state, Zone::Library);
+                }
+                instant_in(&mut state, Zone::Hand, 4);
+                let source = volume(&mut state);
+                match verdict_with_plan(&state, source, None) {
+                    PolicyVerdict::Score { reason, .. } | PolicyVerdict::Reject { reason } => {
+                        reason.facts
+                    }
+                }
+            };
+            assert_eq!(facts(true), facts(false));
+            // {4} instant (2.0) against 6.0: a third of a draw.
+            assert_eq!(
+                facts(true),
+                vec![("cost_milli", 333), ("benefit_milli", 1000)]
+            );
+        }
+
+        // --- the flashback cast (Twinned Vision shape) ------------------
+
+        const TWINNED_VISION_TEXT: &str = "Draw a card. If this spell wasn't cast from your \
+            hand, draw two cards instead.\nFlashback—{1}{U/R}{U/R}, Discard a card. (You may \
+            cast this card from your graveyard for its flashback cost. Then exile it.)";
+
+        /// Twinned Vision in `zone`, its Oracle text parsed by the shipped
+        /// parser, plus a library of three lands (expected draw 3.0) and one
+        /// card in hand: a `p`/`p` creature for `{generic}`, or a {2} instant.
+        fn twinned_vision_board(
+            zone: Zone,
+            held_creature: Option<(i32, u32)>,
+        ) -> (GameState, ObjectId) {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let vision = match zone {
+                Zone::Graveyard => scenario.add_spell_to_graveyard(P0, "Twinned Vision", true),
+                _ => scenario.add_spell_to_hand_from_oracle(P0, "Twinned Vision", true, ""),
+            }
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::BlueRed],
+                generic: 1,
+            })
+            .from_oracle_text_with_keywords(&["Flashback"], TWINNED_VISION_TEXT)
+            .id();
+            let mut state = scenario.build().state().clone();
+            library_of_lands(&mut state);
+            match held_creature {
+                Some((p, generic)) => {
+                    creature_in(&mut state, Zone::Hand, p, generic);
+                }
+                None => {
+                    instant_in(&mut state, Zone::Hand, 2);
+                }
+            }
+            (state, vision)
+        }
+
+        fn cast_verdict(state: &GameState, object_id: ObjectId) -> PolicyVerdict {
+            let config = AiConfig::default();
+            let context = context_for(&config, plain_features());
+            let card_id = state.objects[&object_id].card_id;
+            let candidate = CandidateAction {
+                action: GameAction::CastSpell {
+                    object_id,
+                    card_id,
+                    targets: Vec::new(),
+                    payment_mode: CastPaymentMode::Auto,
+                },
+                metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Spell),
+            };
+            let decision = AiDecisionContext {
+                waiting_for: WaitingFor::Priority { player: AI },
+                candidates: Vec::new(),
+            };
+            SelfCostValuePolicy.verdict(&PolicyContext {
+                state,
+                decision: &decision,
+                candidate: &candidate,
+                ai_player: AI,
+                config: &config,
+                context: &context,
+                cast_facts: None,
+                search_depth: crate::policies::context::SearchDepth::Root,
+            })
+        }
+
+        #[test]
+        fn the_policy_scores_cast_decisions() {
+            assert!(
+                SelfCostValuePolicy
+                    .decision_kinds()
+                    .contains(&DecisionKind::CastSpell),
+                "a cast whose cost discards must reach the self-cost gate"
+            );
+        }
+
+        #[test]
+        fn flashback_discard_is_priced_against_the_two_cards_it_draws() {
+            // Cast from the graveyard, Twinned Vision draws two (2.0). The lone
+            // card is a 4/4 for {4} (12.0) = 4.0 draws: a certified loss.
+            let (state, vision) = twinned_vision_board(Zone::Graveyard, Some((4, 4)));
+            let verdict = cast_verdict(&state, vision);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 4000, 2000);
+        }
+
+        #[test]
+        fn flashback_discard_of_a_card_worth_less_than_two_draws_covers() {
+            // A {2} instant (1.0) = a third of a draw, against two draws.
+            let (state, vision) = twinned_vision_board(Zone::Graveyard, None);
+            let verdict = cast_verdict(&state, vision);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 333, 2000);
+        }
+
+        #[test]
+        fn a_hand_cast_with_no_discard_cost_is_not_this_policys() {
+            // From hand Twinned Vision costs only mana: nothing to price.
+            let (state, vision) = twinned_vision_board(Zone::Hand, Some((4, 4)));
+            assert_neutral(&cast_verdict(&state, vision), "self_cost_value_na");
+        }
+    }
 }
