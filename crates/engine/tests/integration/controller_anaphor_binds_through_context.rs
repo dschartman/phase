@@ -913,6 +913,30 @@ fn break_under_pressure_sacrifices_the_target_opponents_greatest_mana_value() {
     }
 }
 
+/// CR 115.1 + CR 601.2c: Break Under Pressure announces one target, the
+/// opponent. Binding "they" to that opponent must not surface a second player
+/// slot: the cast driver answers a duplicate slot with the same player, so a
+/// second slot would pass every runtime test above unseen.
+#[test]
+fn break_under_pressure_announces_exactly_one_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Break Under Pressure", true, BREAK_UNDER_PRESSURE)
+        .id();
+    let runner = scenario.build();
+
+    let spell_def = runner.state().objects[&spell].abilities[0].clone();
+    let resolved = engine::game::ability_utils::build_resolved_from_def(&spell_def, spell, P0);
+    let slots = engine::game::ability_utils::build_target_slots(runner.state(), &resolved)
+        .expect("target slots build");
+    assert_eq!(
+        slots.len(),
+        1,
+        "Break Under Pressure announces exactly one target: the opponent"
+    );
+}
+
 /// CR 608.2c: Consume's greatest power is taken over the target player's
 /// creatures.
 #[test]
