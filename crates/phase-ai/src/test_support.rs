@@ -44,13 +44,14 @@ pub(crate) fn default_deck_plan() -> PlanSnapshot {
     crate::plan::derive_snapshot(&crate::features::DeckFeatures::default())
 }
 
-/// The plan a ramp deck derives — land target **7**, the only other
-/// reachable target.
+/// The plan a land-ramp deck derives (extra land drops, CR 305.2) — land
+/// target **7** against the default deck's 6.
 pub(crate) fn ramp_deck_plan() -> PlanSnapshot {
     crate::plan::derive_snapshot(&crate::features::DeckFeatures {
         mana_ramp: crate::features::ManaRampFeature {
-            dork_count: 8,
+            extra_landdrop_count: 4,
             commitment: 0.96,
+            land_commitment: 0.96,
             ..Default::default()
         },
         ..Default::default()

@@ -60,6 +60,12 @@ pub struct ManaRampFeature {
     /// `0.0..=1.0` — how central mana ramp is to this deck. Consumed by
     /// `RampTimingPolicy`'s `activation()` as the single scaling knob.
     pub commitment: f32,
+    /// `0.0..=1.0` — how central putting *extra lands* into play is: the
+    /// land-fetch and extra-land-drop pillars of [`Self::commitment`] alone,
+    /// at the same weights. CR 305.2: only these raise the number of lands a
+    /// deck has in play past its land drops; a dork, rock or ritual adds mana,
+    /// not lands. The plan's land schedule reads this, not `commitment`.
+    pub land_commitment: f32,
 }
 
 /// Structural detection — walks each `DeckEntry`'s `CardFace` AST and
@@ -101,21 +107,27 @@ pub fn detect(deck: &[DeckEntry]) -> ManaRampFeature {
 
     // CR 106.1 + CR 605.1a: ramp accelerates mana availability. Payoff weight
     // mirrors landfall — dorks and fetches dominate; statics multiply actions.
-    let commitment = commitment::weighted_sum(&[
-        (0.12, commitment::density_per_60(dork_count, total_nonland)),
+    let land_pillars = [
         (
             0.10,
             commitment::density_per_60(land_fetch_count, total_nonland),
         ),
         (
-            0.08,
-            commitment::density_per_60(ritual_count, total_nonland),
-        ),
-        (
             0.20,
             commitment::density_per_60(extra_landdrop_count, total_nonland),
         ),
+    ];
+    let commitment = commitment::weighted_sum(&[
+        (0.12, commitment::density_per_60(dork_count, total_nonland)),
+        land_pillars[0],
+        (
+            0.08,
+            commitment::density_per_60(ritual_count, total_nonland),
+        ),
+        land_pillars[1],
     ]);
+    // CR 305.2: the pillars that put extra lands into play.
+    let land_commitment = commitment::weighted_sum(&land_pillars);
 
     ManaRampFeature {
         dork_count,
@@ -123,6 +135,7 @@ pub fn detect(deck: &[DeckEntry]) -> ManaRampFeature {
         ritual_count,
         extra_landdrop_count,
         commitment,
+        land_commitment,
     }
 }
 

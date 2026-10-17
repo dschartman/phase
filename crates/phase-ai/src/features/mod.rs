@@ -22,6 +22,7 @@ pub mod equipment;
 pub mod graveyard_types;
 pub mod landfall;
 pub mod lifegain;
+pub mod mana_base;
 pub mod mana_ramp;
 pub mod mill;
 pub mod plus_one_counters;
@@ -50,6 +51,7 @@ pub use equipment::EquipmentFeature;
 pub use graveyard_types::GraveyardTypesFeature;
 pub use landfall::LandfallFeature;
 pub use lifegain::LifegainFeature;
+pub use mana_base::ManaBaseFeature;
 pub use mana_ramp::ManaRampFeature;
 pub use mill::MillFeature;
 pub use plus_one_counters::PlusOneCountersFeature;
@@ -77,6 +79,8 @@ pub struct DeckFeatures {
     pub strategy: StrategyProfile,
     pub landfall: LandfallFeature,
     pub lifegain: LifegainFeature,
+    /// Card and land counts: the plan derives the land target from them.
+    pub mana_base: ManaBaseFeature,
     pub mana_ramp: ManaRampFeature,
     pub tribal: TribalFeature,
     pub control: ControlFeature,
@@ -137,6 +141,7 @@ impl DeckFeatures {
             strategy,
             landfall: landfall::detect(deck),
             lifegain: lifegain::detect(deck),
+            mana_base: mana_base::detect(deck),
             mana_ramp: mana_ramp::detect(deck),
             tribal: tribal::detect(deck),
             control: control::detect(deck),
