@@ -7378,6 +7378,11 @@ pub enum FilterProp {
     Suspected,
     /// CR 702.112b: Matches permanents with the renowned designation.
     Renowned,
+    /// CR 722.3a: Matches permanents with the prepared designation (a
+    /// permanent with a prepare spell that has become prepared). This is the
+    /// permanent-side reading; a spell cast as a prepare spell is
+    /// [`FilterProp::PrepareSpell`].
+    Prepared,
     /// CR 701.15b/c: Matches creatures with the goaded designation (at least one
     /// player has goaded it).
     Goaded,

@@ -2484,6 +2484,34 @@ fn parse_source_is_saddled(input: &str) -> OracleResult<'_, StaticCondition> {
     Ok((rest, condition))
 }
 
+/// CR 722.3a: Parse "<subject> is[n't] prepared" into a source condition over
+/// the prepared designation, `SourceMatchesFilter` on `FilterProp::Prepared`,
+/// wrapped in `Not` for the negated copula ("isn't" / "is not"). Woodwork
+/// Prodigy, Paradox Shaper and Stingerquill Voxmancer: "At the beginning of
+/// your upkeep, if this creature isn't prepared, it becomes prepared." The
+/// subject is the source permanent (`parse_self_source_subject`: "~", "this
+/// creature", "this permanent", ..., or "it" bound to the source); the attached
+/// "enchanted/equipped creature" subjects are excluded because the source of
+/// such an ability is the Aura or Equipment, which is never prepared.
+/// The designation belongs to the permanent whatever its card type (CR 722.3a
+/// "a permanent with a prepare spell"), so the filter carries no type.
+fn parse_source_is_prepared(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_self_source_subject(input)?;
+    let (rest, negated) = parse_copula_is_or_isnt(rest)?;
+    let (rest, _) = tag("prepared").parse(rest)?;
+    let condition = StaticCondition::SourceMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Prepared])),
+    };
+    let condition = if negated {
+        StaticCondition::Not {
+            condition: Box::new(condition),
+        }
+    } else {
+        condition
+    };
+    Ok((rest, condition))
+}
+
 /// CR 702.171b + CR 508.1m: Bare elided-subject participle state gate
 /// ("Whenever this creature attacks while saddled" — Alacrian Jaguar). The
 /// printed while-gate elides the subject; the participle is part of the trigger
@@ -2587,6 +2615,9 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // CR 702.171b: "~ is saddled" / "this creature isn't saddled" / etc.
         // (negation composes Not { SourceIsSaddled }).
         parse_source_is_saddled,
+        // CR 722.3a: "~ is prepared" / "this creature isn't prepared" / etc.
+        // (negation composes Not { SourceMatchesFilter(prepared) }).
+        parse_source_is_prepared,
         // CR 301.5 + CR 303.4: "~ is attached to a creature" / "this equipment is attached to a creature".
         // Must precede `parse_source_is_type` so the specific "is attached to a creature"
         // predicate wins over generic "is <type>" dispatch.

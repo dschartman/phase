@@ -701,6 +701,7 @@ impl EventObjectSnapshot {
             | FilterProp::Transformed
             | FilterProp::Suspected
             | FilterProp::Renowned
+            | FilterProp::Prepared
             | FilterProp::IsSaddled => Supported,
 
             // ---- embedded characteristics ----
