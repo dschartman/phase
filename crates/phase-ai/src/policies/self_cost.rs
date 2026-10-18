@@ -299,11 +299,11 @@ pub(crate) fn real_self_cost(
 /// The cards are the ones the keep order gives up
 /// ([`card_value::given_up_value`]) among the hand cards the cost admits (not
 /// the source, CR 118.3; matching the cost's filter). Their value is divided by
-/// [`card_value::expected_draw_value`], so a card as good as an average draw
-/// costs exactly one card, the flat price this replaces, and a lone card worth
-/// four draws costs four. With no library to measure against, or fewer
-/// admissible cards than the cost demands, the missing part keeps the per-card
-/// price.
+/// [`card_value::expected_draw_value`] (plan-aware, floored at 1.0), so a card
+/// as good as an average draw costs exactly one card, the flat price this
+/// replaces, and a lone card worth four draws costs four. With an empty
+/// library, or fewer admissible cards than the cost demands, the missing part
+/// keeps the per-card price.
 fn discard_given_up_cost(
     state: &GameState,
     ai_player: PlayerId,
@@ -314,7 +314,7 @@ fn discard_given_up_cost(
     penalties: &PolicyPenalties,
 ) -> f64 {
     let per_card = penalties.self_cost_discard_per_card;
-    let Some(expected_draw) = card_value::expected_draw_value(state, ai_player) else {
+    let Some(expected_draw) = card_value::expected_draw_value(state, ai_player, plan) else {
         return count as f64 * per_card;
     };
     let pool = discard_pool(state, ai_player, source_id, filter);
@@ -1521,9 +1521,9 @@ fn discard_gives_up_only_fuel(
     }
     let cards = resolve_quantity(payer.state, count, payer.player, payer.source).max(0) as usize;
     let pool = discard_pool(payer.state, payer.player, payer.source, filter);
-    card_value::given_up_cards(payer.state, &pool, cards, payer.plan)
-        .into_iter()
-        .all(is_fuel)
+    let given_up = card_value::given_up_cards(payer.state, &pool, cards, payer.plan);
+    // No card given up stands on nothing: an empty selection is never fuel.
+    !given_up.is_empty() && given_up.into_iter().all(is_fuel)
 }
 
 /// Count AI-controlled death-trigger payoff objects currently on the battlefield.

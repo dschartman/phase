@@ -1406,6 +1406,38 @@ mod tests {
             &[CoreType::Creature],
             activated(shroud_self_grant(), cost),
         );
+        // The waiver needs fuel and a usable reanimation: a creature card in
+        // hand, and a battlefield permanent that can return it.
+        let fuel = create_object(
+            &mut state,
+            CardId(next_id()),
+            AI,
+            "Fuel".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&fuel)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let parsed = engine::parser::oracle::parse_oracle_text(
+            "{2}{B}: Return target creature card from your graveyard to the battlefield.",
+            "Reanimation Engine",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        let engine_id = create_object(
+            &mut state,
+            CardId(next_id()),
+            AI,
+            "Reanimation Engine".to_string(),
+            Zone::Battlefield,
+        );
+        *Arc::make_mut(&mut state.objects.get_mut(&engine_id).unwrap().abilities) =
+            parsed.abilities;
         let features = features_with(0.0, 0.0, 0.9, Vec::new(), CommanderBracketTier::Core);
         assert_neutral(
             &verdict_for(&state, source, features),
@@ -2384,15 +2416,21 @@ mod tests {
         AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1))
     }
 
+    /// `count` {2} instants in hand: `intrinsic_value` 1.0 each, which is one
+    /// expected draw against a valueless library (floored at 1.0), so each
+    /// costs exactly one card to discard.
     fn add_hand_cards(state: &mut GameState, player: PlayerId, count: usize) {
         for index in 0..count {
-            create_object(
+            let id = create_object(
                 state,
                 CardId(next_id()),
                 player,
                 format!("Hand Card {index}"),
                 Zone::Hand,
             );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = engine::types::mana::ManaCost::generic(2);
         }
     }
 

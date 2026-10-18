@@ -356,17 +356,40 @@ pub(crate) fn given_up_cards(
 /// CR 121.1 + CR 401.2: the value of one card `player` draws, on the
 /// [`intrinsic_value`] scale: the mean over their library. The library's order
 /// is hidden, so a draw is priced as an expected card, never as the card on
-/// top. `None` when the library is empty or its cards carry no value, where
-/// there is no scale to measure a card against.
-pub(crate) fn expected_draw_value(state: &GameState, player: PlayerId) -> Option<f64> {
+/// top. A library card the plan counts as a [`KeepTier::Surplus`] mana source
+/// is worth 0 to draw, the same price [`given_up_value`] puts on one in hand
+/// (a flooded player's draw is often a land the plan does not want). The mean
+/// is floored at [`EXPECTED_DRAW_FLOOR`]. `None` only for an empty library,
+/// where there is nothing to draw.
+pub(crate) fn expected_draw_value(
+    state: &GameState,
+    player: PlayerId,
+    plan: Option<PlanState>,
+) -> Option<f64> {
     let library = &state.players.get(player.0 as usize)?.library;
     if library.is_empty() {
         return None;
     }
-    let total: f64 = library.iter().map(|&id| intrinsic_value(state, id)).sum();
-    let mean = total / library.len() as f64;
-    (mean > 0.0).then_some(mean)
+    let total: f64 = library
+        .iter()
+        .map(|&id| match keep_tier(state, id, plan) {
+            KeepTier::Surplus => 0.0,
+            KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
+        })
+        .sum();
+    Some((total / library.len() as f64).max(EXPECTED_DRAW_FLOOR))
 }
+
+/// The least an expected draw is worth, on the [`intrinsic_value`] scale.
+///
+/// A discard's price in draws is the given-up card's value divided by the
+/// expected draw, so a mean near zero would price any card at an unbounded
+/// number of draws (a 1.0 card at 20 draws against a mean of 0.05) while a mean
+/// of exactly zero had no scale at all. At 1.0 no card costs more draws than
+/// its own value, and a 1.0 card (a two-mana spell, the cheapest card the FRA
+/// decks hold) costs exactly one draw: the flat per-card price this pricing
+/// replaced. So the floor and the old fallback agree.
+pub(crate) const EXPECTED_DRAW_FLOOR: f64 = 1.0;
 
 /// The smallest price gap [`keep_prices`] puts between two cards that
 /// [`cmp_keep`] orders strictly but whose values tie (a surplus land at 3.0
@@ -1004,23 +1027,28 @@ mod tests {
     }
 
     #[test]
-    fn expected_draw_value_is_the_library_mean_and_none_without_a_scale() {
+    fn expected_draw_value_is_the_library_mean_floored_and_none_when_empty() {
         let mut state = GameState::new_two_player(7);
-        assert_eq!(expected_draw_value(&state, P0), None, "empty library");
+        assert_eq!(expected_draw_value(&state, P0, None), None, "empty library");
         let blank = card_in_hand(&mut state, "Blank");
         move_to_library(&mut state, blank);
         assert_eq!(
-            expected_draw_value(&state, P0),
-            None,
-            "no value to measure by"
+            expected_draw_value(&state, P0, None),
+            Some(EXPECTED_DRAW_FLOOR),
+            "a worthless library is floored"
         );
         let land = land_card(&mut state);
         move_to_library(&mut state, land);
         let creature = creature_card(&mut state, 3, Vec::new(), 3);
         move_to_library(&mut state, creature);
         assert_eq!(
-            expected_draw_value(&state, P0),
+            expected_draw_value(&state, P0, None),
             Some((0.0 + 3.0 + 9.0) / 3.0)
+        );
+        // Past the land target the library land is Surplus and worth 0.
+        assert_eq!(
+            expected_draw_value(&state, P0, behind(-2, 0)),
+            Some((0.0 + 0.0 + 9.0) / 3.0)
         );
     }
 

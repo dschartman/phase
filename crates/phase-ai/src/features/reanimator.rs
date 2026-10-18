@@ -35,15 +35,18 @@
 //! decks (and the `mill_targeting` self-mill penalty) are unaffected.
 
 use engine::game::filter::{matches_target_filter, FilterContext};
+use engine::game::game_object::GameObject;
+use engine::game::keywords::effective_flashback_cost;
 use engine::game::DeckEntry;
 use engine::types::ability::{
-    AbilityDefinition, ControllerRef, CostCategory, Effect, FilterProp, TargetFilter, TypeFilter,
-    TypedFilter,
+    AbilityDefinition, AbilityKind, ActivationRestriction, ControllerRef, CostCategory, Effect,
+    FilterProp, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
@@ -218,13 +221,12 @@ pub(crate) fn effects_include_reanimation(effects: &[&Effect]) -> bool {
 }
 
 /// CR 404.1 + CR 110.1: whether `card` is reanimation fuel for `player`: a
-/// card one of `player`'s own reanimation effects could return from their
-/// graveyard. The deck's reanimation effects are read from every object
-/// `player` owns, in any zone (their library's composition is theirs to know),
-/// with the effect's own target filter: Generous Revival returns only a
-/// creature card with mana value 3 or less, Liliana the Repentant's exhaust any
-/// creature or planeswalker card. The filter is read with its zone constraint
-/// dropped, since the question is about the card once it is in the graveyard.
+/// card one of `player`'s own usable reanimation effects could return from
+/// their graveyard ([`usable_reanimation_chains`]), read with the effect's own
+/// target filter: Generous Revival returns only a creature card with mana value
+/// 3 or less, Liliana the Repentant's exhaust any creature or planeswalker
+/// card. The filter is read with its zone constraint dropped, since the
+/// question is about the card once it is in the graveyard.
 pub(crate) fn is_reanimation_fuel(state: &GameState, player: PlayerId, card: ObjectId) -> bool {
     state
         .objects
@@ -232,17 +234,94 @@ pub(crate) fn is_reanimation_fuel(state: &GameState, player: PlayerId, card: Obj
         .filter(|object| object.owner == player)
         .any(|object| {
             let ctx = FilterContext::from_source(state, object.id);
-            let abilities = object.abilities.iter();
-            let triggers = object
-                .trigger_definitions
-                .iter_unchecked()
-                .filter_map(|entry| entry.definition.execute.as_deref());
-            abilities
-                .chain(triggers)
+            usable_reanimation_chains(state, object)
+                .into_iter()
                 .flat_map(collect_chain_effects)
                 .filter_map(reanimation_target)
                 .any(|target| matches_target_filter(state, card, &without_zone(target), &ctx))
         })
+}
+
+/// The ability chains of `object` its owner can still use to reanimate.
+///
+/// - On the battlefield: activated abilities (CR 602.1) and triggered
+///   abilities, as the object has them now, so a lose-all-abilities effect
+///   removes them (seed 1013, Infinite Coursework on Liliana). An ability
+///   that can be activated only once (CR 602.5b, exhaust) and already was is
+///   spent. Known limit: an enters trigger that already resolved still reads
+///   as usable.
+/// - In hand, with a mana cost to cast it by (CR 118.6: no mana cost, no
+///   cast): the spell's own abilities and its triggers, which it brings when
+///   cast.
+/// - In the graveyard, with flashback (CR 702.34a): the spell's abilities.
+///   Only an object carrying a reanimation effect pays for the flashback
+///   lookup, which is a full off-zone keyword walk.
+/// - Anywhere else (library, exile, stack): nothing. "Castable" here is the
+///   cost class, not this turn's mana.
+fn usable_reanimation_chains<'a>(
+    state: &GameState,
+    object: &'a GameObject,
+) -> Vec<&'a AbilityDefinition> {
+    let triggers = || {
+        object
+            .trigger_definitions
+            .iter_unchecked()
+            .filter_map(|entry| entry.definition.execute.as_deref())
+    };
+    let spells = || {
+        object
+            .abilities
+            .iter()
+            .filter(|ability| ability.kind == AbilityKind::Spell)
+    };
+    let carries_reanimation = |chains: &[&AbilityDefinition]| {
+        chains
+            .iter()
+            .any(|ability| effects_include_reanimation(&collect_chain_effects(ability)))
+    };
+    match object.zone {
+        Zone::Battlefield => object
+            .abilities
+            .iter()
+            .enumerate()
+            .filter(|(index, ability)| {
+                ability.kind == AbilityKind::Activated
+                    && !once_and_spent(state, object.id, *index, ability)
+            })
+            .map(|(_, ability)| ability)
+            .chain(triggers())
+            .collect(),
+        Zone::Hand if matches!(object.mana_cost, ManaCost::Cost { .. }) => {
+            spells().chain(triggers()).collect()
+        }
+        Zone::Graveyard => {
+            let chains: Vec<_> = spells().collect();
+            if carries_reanimation(&chains) && effective_flashback_cost(state, object.id).is_some()
+            {
+                chains
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// CR 602.5b: an ability that can be activated only once (exhaust, CR
+/// 702.177a) and already has been, by the engine's per-object game counter.
+fn once_and_spent(
+    state: &GameState,
+    id: ObjectId,
+    index: usize,
+    ability: &AbilityDefinition,
+) -> bool {
+    ability
+        .activation_restrictions
+        .contains(&ActivationRestriction::OnlyOnce)
+        && state
+            .activated_abilities_this_game
+            .get(&(id, index))
+            .is_some_and(|&count| count > 0)
 }
 
 /// The target filter of a reanimation effect ([`effect_is_reanimation`]).
