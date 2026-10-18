@@ -314,10 +314,13 @@ pub(crate) fn keep_prices(
 /// `policies::payment_selection` then discards.
 ///
 /// Each card is lost at its own value, with one exception. A
-/// [`KeepTier::Surplus`] mana source is priced at its [`keep_prices`] price,
-/// which puts it below every spell in the pool: past the plan's target it is
-/// worth less than a land's flat 3.0. Any other card the order gives up is a
-/// real loss at its own value, so a needed land kept over a 9.0 creature
+/// [`KeepTier::Surplus`] mana source costs nothing: past the plan's target it
+/// adds nothing the plan wants (CR 305.2, one land a turn), which is why
+/// [`worth_drawing`] calls it not worth drawing, and a card not worth drawing
+/// is not worth keeping either. Pricing it at the pool's lowest value instead
+/// made a flooded loot look underwater whenever the library's mean fell under
+/// a land's 3.0 (signals-r6, seed 1033). Any other card the order gives up is
+/// a real loss at its own value, so a needed land kept over a 9.0 creature
 /// costs the creature's 9.0, not the pool's lowest value that
 /// [`keep_prices`] would assign it.
 pub(crate) fn given_up_value(
@@ -326,11 +329,10 @@ pub(crate) fn given_up_value(
     count: usize,
     plan: Option<PlanState>,
 ) -> f64 {
-    keep_prices(state, pool, plan)
+    given_up_cards(state, pool, count, plan)
         .into_iter()
-        .take(count)
-        .map(|(id, price)| match keep_tier(state, id, plan) {
-            KeepTier::Surplus => price,
+        .map(|id| match keep_tier(state, id, plan) {
+            KeepTier::Surplus => 0.0,
             KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
         })
         .sum()
