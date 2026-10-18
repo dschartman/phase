@@ -3942,6 +3942,35 @@ mod tests {
         }
 
         #[test]
+        fn an_exhaust_reanimation_on_a_creature_card_makes_every_creature_fuel() {
+            // Liliana the Repentant's exhaust, parsed from her Oracle text, on a
+            // creature card in the library: "Return target creature or
+            // planeswalker card from your graveyard to the battlefield."
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            let liliana = card(&mut state, Zone::Library, "Liliana the Repentant");
+            let parsed = engine::parser::oracle::parse_oracle_text(
+                "Whenever another creature or planeswalker you control enters, mill two cards.\n\
+                 Exhaust — {5}{B}: Return target creature or planeswalker card from your \
+                 graveyard to the battlefield. Put a +1/+1 counter on it. (Activate each \
+                 exhaust ability only once.)",
+                "Liliana the Repentant",
+                &[],
+                &["Creature".to_string()],
+                &["Human".to_string(), "Warlock".to_string()],
+            );
+            let obj = state.objects.get_mut(&liliana).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            *Arc::make_mut(&mut obj.abilities) = parsed.abilities;
+            creature_in(&mut state, Zone::Hand, 5, 5);
+            let source = volume(&mut state);
+            assert_neutral(
+                &reanimator_verdict(&state, source),
+                "self_cost_synergy_justified",
+            );
+        }
+
+        #[test]
         fn the_waiver_reads_the_reanimation_effects_own_filter() {
             // The deck's only reanimation returns a creature card with mana
             // value 3 or less (Generous Revival's filter), so a 5-drop is no
