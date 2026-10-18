@@ -49,8 +49,8 @@ use engine::game::keywords::effective_flashback_cost;
 use engine::game::players;
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AdditionalCost, CostCategory, Effect,
-    QuantityExpr, TargetFilter,
+    AbilityCondition, AbilityCost, AbilityDefinition, AdditionalCost, CostCategory,
+    DiscardSelfScope, Effect, QuantityExpr, TargetFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::counter::{CounterMatch, CounterType};
@@ -66,6 +66,7 @@ use crate::config::PolicyPenalties;
 use crate::eval::board_stats;
 use crate::features::landfall::ability_searches_library_for_land;
 use crate::features::mana_ramp::target_filter_references_land;
+use crate::features::reanimator::is_reanimation_fuel;
 use crate::features::DeckFeatures;
 use crate::plan::PlanState;
 
@@ -316,8 +317,22 @@ fn discard_given_up_cost(
     let Some(expected_draw) = card_value::expected_draw_value(state, ai_player) else {
         return count as f64 * per_card;
     };
+    let pool = discard_pool(state, ai_player, source_id, filter);
+    let given_up = count.min(pool.len());
+    card_value::given_up_value(state, &pool, given_up, plan) / expected_draw * per_card
+        + (count - given_up) as f64 * per_card
+}
+
+/// The hand cards a discard cost admits: not the source (CR 118.3), and
+/// matching the cost's filter.
+fn discard_pool(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    filter: Option<&TargetFilter>,
+) -> Vec<ObjectId> {
     let filter_ctx = FilterContext::from_source(state, source_id);
-    let pool: Vec<ObjectId> = state.players[ai_player.0 as usize]
+    state.players[ai_player.0 as usize]
         .hand
         .iter()
         .copied()
@@ -325,10 +340,7 @@ fn discard_given_up_cost(
             id != source_id
                 && filter.is_none_or(|filter| matches_target_filter(state, id, filter, &filter_ctx))
         })
-        .collect();
-    let given_up = count.min(pool.len());
-    card_value::given_up_value(state, &pool, given_up, plan) / expected_draw * per_card
-        + (count - given_up) as f64 * per_card
+        .collect()
 }
 
 /// CR 601.2f + CR 702.34a: the mandatory non-mana cost a cast of `object`
@@ -1422,19 +1434,33 @@ fn pay_life_criticality_mult(state: &GameState, ai_player: PlayerId) -> f64 {
 /// in [`appraise_benefit`] — it covers value that lands elsewhere in a
 /// lifegain/reanimator engine fed by the resource spent.
 pub(crate) fn synergy_justifies_self_cost(
+    payer: &CostPayer<'_>,
     features: &DeckFeatures,
     ability: &AbilityDefinition,
 ) -> bool {
     ability
         .cost
         .as_ref()
-        .is_some_and(|cost| synergy_justifies_cost_tree(features, cost))
+        .is_some_and(|cost| synergy_justifies_cost_tree(payer, features, cost))
 }
 
 /// [`synergy_justifies_self_cost`] for a cost that is not an ability's own,
 /// such as the mandatory cost of a cast.
-pub(crate) fn synergy_justifies_cost_tree(features: &DeckFeatures, cost: &AbilityCost) -> bool {
-    !contains_sacrifice_cost(cost) && synergy_justifies_cost(features, cost)
+pub(crate) fn synergy_justifies_cost_tree(
+    payer: &CostPayer<'_>,
+    features: &DeckFeatures,
+    cost: &AbilityCost,
+) -> bool {
+    !contains_sacrifice_cost(cost) && synergy_justifies_cost(payer, features, cost)
+}
+
+/// Who pays a self-cost, from what source, under which plan: what the
+/// reanimator waiver needs to see the card a discard gives up.
+pub(crate) struct CostPayer<'a> {
+    pub(crate) state: &'a GameState,
+    pub(crate) player: PlayerId,
+    pub(crate) source: ObjectId,
+    pub(crate) plan: Option<PlanState>,
 }
 
 /// A sacrifice leaf remains a real cost even when nested in a composite or a
@@ -1445,23 +1471,59 @@ fn contains_sacrifice_cost(cost: &AbilityCost) -> bool {
         .contains(&CostCategory::SacrificesPermanent)
 }
 
-fn synergy_justifies_cost(features: &DeckFeatures, cost: &AbilityCost) -> bool {
+fn synergy_justifies_cost(
+    payer: &CostPayer<'_>,
+    features: &DeckFeatures,
+    cost: &AbilityCost,
+) -> bool {
     match cost {
         // Sacrificing the source is a concrete cost, not a generic aristocrats
         // discount.  Death triggers remain part of an ability's actual payoff
         // appraisal; they must not make an otherwise trivial activation free.
         AbilityCost::Sacrifice(_) => false,
         AbilityCost::PayLife { .. } => features.lifegain.commitment >= SYNERGY_COMMITMENT_FLOOR,
-        AbilityCost::Discard { .. } => features.reanimator.commitment >= SYNERGY_COMMITMENT_FLOOR,
+        // CR 701.9b + CR 404.1: a reanimator deck's discard is a discount only
+        // for fuel, a card its own reanimation effects can return
+        // (`reanimator::is_reanimation_fuel`). Any other card the keep order
+        // gives up is a real loss and pays its price.
+        AbilityCost::Discard {
+            count,
+            filter,
+            self_scope,
+            ..
+        } => {
+            features.reanimator.commitment >= SYNERGY_COMMITMENT_FLOOR
+                && discard_gives_up_only_fuel(payer, count, filter.as_ref(), *self_scope)
+        }
         // Exile from the AI's own hand/graveyard: no synergy stand-down. Graveyard
         // exile is a strict loss for a reanimator deck (it removes fuel), and no
         // real card pairs a trivial payoff with a hand-exile self-cost.
         AbilityCost::Exile { .. } => false,
         AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => costs
             .iter()
-            .any(|cost| synergy_justifies_cost(features, cost)),
+            .any(|cost| synergy_justifies_cost(payer, features, cost)),
         _ => false,
     }
+}
+
+/// True when every card a discard cost gives up is reanimation fuel: the
+/// source itself for "discard this card", otherwise the keep order's first
+/// `count` admissible hand cards ([`card_value::given_up_cards`]).
+fn discard_gives_up_only_fuel(
+    payer: &CostPayer<'_>,
+    count: &QuantityExpr,
+    filter: Option<&TargetFilter>,
+    self_scope: DiscardSelfScope,
+) -> bool {
+    let is_fuel = |card| is_reanimation_fuel(payer.state, payer.player, card);
+    if self_scope.is_source_card() {
+        return is_fuel(payer.source);
+    }
+    let cards = resolve_quantity(payer.state, count, payer.player, payer.source).max(0) as usize;
+    let pool = discard_pool(payer.state, payer.player, payer.source, filter);
+    card_value::given_up_cards(payer.state, &pool, cards, payer.plan)
+        .into_iter()
+        .all(is_fuel)
 }
 
 /// Count AI-controlled death-trigger payoff objects currently on the battlefield.
