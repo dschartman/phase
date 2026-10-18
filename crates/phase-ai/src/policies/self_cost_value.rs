@@ -3843,6 +3843,93 @@ mod tests {
             );
         }
 
+        // --- the reanimator waiver covers fuel only (2026-10-17) -----------
+        //
+        // A deck the detection reads as reanimator waives a discard cost only
+        // when the card the keep order gives up is fuel: a card one of the
+        // deck's own reanimation effects can return. Any other card pays the
+        // price above.
+
+        const ANY_CREATURE_REANIMATION: &str =
+            "Return target creature card from your graveyard to the battlefield.";
+        const SMALL_CREATURE_REANIMATION: &str = "Return target creature card with mana value 3 \
+            or less from your graveyard to the battlefield with an additional +1/+1 counter on it.";
+
+        /// A reanimation sorcery in the AI's library, its text parsed by the
+        /// shipped parser. It has no mana cost, so it adds 0.0 to the library.
+        fn reanimation_spell_in_library(state: &mut GameState, oracle_text: &str) {
+            let id = card(state, Zone::Library, "Reanimation Spell");
+            let parsed = engine::parser::oracle::parse_oracle_text(
+                oracle_text,
+                "Reanimation Spell",
+                &[],
+                &["Sorcery".to_string()],
+                &[],
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            *Arc::make_mut(&mut obj.abilities) = parsed.abilities;
+        }
+
+        fn reanimator_verdict(state: &GameState, source: ObjectId) -> PolicyVerdict {
+            let features = features_with(0.0, 0.0, 0.81, Vec::new(), CommanderBracketTier::Core);
+            verdict_for(state, source, features)
+        }
+
+        #[test]
+        fn a_reanimator_deck_still_pays_for_a_lone_break_under_pressure() {
+            // Break Under Pressure ({2}{B}, 1.5) is no reanimation target. The
+            // library (three {1} instants at 0.5 and the reanimation spell at
+            // 0.0) averages 0.375, so the lone card costs four draws.
+            let mut state = GameState::new_two_player(42);
+            for _ in 0..3 {
+                instant_in(&mut state, Zone::Library, 1);
+            }
+            reanimation_spell_in_library(&mut state, ANY_CREATURE_REANIMATION);
+            let bup = card(&mut state, Zone::Hand, "Break Under Pressure");
+            let obj = state.objects.get_mut(&bup).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 2,
+            };
+            let source = volume(&mut state);
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 4000, 1000);
+        }
+
+        #[test]
+        fn a_reanimator_deck_waives_the_discard_of_a_creature_it_can_return() {
+            // A 5/5 for {5} (15.0) against an expected draw of 2.25 would be
+            // rejected, but the deck's reanimation spell returns any creature
+            // card: pitching it is the plan.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            reanimation_spell_in_library(&mut state, ANY_CREATURE_REANIMATION);
+            creature_in(&mut state, Zone::Hand, 5, 5);
+            let source = volume(&mut state);
+            assert_neutral(
+                &reanimator_verdict(&state, source),
+                "self_cost_synergy_justified",
+            );
+        }
+
+        #[test]
+        fn the_waiver_reads_the_reanimation_effects_own_filter() {
+            // The deck's only reanimation returns a creature card with mana
+            // value 3 or less (Generous Revival's filter), so a 5-drop is no
+            // fuel and pays its price: 15.0 / 2.25 = 6.67 draws.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            reanimation_spell_in_library(&mut state, SMALL_CREATURE_REANIMATION);
+            creature_in(&mut state, Zone::Hand, 5, 5);
+            let source = volume(&mut state);
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 6666, 1000);
+        }
+
         // --- the flashback cast (Twinned Vision shape) ------------------
 
         const TWINNED_VISION_TEXT: &str = "Draw a card. If this spell wasn't cast from your \
