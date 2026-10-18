@@ -4207,6 +4207,229 @@ mod tests {
             }
         }
 
+        #[test]
+        fn a_resolved_enters_trigger_reanimator_is_not_usable() {
+            // "When this creature enters, return ..." already resolved on the
+            // battlefield: it will not fire again, so the lone 5/5 pays.
+            let mut state = GameState::new_two_player(42);
+            trigger_reanimator_on_battlefield(
+                &mut state,
+                "When this creature enters, return target creature card from your graveyard \
+                 to the battlefield.",
+            );
+            let source = lone_five_drop(&mut state);
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 5000, 1000);
+        }
+
+        #[test]
+        fn a_repeating_trigger_reanimator_stays_usable() {
+            // Guard: an attack trigger fires again, so its target is fuel.
+            let mut state = GameState::new_two_player(42);
+            trigger_reanimator_on_battlefield(
+                &mut state,
+                "Whenever this creature attacks, return target creature card from your \
+                 graveyard to the battlefield.",
+            );
+            let source = lone_five_drop(&mut state);
+            assert_neutral(
+                &reanimator_verdict(&state, source),
+                "self_cost_synergy_justified",
+            );
+        }
+
+        #[test]
+        fn the_spent_exhaust_lookup_survives_ability_reordering() {
+            // Guard: an extra activated ability placed ahead of the exhaust
+            // moves it to index 1. Marking index 0 used leaves the exhaust
+            // live; marking index 1 spends it.
+            let build = |spent_index: usize| {
+                let mut state = GameState::new_two_player(42);
+                let (lili, _) = liliana(&mut state, Zone::Battlefield);
+                let mut first = AbilityDefinition::new(AbilityKind::Activated, draw(1));
+                first.cost = Some(AbilityCost::Tap);
+                let obj = state.objects.get_mut(&lili).unwrap();
+                Arc::make_mut(&mut obj.abilities).insert(0, first);
+                state
+                    .activated_abilities_this_game
+                    .insert((lili, spent_index), 1);
+                let source = lone_five_drop(&mut state);
+                reanimator_verdict(&state, source)
+            };
+            assert_neutral(&build(0), "self_cost_synergy_justified");
+            assert_reject(&build(1), "self_cost_benefit_underwater");
+        }
+
+        fn trigger_reanimator_on_battlefield(state: &mut GameState, oracle_text: &str) {
+            let id = card(state, Zone::Battlefield, "Trigger Reanimator");
+            let parsed = engine::parser::oracle::parse_oracle_text(
+                oracle_text,
+                "Trigger Reanimator",
+                &[],
+                &["Creature".to_string()],
+                &[],
+            );
+            assert!(
+                !parsed.triggers.is_empty(),
+                "fixture premise: the trigger parses"
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            for trigger in parsed.triggers {
+                obj.trigger_definitions.push(trigger);
+            }
+        }
+
+        // --- a harmful targeted effect is priced, not trivial --------------
+        //
+        // Proft, Sinister Mastermind: "{B}, Discard this card: Target
+        // creature gets -3/-1 until end of turn." The discard is the source
+        // itself (one card); the payoff is what the shrink does to an
+        // opposing creature: a kill is worth that creature's board value, a
+        // shrink of a creature in combat is worth the combat value it loses,
+        // and a shrink with no opposing target, or of a creature out of
+        // combat that it does not kill, is worth nothing.
+
+        const PROFT_ABILITY: &str =
+            "{B}, Discard this card: Target creature gets -3/-1 until end of turn.";
+
+        fn proft_in_hand(state: &mut GameState) -> ObjectId {
+            let id = card(state, Zone::Hand, "Proft, Sinister Mastermind");
+            let parsed = engine::parser::oracle::parse_oracle_text(
+                PROFT_ABILITY,
+                "Proft, Sinister Mastermind",
+                &[],
+                &["Creature".to_string()],
+                &[],
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 2,
+            };
+            *Arc::make_mut(&mut obj.abilities) = parsed.abilities;
+            id
+        }
+
+        fn opposing_creature(state: &mut GameState, p: i32, t: i32) -> ObjectId {
+            let id = create_object(
+                state,
+                CardId(next_id()),
+                OPP,
+                "Opposing Creature".to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(p);
+            obj.toughness = Some(t);
+            id
+        }
+
+        fn proft_verdict(state: &GameState, proft: ObjectId) -> PolicyVerdict {
+            verdict_for(state, proft, plain_features())
+        }
+
+        #[test]
+        fn proft_with_an_opposing_two_one_to_kill_is_not_vetoed() {
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            opposing_creature(&mut state, 2, 1);
+            let proft = proft_in_hand(&mut state);
+            let verdict = proft_verdict(&state, proft);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+        }
+
+        #[test]
+        fn proft_with_no_opposing_creature_is_still_vetoed() {
+            // Guard: the only creature is the AI's own; the shrink buys nothing.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            creature_in(&mut state, Zone::Battlefield, 2, 1);
+            let proft = proft_in_hand(&mut state);
+            assert_reject(&proft_verdict(&state, proft), "self_cost_trivial_benefit");
+        }
+
+        #[test]
+        fn proft_shrinking_a_three_three_out_of_combat_is_still_vetoed() {
+            // Guard: -3/-1 leaves a 3/3 alive, and out of combat a shrink until
+            // end of turn changes nothing.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            opposing_creature(&mut state, 3, 3);
+            let proft = proft_in_hand(&mut state);
+            assert_reject(&proft_verdict(&state, proft), "self_cost_trivial_benefit");
+        }
+
+        #[test]
+        fn proft_shrinking_an_attacking_three_three_is_priced_by_the_combat_value_it_loses() {
+            // CR 506.4: an attacking creature is in combat. A 3/3 (7.5) shrunk
+            // to 0/2 (2.0) loses 5.5 of combat value, against one card.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            let attacker = opposing_creature(&mut state, 3, 3);
+            let mut combat = engine::game::combat::CombatState::default();
+            combat.attackers.push(engine::game::combat::AttackerInfo {
+                object_id: attacker,
+                defending_player: AI,
+                attack_target: engine::game::combat::AttackTarget::Player(AI),
+                blocked: false,
+                band_id: None,
+            });
+            state.combat = Some(combat);
+            let proft = proft_in_hand(&mut state);
+            let verdict = proft_verdict(&state, proft);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 1000, 5500);
+        }
+
+        #[test]
+        fn proft_kills_a_three_three_with_two_damage_marked() {
+            // CR 704.5g: toughness 3 - 1 = 2 against 2 marked damage is lethal.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            let damaged = opposing_creature(&mut state, 3, 3);
+            state.objects.get_mut(&damaged).unwrap().damage_marked = 2;
+            let proft = proft_in_hand(&mut state);
+            assert_neutral(
+                &proft_verdict(&state, proft),
+                "self_cost_benefit_covers_cost",
+            );
+        }
+
+        #[test]
+        fn a_discard_for_lethal_damage_is_priced_by_the_creature_it_kills() {
+            // "Discard a card: this deals 3 damage to target creature." with an
+            // opposing 2/2 and a {2} instant to discard (1.0 against a mean of
+            // 3.0): the kill is worth the 2/2's board value.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            opposing_creature(&mut state, 2, 2);
+            instant_in(&mut state, Zone::Hand, 2);
+            let source = source_with(
+                &mut state,
+                "Pinger",
+                &[CoreType::Artifact],
+                activated(
+                    Effect::DealDamage {
+                        amount: QuantityExpr::Fixed { value: 3 },
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        damage_source: None,
+                        excess: None,
+                    },
+                    discard_cost(1),
+                ),
+            );
+            let verdict = verdict_with_plan(&state, source, None);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+        }
+
         // --- the expected draw: surplus at 0, floored at 1.0 ---------------
 
         #[test]
