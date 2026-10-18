@@ -993,9 +993,10 @@ mod tests {
         // is kept, so two cards give up the spell and the 3/3 at 1.5 + 9.0,
         // not at the pool's two lowest values.
         assert_eq!(given_up_value(&state, &pool, 2, behind(2, 0)), 10.5);
-        // Past the land target the land is Surplus: it goes first, at its
-        // keep price (the pool's lowest value, 1.5), not at 3.0.
-        assert_eq!(given_up_value(&state, &pool, 1, behind(-2, 0)), 1.5);
+        // Past the land target the land is Surplus: it goes first, and costs
+        // nothing (`worth_drawing` calls it not worth drawing), not 3.0.
+        assert_eq!(given_up_value(&state, &pool, 1, behind(-2, 0)), 0.0);
+        assert_eq!(given_up_value(&state, &pool, 2, behind(-2, 0)), 1.5);
         let order = surrender_order(&state, &pool, behind(-2, 0));
         assert_eq!(order[0], land, "the surplus land is the card given up");
     }
