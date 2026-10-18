@@ -40,7 +40,7 @@ use engine::game::keywords::effective_flashback_cost;
 use engine::game::DeckEntry;
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, ActivationRestriction, ControllerRef, CostCategory, Effect,
-    FilterProp, TargetFilter, TypeFilter, TypedFilter,
+    FilterProp, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
 };
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
@@ -48,6 +48,7 @@ use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use crate::ability_chain::collect_chain_effects;
@@ -248,11 +249,13 @@ pub(crate) fn is_reanimation_fuel(state: &GameState, player: PlayerId, card: Obj
 ///   abilities, as the object has them now, so a lose-all-abilities effect
 ///   removes them (seed 1013, Infinite Coursework on Liliana). An ability
 ///   that can be activated only once (CR 602.5b, exhaust) and already was is
-///   spent. Known limit: an enters trigger that already resolved still reads
-///   as usable.
+///   spent. The permanent's own enters trigger has already fired and does
+///   not count.
 /// - In hand, with a mana cost to cast it by (CR 118.6: no mana cost, no
 ///   cast): the spell's own abilities and its triggers, which it brings when
-///   cast.
+///   cast. A permanent card's activated abilities do not count from hand
+///   (Liliana in hand is not a live reanimation: she must be cast and then
+///   pay {5}{B} at sorcery speed); this is conservative by choice.
 /// - In the graveyard, with flashback (CR 702.34a): the spell's abilities.
 ///   Only an object carrying a reanimation effect pays for the flashback
 ///   lookup, which is a full off-zone keyword walk.
@@ -262,11 +265,16 @@ fn usable_reanimation_chains<'a>(
     state: &GameState,
     object: &'a GameObject,
 ) -> Vec<&'a AbilityDefinition> {
-    let triggers = || {
+    let triggers = |on_battlefield: bool| {
         object
             .trigger_definitions
             .iter_unchecked()
-            .filter_map(|entry| entry.definition.execute.as_deref())
+            .map(|entry| &entry.definition)
+            // CR 603.6a: a permanent's own enters trigger fired when it entered;
+            // on the battlefield it will not fire again. Repeating triggers
+            // (attacks, upkeep, enters-or-attacks) still can.
+            .filter(move |trigger| !(on_battlefield && is_own_enters_trigger(trigger)))
+            .filter_map(|trigger| trigger.execute.as_deref())
     };
     let spells = || {
         object
@@ -289,10 +297,10 @@ fn usable_reanimation_chains<'a>(
                     && !once_and_spent(state, object.id, *index, ability)
             })
             .map(|(_, ability)| ability)
-            .chain(triggers())
+            .chain(triggers(true))
             .collect(),
         Zone::Hand if matches!(object.mana_cost, ManaCost::Cost { .. }) => {
-            spells().chain(triggers()).collect()
+            spells().chain(triggers(false)).collect()
         }
         Zone::Graveyard => {
             let chains: Vec<_> = spells().collect();
@@ -307,8 +315,17 @@ fn usable_reanimation_chains<'a>(
     }
 }
 
-/// CR 602.5b: an ability that can be activated only once (exhaust, CR
-/// 702.177a) and already has been, by the engine's per-object game counter.
+/// CR 603.6a: "When this enters": a self-scoped zone-change trigger into the
+/// battlefield.
+fn is_own_enters_trigger(trigger: &TriggerDefinition) -> bool {
+    trigger.mode == TriggerMode::ChangesZone
+        && trigger.valid_card == Some(TargetFilter::SelfRef)
+        && trigger.destination == Some(Zone::Battlefield)
+}
+
+/// CR 702.177a: an exhaust ability can be activated only once; this reads
+/// whether it already has been, by the engine's per-object game counter, keyed
+/// by the ability's index in the object's current abilities.
 fn once_and_spent(
     state: &GameState,
     id: ObjectId,

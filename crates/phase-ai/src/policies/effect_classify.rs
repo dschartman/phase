@@ -658,11 +658,15 @@ pub(crate) fn lethal_to_creature(
     // CR 704.5g + CR 702.12b: lethal marked damage destroys the creature — but
     // an indestructible permanent ignores that state-based action, so damage
     // alone can never kill it.
-    if total_damage > 0 && !object.has_keyword(&Keyword::Indestructible) {
-        let marked = object.damage_marked as i32;
-        if marked + total_damage >= new_toughness {
-            return Some(true);
-        }
+    // A shrink counts too: damage already marked this turn is lethal once the
+    // reduced toughness falls to it (CR 704.5g reads marked damage against the
+    // creature's current toughness).
+    let marked = object.damage_marked as i32;
+    if marked + total_damage > 0
+        && !object.has_keyword(&Keyword::Indestructible)
+        && marked + total_damage >= new_toughness
+    {
+        return Some(true);
     }
     Some(false)
 }
