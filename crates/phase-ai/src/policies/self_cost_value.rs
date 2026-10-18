@@ -3911,18 +3911,31 @@ mod tests {
         //
         // A deck the detection reads as reanimator waives a discard cost only
         // when the card the keep order gives up is fuel: a card one of the
-        // deck's own reanimation effects can return. Any other card pays the
-        // price above.
+        // deck's own reanimation effects can return, and only a source the
+        // player can still use counts. An activated (or exhaust) ability
+        // counts on the battlefield while it is live and not spent; a
+        // reanimation spell counts in hand, or in the graveyard with
+        // flashback, when it has a cost to cast it by. Any other card pays
+        // the price above.
 
         const ANY_CREATURE_REANIMATION: &str =
             "Return target creature card from your graveyard to the battlefield.";
         const SMALL_CREATURE_REANIMATION: &str = "Return target creature card with mana value 3 \
             or less from your graveyard to the battlefield with an additional +1/+1 counter on it.";
+        const LILIANA_TEXT: &str = "Whenever another creature or planeswalker you control \
+            enters, mill two cards.\nExhaust — {5}{B}: Return target creature or planeswalker \
+            card from your graveyard to the battlefield. Put a +1/+1 counter on it. (Activate \
+            each exhaust ability only once.)";
 
-        /// A reanimation sorcery in the AI's library, its text parsed by the
-        /// shipped parser. It has no mana cost, so it adds 0.0 to the library.
-        fn reanimation_spell_in_library(state: &mut GameState, oracle_text: &str) {
-            let id = card(state, Zone::Library, "Reanimation Spell");
+        /// A reanimation sorcery costing {2}{B} in `zone`, its text parsed by
+        /// the shipped parser, with a printed flashback {4}{B} when asked.
+        fn reanimation_spell(
+            state: &mut GameState,
+            zone: Zone,
+            oracle_text: &str,
+            flashback: bool,
+        ) -> ObjectId {
+            let id = card(state, zone, "Reanimation Spell");
             let parsed = engine::parser::oracle::parse_oracle_text(
                 oracle_text,
                 "Reanimation Spell",
@@ -3932,7 +3945,48 @@ mod tests {
             );
             let obj = state.objects.get_mut(&id).unwrap();
             obj.card_types.core_types.push(CoreType::Sorcery);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 2,
+            };
             *Arc::make_mut(&mut obj.abilities) = parsed.abilities;
+            if flashback {
+                obj.base_keywords.push(Keyword::Flashback(
+                    engine::types::keywords::FlashbackCost::Mana(ManaCost::Cost {
+                        shards: vec![ManaCostShard::Black],
+                        generic: 4,
+                    }),
+                ));
+            }
+            id
+        }
+
+        /// Liliana the Repentant ({1}{B}, 2/3) in `zone`, parsed from her
+        /// Oracle text; returns her id and her exhaust ability's index.
+        fn liliana(state: &mut GameState, zone: Zone) -> (ObjectId, usize) {
+            let id = card(state, zone, "Liliana the Repentant");
+            let parsed = engine::parser::oracle::parse_oracle_text(
+                LILIANA_TEXT,
+                "Liliana the Repentant",
+                &[],
+                &["Creature".to_string()],
+                &["Human".to_string(), "Warlock".to_string()],
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(3);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 1,
+            };
+            *Arc::make_mut(&mut obj.abilities) = parsed.abilities;
+            let exhaust = obj
+                .abilities
+                .iter()
+                .position(|a| a.kind == AbilityKind::Activated)
+                .expect("fixture premise: the exhaust parses as an activated ability");
+            (id, exhaust)
         }
 
         fn reanimator_verdict(state: &GameState, source: ObjectId) -> PolicyVerdict {
@@ -3940,16 +3994,24 @@ mod tests {
             verdict_for(state, source, features)
         }
 
+        /// One 5/5 for {5} (15.0) in hand and a library of three lands
+        /// (expected draw 3.0): priced, the loot costs five draws.
+        fn lone_five_drop(state: &mut GameState) -> ObjectId {
+            library_of_lands(state);
+            creature_in(state, Zone::Hand, 5, 5);
+            volume(state)
+        }
+
         #[test]
         fn a_reanimator_deck_still_pays_for_a_lone_break_under_pressure() {
             // Break Under Pressure ({2}{B}, 1.5) is no reanimation target. The
-            // library (three {1} instants at 0.5 and the reanimation spell at
-            // 0.0) averages 0.375, so the lone card costs four draws.
+            // library (three {1} instants at 0.5) averages 0.5, under the
+            // floor of 1.0, so the lone card costs 1.5 draws.
             let mut state = GameState::new_two_player(42);
             for _ in 0..3 {
                 instant_in(&mut state, Zone::Library, 1);
             }
-            reanimation_spell_in_library(&mut state, ANY_CREATURE_REANIMATION);
+            liliana(&mut state, Zone::Battlefield);
             let bup = card(&mut state, Zone::Hand, "Break Under Pressure");
             let obj = state.objects.get_mut(&bup).unwrap();
             obj.card_types.core_types.push(CoreType::Instant);
@@ -3960,19 +4022,16 @@ mod tests {
             let source = volume(&mut state);
             let verdict = reanimator_verdict(&state, source);
             assert_reject(&verdict, "self_cost_benefit_underwater");
-            assert_facts(&verdict, 4000, 1000);
+            assert_facts(&verdict, 1500, 1000);
         }
 
         #[test]
-        fn a_reanimator_deck_waives_the_discard_of_a_creature_it_can_return() {
-            // A 5/5 for {5} (15.0) against an expected draw of 2.25 would be
-            // rejected, but the deck's reanimation spell returns any creature
-            // card: pitching it is the plan.
+        fn a_flashback_reanimation_in_the_graveyard_keeps_the_waiver() {
+            // The reanimation sorcery sits in the graveyard with flashback: the
+            // deck can still cast it, and it returns any creature card.
             let mut state = GameState::new_two_player(42);
-            library_of_lands(&mut state);
-            reanimation_spell_in_library(&mut state, ANY_CREATURE_REANIMATION);
-            creature_in(&mut state, Zone::Hand, 5, 5);
-            let source = volume(&mut state);
+            reanimation_spell(&mut state, Zone::Graveyard, ANY_CREATURE_REANIMATION, true);
+            let source = lone_five_drop(&mut state);
             assert_neutral(
                 &reanimator_verdict(&state, source),
                 "self_cost_synergy_justified",
@@ -3980,47 +4039,178 @@ mod tests {
         }
 
         #[test]
-        fn an_exhaust_reanimation_on_a_creature_card_makes_every_creature_fuel() {
-            // Liliana the Repentant's exhaust, parsed from her Oracle text, on a
-            // creature card in the library: "Return target creature or
-            // planeswalker card from your graveyard to the battlefield."
+        fn a_reanimation_spell_in_hand_is_reachable() {
+            // Hand: the sorcery ({2}{B}, 1.5) and a 5/5. The keep order gives
+            // up the sorcery, which is no fuel, so pitching it is priced: 1.5
+            // against 3.0 covers. The 5/5 is the reachable target the spell
+            // would return; this row pins that the spell in hand is reachable
+            // by asserting the waiver holds for a hand of fuel only.
             let mut state = GameState::new_two_player(42);
             library_of_lands(&mut state);
-            let liliana = card(&mut state, Zone::Library, "Liliana the Repentant");
-            let parsed = engine::parser::oracle::parse_oracle_text(
-                "Whenever another creature or planeswalker you control enters, mill two cards.\n\
-                 Exhaust — {5}{B}: Return target creature or planeswalker card from your \
-                 graveyard to the battlefield. Put a +1/+1 counter on it. (Activate each \
-                 exhaust ability only once.)",
-                "Liliana the Repentant",
-                &[],
-                &["Creature".to_string()],
-                &["Human".to_string(), "Warlock".to_string()],
+            reanimation_spell(&mut state, Zone::Hand, ANY_CREATURE_REANIMATION, false);
+            let pool_creature = creature_in(&mut state, Zone::Hand, 5, 5);
+            let source = volume(&mut state);
+            assert_neutral(
+                &reanimator_verdict(&state, source),
+                "self_cost_benefit_covers_cost",
             );
-            let obj = state.objects.get_mut(&liliana).unwrap();
+            assert!(crate::features::reanimator::is_reanimation_fuel(
+                &state,
+                AI,
+                pool_creature
+            ));
+        }
+
+        #[test]
+        fn a_reanimation_spell_in_the_library_is_not_reachable() {
+            let mut state = GameState::new_two_player(42);
+            reanimation_spell(&mut state, Zone::Library, ANY_CREATURE_REANIMATION, false);
+            let source = lone_five_drop(&mut state);
+            // Library: three lands and the sorcery (1.5): mean 2.625.
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 5714, 1000);
+        }
+
+        #[test]
+        fn a_spent_reanimation_spell_in_the_graveyard_is_not_reachable() {
+            // No flashback: once cast, the sorcery cannot be cast again.
+            let mut state = GameState::new_two_player(42);
+            reanimation_spell(&mut state, Zone::Graveyard, ANY_CREATURE_REANIMATION, false);
+            let source = lone_five_drop(&mut state);
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 5000, 1000);
+        }
+
+        #[test]
+        fn liliana_in_the_graveyard_does_not_waive_a_lone_mind_meanderer() {
+            // Her exhaust is an activated ability: from the graveyard it cannot
+            // be activated. Mind Meanderer (4/4 for {3}{G}{U}{U}, 13.0) alone
+            // in hand, expected draw 3.0: priced at 4.33 draws and rejected.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            liliana(&mut state, Zone::Graveyard);
+            let meanderer = card(&mut state, Zone::Hand, "Mind Meanderer");
+            let obj = state.objects.get_mut(&meanderer).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
-            *Arc::make_mut(&mut obj.abilities) = parsed.abilities;
-            creature_in(&mut state, Zone::Hand, 5, 5);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Blue,
+                ],
+                generic: 3,
+            };
             let source = volume(&mut state);
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 4333, 1000);
+        }
+
+        #[test]
+        fn liliana_on_the_battlefield_keeps_the_waiver() {
+            // Guard: her exhaust is live, and it returns any creature card.
+            let mut state = GameState::new_two_player(42);
+            liliana(&mut state, Zone::Battlefield);
+            let source = lone_five_drop(&mut state);
             assert_neutral(
                 &reanimator_verdict(&state, source),
                 "self_cost_synergy_justified",
             );
+        }
+
+        #[test]
+        fn a_spent_exhaust_does_not_waive() {
+            // CR 602.5b: an exhaust ability can be activated only once.
+            let mut state = GameState::new_two_player(42);
+            let (lili, exhaust) = liliana(&mut state, Zone::Battlefield);
+            state
+                .activated_abilities_this_game
+                .insert((lili, exhaust), 1);
+            let source = lone_five_drop(&mut state);
+            let verdict = reanimator_verdict(&state, source);
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 5000, 1000);
         }
 
         #[test]
         fn the_waiver_reads_the_reanimation_effects_own_filter() {
-            // The deck's only reanimation returns a creature card with mana
-            // value 3 or less (Generous Revival's filter), so a 5-drop is no
-            // fuel and pays its price: 15.0 / 2.25 = 6.67 draws.
+            // The deck's only reanimation, castable from the graveyard by
+            // flashback, returns a creature card with mana value 3 or less
+            // (Generous Revival's filter), so a 5-drop is no fuel.
             let mut state = GameState::new_two_player(42);
-            library_of_lands(&mut state);
-            reanimation_spell_in_library(&mut state, SMALL_CREATURE_REANIMATION);
-            creature_in(&mut state, Zone::Hand, 5, 5);
-            let source = volume(&mut state);
+            reanimation_spell(
+                &mut state,
+                Zone::Graveyard,
+                SMALL_CREATURE_REANIMATION,
+                true,
+            );
+            let source = lone_five_drop(&mut state);
             let verdict = reanimator_verdict(&state, source);
             assert_reject(&verdict, "self_cost_benefit_underwater");
-            assert_facts(&verdict, 6666, 1000);
+            assert_facts(&verdict, 5000, 1000);
+        }
+
+        #[test]
+        fn an_empty_hand_is_never_waived() {
+            // No card is given up, so nothing is fuel: the waiver needs at
+            // least one card to stand on.
+            let mut state = GameState::new_two_player(42);
+            library_of_lands(&mut state);
+            liliana(&mut state, Zone::Battlefield);
+            let source = volume(&mut state);
+            match reanimator_verdict(&state, source) {
+                PolicyVerdict::Score { reason, .. } | PolicyVerdict::Reject { reason } => {
+                    assert_ne!(reason.kind, "self_cost_synergy_justified")
+                }
+            }
+        }
+
+        // --- the expected draw: surplus at 0, floored at 1.0 ---------------
+
+        #[test]
+        fn surplus_lands_in_the_library_count_nothing_in_the_expected_draw() {
+            // Eight lands in play against target 6: the two library lands are
+            // Surplus and worth 0 to draw, as a surplus land in hand is worth 0
+            // to give up. Library: two lands and a {4} instant (2.0): the mean
+            // is 0.67, floored to 1.0, not 2.67. A lone {3} instant (1.5) then
+            // costs 1.5 draws, and the flooded loot of a spell is refused.
+            let mut state = GameState::new_two_player(42);
+            for _ in 0..8 {
+                land_in(&mut state, Zone::Battlefield);
+            }
+            land_in(&mut state, Zone::Library);
+            land_in(&mut state, Zone::Library);
+            instant_in(&mut state, Zone::Library, 4);
+            instant_in(&mut state, Zone::Hand, 3);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(
+                &state,
+                source,
+                Some(crate::test_support::default_deck_plan()),
+            );
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 1500, 1000);
+        }
+
+        #[test]
+        fn the_expected_draw_is_floored_at_one() {
+            // Ten blank cards and a {1} instant: mean 0.045. Unfloored, a lone
+            // {2} instant (1.0) would cost 22 draws; floored at 1.0 it costs
+            // exactly one, the old flat price.
+            let mut state = GameState::new_two_player(42);
+            for _ in 0..10 {
+                card(&mut state, Zone::Library, "Blank");
+            }
+            instant_in(&mut state, Zone::Library, 1);
+            instant_in(&mut state, Zone::Hand, 2);
+            let source = volume(&mut state);
+            let verdict = verdict_with_plan(&state, source, None);
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 1000, 1000);
         }
 
         // --- the flashback cast (Twinned Vision shape) ------------------
