@@ -336,6 +336,21 @@ pub(crate) fn given_up_value(
         .sum()
 }
 
+/// The first `count` cards of `pool` in [`cmp_keep`] order: the cards a
+/// discard of `count` gives up, the ones [`given_up_value`] prices.
+pub(crate) fn given_up_cards(
+    state: &GameState,
+    pool: &[ObjectId],
+    count: usize,
+    plan: Option<PlanState>,
+) -> Vec<ObjectId> {
+    keep_prices(state, pool, plan)
+        .into_iter()
+        .take(count)
+        .map(|(id, _)| id)
+        .collect()
+}
+
 /// CR 121.1 + CR 401.2: the value of one card `player` draws, on the
 /// [`intrinsic_value`] scale: the mean over their library. The library's order
 /// is hidden, so a draw is priced as an expected card, never as the card on

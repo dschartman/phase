@@ -34,12 +34,17 @@
 //! gap; the companion `ReanimatorPayoffPolicy` is payoff-gated so non-reanimator
 //! decks (and the `mill_targeting` self-mill penalty) are unaffected.
 
+use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::DeckEntry;
 use engine::types::ability::{
-    AbilityDefinition, ControllerRef, CostCategory, Effect, TargetFilter, TypeFilter, TypedFilter,
+    AbilityDefinition, ControllerRef, CostCategory, Effect, FilterProp, TargetFilter, TypeFilter,
+    TypedFilter,
 };
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
+use engine::types::game_state::GameState;
+use engine::types::identifiers::ObjectId;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 use crate::ability_chain::collect_chain_effects;
@@ -210,6 +215,68 @@ pub fn is_reanimation_target(face: &CardFace) -> bool {
 /// live-game `ReanimatorPayoffPolicy` so the two never drift.
 pub(crate) fn effects_include_reanimation(effects: &[&Effect]) -> bool {
     effects.iter().copied().any(effect_is_reanimation)
+}
+
+/// CR 404.1 + CR 110.1: whether `card` is reanimation fuel for `player`: a
+/// card one of `player`'s own reanimation effects could return from their
+/// graveyard. The deck's reanimation effects are read from every object
+/// `player` owns, in any zone (their library's composition is theirs to know),
+/// with the effect's own target filter: Generous Revival returns only a
+/// creature card with mana value 3 or less, Liliana the Repentant's exhaust any
+/// creature or planeswalker card. The filter is read with its zone constraint
+/// dropped, since the question is about the card once it is in the graveyard.
+pub(crate) fn is_reanimation_fuel(state: &GameState, player: PlayerId, card: ObjectId) -> bool {
+    state
+        .objects
+        .values()
+        .filter(|object| object.owner == player)
+        .any(|object| {
+            let ctx = FilterContext::from_source(state, object.id);
+            let abilities = object.abilities.iter();
+            let triggers = object
+                .trigger_definitions
+                .iter_unchecked()
+                .filter_map(|entry| entry.definition.execute.as_deref());
+            abilities
+                .chain(triggers)
+                .flat_map(collect_chain_effects)
+                .filter_map(reanimation_target)
+                .any(|target| matches_target_filter(state, card, &without_zone(target), &ctx))
+        })
+}
+
+/// The target filter of a reanimation effect ([`effect_is_reanimation`]).
+fn reanimation_target(effect: &Effect) -> Option<&TargetFilter> {
+    match effect {
+        Effect::ChangeZone { target, .. } if effect_is_reanimation(effect) => Some(target),
+        _ => None,
+    }
+}
+
+/// `filter` with every `InZone` / `InAnyZone` constraint dropped.
+fn without_zone(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            let mut typed = typed.clone();
+            typed.properties.retain(|prop| {
+                !matches!(
+                    prop,
+                    FilterProp::InZone { .. } | FilterProp::InAnyZone { .. }
+                )
+            });
+            TargetFilter::Typed(typed)
+        }
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters.iter().map(without_zone).collect(),
+        },
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters.iter().map(without_zone).collect(),
+        },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(without_zone(filter)),
+        },
+        other => other.clone(),
+    }
 }
 
 /// Single authority — true if any effect in the slice fills the controller's own

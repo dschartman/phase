@@ -28,6 +28,11 @@
 //! cards (`DiscardPrice::PerCard`): any card spent for nothing is a loss,
 //! whatever it is worth.
 //!
+//! A deck read as reanimator waives the cost only when every card given up is
+//! fuel its own reanimation effects can return
+//! (`features::reanimator::is_reanimation_fuel`, read with the effect's own
+//! filter); a lone Break Under Pressure is no discount in any deck.
+//!
 //! Known limit: the search below this policy draws the real top card of the
 //! AI's own library, which determinization never resamples
 //! (`determinize.rs`, "Why the AI's own zones are never resampled"). This
@@ -97,7 +102,7 @@ use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, Tacti
 use super::self_cost::{
     appraise_benefit, appraise_cast_benefit, cost_is_material, mandatory_cast_discard_cost,
     real_self_cost, self_cost_in_scope, self_counter_cost_preview, synergy_justifies_cost_tree,
-    synergy_justifies_self_cost, BenefitAppraisal, DiscardPrice, SelfCounterCostPreview,
+    synergy_justifies_self_cost, BenefitAppraisal, CostPayer, DiscardPrice, SelfCounterCostPreview,
 };
 use crate::features::DeckFeatures;
 use crate::plan::PlanState;
@@ -164,7 +169,14 @@ fn activation_verdict(ctx: &PolicyContext<'_>, source_id: ObjectId) -> PolicyVer
         return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
     }
 
-    if synergy_justifies_self_cost(&ai_features(ctx), &ability) {
+    let plan = discarding_plan(ctx);
+    let payer = CostPayer {
+        state: ctx.state,
+        player: ctx.ai_player,
+        source: source_id,
+        plan,
+    };
+    if synergy_justifies_self_cost(&payer, &ai_features(ctx), &ability) {
         return PolicyVerdict::neutral(PolicyReason::new("self_cost_synergy_justified"));
     }
 
@@ -223,7 +235,7 @@ fn activation_verdict(ctx: &PolicyContext<'_>, source_id: ObjectId) -> PolicyVer
                 source_id,
                 cost,
                 ctx.penalties(),
-                DiscardPrice::GivenUp(discarding_plan(ctx)),
+                DiscardPrice::GivenUp(plan),
             ),
         ),
         BenefitAppraisal::Unpriced => {
@@ -251,7 +263,14 @@ fn cast_verdict(ctx: &PolicyContext<'_>, object_id: ObjectId) -> PolicyVerdict {
     else {
         return PolicyVerdict::neutral(PolicyReason::new("self_cost_value_na"));
     };
-    if synergy_justifies_cost_tree(&ai_features(ctx), &cost) {
+    let plan = discarding_plan(ctx);
+    let payer = CostPayer {
+        state: ctx.state,
+        player: ctx.ai_player,
+        source: object_id,
+        plan,
+    };
+    if synergy_justifies_cost_tree(&payer, &ai_features(ctx), &cost) {
         return PolicyVerdict::neutral(PolicyReason::new("self_cost_synergy_justified"));
     }
     match appraise_cast_benefit(
@@ -270,7 +289,7 @@ fn cast_verdict(ctx: &PolicyContext<'_>, object_id: ObjectId) -> PolicyVerdict {
                 object_id,
                 &cost,
                 ctx.penalties(),
-                DiscardPrice::GivenUp(discarding_plan(ctx)),
+                DiscardPrice::GivenUp(plan),
             ),
         ),
         BenefitAppraisal::Trivial { .. } | BenefitAppraisal::Unpriced => {
@@ -1296,6 +1315,13 @@ mod tests {
             vec!["Diregraf Captain".to_string()],
             CommanderBracketTier::Cedh,
         );
+        let state = GameState::new_two_player(42);
+        let payer = crate::policies::self_cost::CostPayer {
+            state: &state,
+            player: AI,
+            source: ObjectId(0),
+            plan: None,
+        };
         let costs = [
             sac_creature_cost(),
             AbilityCost::Composite {
@@ -1326,7 +1352,7 @@ mod tests {
         for cost in costs {
             let ability = activated(gain_life(1), cost);
             assert!(
-                !synergy_justifies_self_cost(&features, &ability),
+                !synergy_justifies_self_cost(&payer, &features, &ability),
                 "a sacrifice leaf must remain priced even in a CEDH aristocrats deck"
             );
         }
