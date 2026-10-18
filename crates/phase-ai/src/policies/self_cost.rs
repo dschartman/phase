@@ -50,7 +50,7 @@ use engine::game::players;
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AdditionalCost, CostCategory,
-    DiscardSelfScope, Effect, QuantityExpr, TargetFilter,
+    DiscardSelfScope, Effect, PtValue, QuantityExpr, TargetFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::counter::{CounterMatch, CounterType};
@@ -63,7 +63,9 @@ use engine::types::zones::Zone;
 use crate::ability_chain::collect_chain_effects;
 use crate::card_value;
 use crate::config::PolicyPenalties;
-use crate::eval::board_stats;
+use crate::eval::{
+    board_stats, creature_combat_value, evaluate_creature_intrinsic, KeywordBonuses,
+};
 use crate::features::landfall::ability_searches_library_for_land;
 use crate::features::mana_ramp::target_filter_references_land;
 use crate::features::reanimator::is_reanimation_fuel;
@@ -71,14 +73,17 @@ use crate::features::DeckFeatures;
 use crate::plan::PlanState;
 
 use super::effect_classify::{
-    aggregate_player_impact_in, extract_target_filter, filter_admits_player, lethal_to_creature,
-    targeted_player_impact_in_with_bound_parent_target, PLAYER_IMPACT_PREFERENCE_BAND,
+    aggregate_player_impact_in, effect_polarity, extract_target_filter, filter_admits_player,
+    lethal_to_creature, targeted_player_impact_in_with_bound_parent_target, EffectPolarity,
+    PLAYER_IMPACT_PREFERENCE_BAND,
 };
 use super::self_protection_classify::{
     any_immediate_threat, is_self_protection_effect, self_protection_effect_payoff,
     target_filter_self_scoped,
 };
-use super::strategy_helpers::{sacrifice_cost, targetable_threat_value, SINGLE_CARD_VALUE};
+use super::strategy_helpers::{
+    permanent_board_value, sacrifice_cost, targetable_threat_value, SINGLE_CARD_VALUE,
+};
 
 /// A fixed face-damage payoff at or below this value is trivial — a 1- or
 /// 2-point ping for no board effect is not worth spending a real resource on.
@@ -797,6 +802,21 @@ fn effect_benefit_value(
                 DrawDeliveryPreview::Unknown => None,
             }
         }
+        // A harmful targeted effect is worth the most it does to one opposing
+        // creature it can target: a kill is that creature's board value, a
+        // shrink of a creature in combat the combat value it loses.
+        Effect::Pump { target, .. } if effect_polarity(effect) == EffectPolarity::Harmful => {
+            harm_value(state, ai_player, source_id, effect, target, penalties)
+        }
+        // Damage that kills an opposing creature is priced the same way. Damage
+        // that can also go to a player, or kills nothing, stays unpriced.
+        Effect::DealDamage {
+            amount: QuantityExpr::Fixed { .. },
+            target,
+            ..
+        } if !filter_admits_player(target) => {
+            harm_value(state, ai_player, source_id, effect, target, penalties)
+        }
         Effect::Discard {
             count,
             target: TargetFilter::ParentTarget,
@@ -1168,6 +1188,16 @@ fn effect_triviality(
         Effect::DealDamage { amount, target, .. } => EffectTriviality::from_is_trivial(
             deal_damage_is_trivial(state, ai_player, source_id, amount, target),
         ),
+        // A shrink aimed at a creature is removal or a combat trick against
+        // it: trivial only when it does nothing to any opposing creature it
+        // can target ([`harmful_outcomes`] empty). An undecidable (-X/-X)
+        // shrink is non-trivial and stays unpriced.
+        Effect::Pump { target, .. } if effect_polarity(effect) == EffectPolarity::Harmful => {
+            EffectTriviality::from_is_trivial(
+                harmful_outcomes(state, ai_player, source_id, effect, target)
+                    .is_some_and(|outcomes| outcomes.is_empty()),
+            )
+        }
         // Small lifegain is trivial unless the AI is under life pressure.
         Effect::GainLife { amount, .. } => EffectTriviality::from_is_trivial(
             resolve_quantity(state, amount, ai_player, source_id) <= TRIVIAL_LIFEGAIN_CEILING
@@ -1275,6 +1305,108 @@ fn deal_damage_is_trivial(
         return false;
     }
     true
+}
+
+/// What a harmful targeted effect does to one opposing creature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HarmOutcome {
+    /// CR 704.5f + CR 704.5g: the creature dies.
+    Kill(ObjectId),
+    /// CR 510.1a: a creature in combat deals and survives less; the combat
+    /// value it loses, on `creature_combat_value`'s scale.
+    CombatLoss(f64),
+}
+
+/// The outcomes `effect` (a shrink or fixed damage) has on each opposing
+/// creature `target` admits, from the source's view: only the ones that do
+/// something. Empty means it does nothing to any of them; `None` means the
+/// effect's size is undecidable here (-X/-X, variable damage).
+///
+/// Lethality reads the creature's current toughness and the damage already
+/// marked on it (`effect_classify::lethal_to_creature`). A shrink that does not
+/// kill matters only to a creature that is attacking or blocking: until end of
+/// turn and out of combat, it changes nothing.
+fn harmful_outcomes(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    effect: &Effect,
+    target: &TargetFilter,
+) -> Option<Vec<HarmOutcome>> {
+    let opponents = players::opponents(state, ai_player);
+    let filter_ctx = FilterContext::from_source(state, source_id);
+    let mut outcomes = Vec::new();
+    for &id in &state.battlefield {
+        let Some(obj) = state.objects.get(&id) else {
+            continue;
+        };
+        if !opponents.contains(&obj.controller)
+            || !obj.card_types.core_types.contains(&CoreType::Creature)
+            || !matches_target_filter(state, id, target, &filter_ctx)
+        {
+            continue;
+        }
+        if lethal_to_creature(state, id, &[effect])? {
+            outcomes.push(HarmOutcome::Kill(id));
+            continue;
+        }
+        let Effect::Pump {
+            power: PtValue::Fixed(dp),
+            toughness: PtValue::Fixed(dt),
+            ..
+        } = effect
+        else {
+            continue;
+        };
+        if !in_combat(state, id) {
+            continue;
+        }
+        let (power, toughness) = (obj.power.unwrap_or(0), obj.toughness.unwrap_or(0));
+        let after = creature_combat_value(
+            (power + dp).max(0),
+            toughness + dt,
+            |kw| obj.has_keyword(kw),
+            &KeywordBonuses::default(),
+        );
+        let loss = evaluate_creature_intrinsic(state, id) - after;
+        if loss > 0.0 {
+            outcomes.push(HarmOutcome::CombatLoss(loss));
+        }
+    }
+    Some(outcomes)
+}
+
+/// The price of [`harmful_outcomes`]: the best single outcome, a kill at the
+/// creature's board value (`strategy_helpers::permanent_board_value`, the
+/// price this policy charges for sacrificing one). `None` when undecidable or
+/// when the effect does nothing.
+fn harm_value(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    effect: &Effect,
+    target: &TargetFilter,
+    penalties: &PolicyPenalties,
+) -> Option<f64> {
+    harmful_outcomes(state, ai_player, source_id, effect, target)?
+        .into_iter()
+        .map(|outcome| match outcome {
+            HarmOutcome::Kill(id) => permanent_board_value(state, id, penalties),
+            HarmOutcome::CombatLoss(loss) => loss,
+        })
+        .reduce(f64::max)
+}
+
+/// CR 506.4 + CR 508.1: an attacking or blocking creature is in combat until
+/// combat ends or it is removed from combat.
+fn in_combat(state: &GameState, id: ObjectId) -> bool {
+    state.combat.as_ref().is_some_and(|combat| {
+        combat
+            .attackers
+            .iter()
+            .any(|attacker| attacker.object_id == id)
+            || combat.blocker_to_attacker.contains_key(&id)
+    })
 }
 
 fn damage_lethal_to_opponent(state: &GameState, ai_player: PlayerId, value: i32) -> bool {
