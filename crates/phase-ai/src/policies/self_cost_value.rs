@@ -3815,11 +3815,10 @@ mod tests {
         }
 
         #[test]
-        fn a_surplus_land_is_priced_at_its_keep_price() {
+        fn a_surplus_land_costs_nothing_to_give_up() {
             // Eight lands in play against target 6: the land in hand is
-            // Surplus and goes first, at the keep order's price (the pool's
-            // lowest value, the {3} instant's 1.5), not a land's 3.0. Library
-            // {2}, {2}, land, land: expected draw 2.0.
+            // Surplus, which `worth_drawing` already calls not worth drawing,
+            // so giving it up costs nothing. Library {2}, {2}, land, land.
             let mut state = GameState::new_two_player(42);
             for _ in 0..8 {
                 land_in(&mut state, Zone::Battlefield);
@@ -3837,7 +3836,46 @@ mod tests {
                 Some(crate::test_support::default_deck_plan()),
             );
             assert_neutral(&verdict, "self_cost_benefit_covers_cost");
-            assert_facts(&verdict, 750, 1000);
+            assert_facts(&verdict, 0, 1000);
+        }
+
+        #[test]
+        fn a_flooded_loot_gives_up_a_land_even_when_the_library_is_cheap() {
+            // Seed 1033 T24 (r6, L2727): nine lands in play against target 6,
+            // four lands and Divining Duelist (2/3 for {2}{U}, 7.5) in hand, a
+            // late library of cheap spells. Expected draw here 1.0 ({2}
+            // instants), under a land's 3.0: pricing the surplus land at the
+            // pool's lowest value (3.0) made the loot look three draws deep.
+            let mut state = GameState::new_two_player(42);
+            for _ in 0..9 {
+                land_in(&mut state, Zone::Battlefield);
+            }
+            for _ in 0..4 {
+                instant_in(&mut state, Zone::Library, 2);
+            }
+            let lands: Vec<ObjectId> = (0..4).map(|_| land_in(&mut state, Zone::Hand)).collect();
+            let duelist = card(&mut state, Zone::Hand, "Divining Duelist");
+            let obj = state.objects.get_mut(&duelist).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(3);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 2,
+            };
+            let source = volume(&mut state);
+            let plan = crate::test_support::default_deck_plan();
+            let verdict = verdict_with_plan(&state, source, Some(plan.clone()));
+            assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+            assert_facts(&verdict, 0, 1000);
+            // And the card the keep order gives up is a land, not the Duelist.
+            let pool: Vec<ObjectId> = state.players[AI.0 as usize].hand.iter().copied().collect();
+            let realized = crate::plan::PlanState::realize(&state, AI, &plan);
+            let given_up = crate::card_value::given_up_cards(&state, &pool, 1, Some(realized));
+            assert!(
+                lands.contains(&given_up[0]),
+                "a surplus land is the card given up"
+            );
         }
 
         #[test]
