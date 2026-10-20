@@ -123,10 +123,18 @@ pub(crate) fn resolve_fight_fighters(
     if object_targets.len() >= 2 {
         return Ok(Some((object_targets[0], object_targets[1])));
     }
-    if let Effect::Fight { subject, .. } = &ability.effect {
+    if let Effect::Fight { subject, target } = &ability.effect {
         if crate::game::ability_utils::fight_subject_needs_target_slot(subject) {
             // CR 701.14a: Dual-target fights require both chosen fighters; do
             // not reinterpret a lone survivor as "~ fights target creature".
+            return Ok(None);
+        }
+        // CR 115.6 + CR 701.14b: "~ fights up to one target creature" whose
+        // controller chose no target has no creature to fight, so neither
+        // fights. A no-op, not a missing parameter: the resolution goes on.
+        if object_targets.is_empty()
+            && crate::game::ability_utils::fight_targeting_is_optional(ability, subject, target)
+        {
             return Ok(None);
         }
         // CR 701.14b + CR 400.7: "~ fights …" whose source left and returned
