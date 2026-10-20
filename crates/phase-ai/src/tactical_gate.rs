@@ -12571,4 +12571,287 @@ mod tests {
         let (state, arena) = self_draw_table(2, arena_in_hand);
         assert_eq!(offered_and_kept(&state, arena), (true, true));
     }
+
+    // --- a creature spell's cast is judged by what the spell does ----------
+    //
+    // CR 601.2 + CR 608.3: casting a permanent spell puts it on the stack, and
+    // it resolves by becoming a permanent; CR 113.3a: only an instant or
+    // sorcery has spell abilities that are followed as it resolves. A
+    // creature's activated ability is a later, separate choice (CR 602.2), so
+    // the cast is not judged by whether that ability has an opposing target
+    // now (seed 1038 T18, Proft, Sinister Mastermind gated with threshold met
+    // on an empty board). Activations keep their own reading.
+
+    const PROFT_SINISTER_MASTERMIND_ORACLE: &str = "Threshold \u{2014} You can't cast this spell \
+         unless there are seven or more cards in your graveyard.\n\
+         Menace\n\
+         {B}, Discard this card: Target creature gets -3/-1 until end of turn.";
+    const ROYAL_ASSASSIN_ORACLE: &str = "{T}: Destroy target tapped creature.";
+    const RAVENOUS_CHUPACABRA_ORACLE: &str =
+        "When this creature enters, destroy target creature an opponent controls.";
+    const PRODIGAL_PYROMANCER_ORACLE: &str = "{T}: This creature deals 1 damage to any target.";
+    const SHOCK_ORACLE: &str = "Shock deals 2 damage to any target.";
+
+    /// P0 on its own precombat main with four untapped Swamps, `graveyard`
+    /// cards in its graveyard and 25 in library; P1 with 25 in library and no
+    /// creature. Returns the state and the card `add` puts in P0's hand.
+    fn creature_cast_table(
+        graveyard: usize,
+        add: impl FnOnce(&mut GameScenario) -> ObjectId,
+    ) -> (GameState, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..4 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+        }
+        for index in 0..graveyard {
+            scenario.add_creature_to_graveyard(P0, &format!("Dead Rat {index}"), 1, 1);
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P0, "Swamp");
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let id = add(&mut scenario);
+        (scenario.build().state().clone(), id)
+    }
+
+    fn proft_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_creature_to_hand_from_oracle(
+                P0,
+                "Proft, Sinister Mastermind",
+                5,
+                5,
+                PROFT_SINISTER_MASTERMIND_ORACLE,
+            )
+            .as_legendary()
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 2,
+            })
+            .id()
+    }
+
+    fn royal_assassin_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_creature_to_hand_from_oracle(P0, "Royal Assassin", 1, 1, ROYAL_ASSASSIN_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                generic: 1,
+            })
+            .id()
+    }
+
+    fn chupacabra_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_creature_to_hand_from_oracle(
+                P0,
+                "Ravenous Chupacabra",
+                2,
+                2,
+                RAVENOUS_CHUPACABRA_ORACLE,
+            )
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                generic: 2,
+            })
+            .id()
+    }
+
+    /// Whether `object`'s parsed abilities include an activated one whose
+    /// effect `is_effect` accepts: the fixture carries the ability it is about.
+    fn has_activated(state: &GameState, object: ObjectId, is_effect: fn(&Effect) -> bool) -> bool {
+        state.objects[&object]
+            .abilities
+            .iter()
+            .any(|ability| ability.kind == AbilityKind::Activated && is_effect(&ability.effect))
+    }
+
+    /// Seed 1038 T18: Proft, Sinister Mastermind with threshold met (seven
+    /// cards in the graveyard), the mana for it and no opposing creature. A
+    /// 5/5 menace on an empty board is the cast a competent player makes; its
+    /// discard ability from hand (CR 113.6j) having no target is beside the
+    /// point once it is cast.
+    #[test]
+    fn proft_sinister_mastermind_with_threshold_and_no_opposing_creature_stays_a_candidate() {
+        let (state, proft) = creature_cast_table(7, proft_in_hand);
+        assert!(
+            has_activated(&state, proft, |effect| matches!(
+                effect,
+                Effect::Pump {
+                    toughness: PtValue::Fixed(-1),
+                    ..
+                }
+            )),
+            "fixture: Proft carries the activated -3/-1"
+        );
+        assert_eq!(
+            offered_and_kept(&state, proft),
+            (true, true),
+            "Proft's cast was judged by its discard ability's missing target"
+        );
+    }
+
+    /// Fixture guard for the row above: at six cards in the graveyard the
+    /// threshold restriction holds and the engine does not offer the cast, so
+    /// the seven-card row is the threshold-met case.
+    #[test]
+    fn proft_sinister_mastermind_below_threshold_is_not_offered() {
+        let (state, proft) = creature_cast_table(6, proft_in_hand);
+        assert_eq!(offered_and_kept(&state, proft), (false, false));
+    }
+
+    /// CR 602.2 + CR 302.6: Royal Assassin's only ability is "{T}: Destroy
+    /// target tapped creature", activated later from the battlefield. With no
+    /// opposing creature the creature spell is still a candidate (the shape the
+    /// own-target judge noted, ed80dd7ee).
+    #[test]
+    fn royal_assassin_with_no_opposing_creature_stays_a_candidate() {
+        let (state, assassin) = creature_cast_table(0, royal_assassin_in_hand);
+        assert!(
+            has_activated(&state, assassin, |effect| matches!(
+                effect,
+                Effect::Destroy { .. }
+            )),
+            "fixture: Royal Assassin carries the activated Destroy"
+        );
+        assert_eq!(offered_and_kept(&state, assassin), (true, true));
+    }
+
+    /// Guard: Ravenous Chupacabra's removal is an ETB trigger (CR 603.6a), not
+    /// a spell ability or an activated one. The gate has never read it: the
+    /// cast stays a candidate, and its no-target whiff is priced by
+    /// AntiSelfHarm's pre-cast check
+    /// (`creature_etb_removal_with_no_opposing_creature_is_still_penalized`,
+    /// -8). This change leaves both as they are.
+    #[test]
+    fn ravenous_chupacabra_with_no_opposing_creature_is_judged_as_before() {
+        let (state, chupacabra) = creature_cast_table(0, chupacabra_in_hand);
+        assert!(
+            state.objects[&chupacabra]
+                .trigger_definitions
+                .as_slice()
+                .iter()
+                .any(|trigger| trigger.definition.mode == TriggerMode::ChangesZone),
+            "fixture: Chupacabra's destroy is an ETB trigger"
+        );
+        assert_eq!(offered_and_kept(&state, chupacabra), (true, true));
+    }
+
+    /// Guard: a plain removal instant's "target creature" is its spell ability
+    /// (CR 113.3a + CR 115.1a). With only the AI's own creature to aim at,
+    /// `is_redundant_creature_only_removal` still rejects Last Gasp.
+    #[test]
+    fn last_gasp_with_no_opposing_creature_is_still_redundant_removal() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        let gasp = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: gasp,
+                card_id: state.objects[&gasp].card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        let context = AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assert!(is_redundant_creature_only_removal(&ctx, &ctx.effects()));
+        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+    }
+
+    /// P0 on its own precombat main with an untapped 3/3 that can attack, P1
+    /// at 3 life with no creature (an attack is lethal), four untapped
+    /// Mountains, and the card `add` puts in P0's hand.
+    fn lethal_attack_table(
+        add: impl FnOnce(&mut GameScenario) -> ObjectId,
+    ) -> (GameState, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature(P0, "Ready Bear", 3, 3);
+        scenario.with_life(P1, 3);
+        for _ in 0..4 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Red);
+        }
+        let id = add(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert!(
+            is_lethal_attack_available(state, P0),
+            "fixture: the 3/3 attack is lethal"
+        );
+        (state.clone(), id)
+    }
+
+    /// CR 508.1 + CR 602.2: with a lethal attack available the gate keeps
+    /// spells for after combat, carving out direct damage that can hit a
+    /// player. Prodigal Pyromancer's ping is an activated ability of the
+    /// permanent, not what casting it does, so the creature spell gets no
+    /// carve-out: the cast waits for after combat like any other.
+    #[test]
+    fn creature_with_an_activated_ping_waits_for_a_lethal_attack() {
+        let (state, pyromancer) = lethal_attack_table(|scenario| {
+            scenario
+                .add_creature_to_hand_from_oracle(
+                    P0,
+                    "Prodigal Pyromancer",
+                    1,
+                    1,
+                    PRODIGAL_PYROMANCER_ORACLE,
+                )
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Red],
+                    generic: 2,
+                })
+                .id()
+        });
+        assert!(
+            has_activated(&state, pyromancer, |effect| matches!(
+                effect,
+                Effect::DealDamage { .. }
+            )),
+            "fixture: Pyromancer carries the activated ping"
+        );
+        assert_eq!(gate_spell_cast(&state, pyromancer), GateDecision::Reject);
+    }
+
+    /// Guard: Shock's damage is its spell ability, so before a lethal attack it
+    /// keeps the direct-damage carve-out's mild penalty.
+    #[test]
+    fn shock_before_a_lethal_attack_keeps_the_direct_damage_carve_out() {
+        let (state, shock) = lethal_attack_table(|scenario| {
+            scenario
+                .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK_ORACLE)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Red],
+                    generic: 0,
+                })
+                .id()
+        });
+        assert_eq!(
+            gate_spell_cast(&state, shock),
+            GateDecision::AllowWithPenalty(-5.0)
+        );
+    }
 }
