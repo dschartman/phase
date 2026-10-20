@@ -31,6 +31,7 @@ use super::landfall_timing::LandfallTimingPolicy;
 use super::lethality_awareness::LethalityAwarenessPolicy;
 use super::life_total_resource::LifeTotalResourcePolicy;
 use super::loop_shortcut::LoopShortcutPolicy;
+use super::mode_choice_value::ModeChoiceValuePolicy;
 use super::momir_curve::MomirCurvePolicy;
 use super::payment_selection::PaymentSelectionPolicy;
 use super::payoff::{
@@ -184,6 +185,10 @@ pub enum PolicyId {
     /// CR 106.4: a ritual's mana empties at end of step/phase — don't cast one
     /// when nothing in reach can spend it in this window.
     RitualSink,
+    /// CR 700.2a + CR 603.3c: price each mode of a modal choice by what it
+    /// buys — the combat a tap or untap reaches, the card quality a loot
+    /// exchanges.
+    ModeChoiceValue,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -451,6 +456,7 @@ impl Default for PolicyRegistry {
             Box::new(GraveyardAuthorityPolicy),
             Box::new(super::pile_partition::PilePartitionPolicy),
             Box::new(super::ritual_sink::RitualSinkPolicy),
+            Box::new(ModeChoiceValuePolicy),
         ];
         Self::from_policies(policies)
     }

@@ -43,6 +43,7 @@ mod life_total_resource;
 mod loop_shortcut;
 mod mana_efficiency;
 mod mill_targeting;
+mod mode_choice_value;
 mod momir_curve;
 pub mod mulligan;
 mod payment_selection;

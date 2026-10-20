@@ -582,6 +582,19 @@ pub struct PolicyPenalties {
     /// scalar.)
     #[serde(default = "default_loop_shortcut_winning_declare_bonus")]
     pub loop_shortcut_winning_declare_bonus: f64,
+    /// CR 502.3 + CR 506.1: card-equivalent value of one point of combat
+    /// damage a mode opens or prevents in the next combat it reaches (a tap
+    /// that holds a blocker or attacker down, an untap that enables an attack
+    /// or a block). Mirrors the 0.15-a-point life weight `player_impact` and
+    /// `self_cost_pay_life_per_point` price life at. Consumed by
+    /// `ModeChoiceValuePolicy`.
+    #[serde(default = "default_mode_choice_damage_per_point")]
+    pub mode_choice_damage_per_point: f64,
+    /// CR 121.1 + CR 701.9a: card-equivalent value of one expected draw's
+    /// worth of card quality a loot mode exchanges (`card_value::expected_loot_gain`
+    /// over `expected_draw_value`). Consumed by `ModeChoiceValuePolicy`.
+    #[serde(default = "default_mode_choice_loot_per_card")]
+    pub mode_choice_loot_per_card: f64,
     /// CR 104.3d: card-equivalent weight for advancing the poison clock.
     /// Critical band when the action reaches ten poison (a win), scaled by
     /// clock progress below that.
@@ -758,6 +771,8 @@ impl Default for PolicyPenalties {
             self_cost_counter_replacement_prevented_penalty:
                 default_self_cost_counter_replacement_prevented_penalty(),
             loop_shortcut_winning_declare_bonus: default_loop_shortcut_winning_declare_bonus(),
+            mode_choice_damage_per_point: default_mode_choice_damage_per_point(),
+            mode_choice_loot_per_card: default_mode_choice_loot_per_card(),
             poison_clock_pressure: default_poison_clock_pressure(),
             graveyard_types_progress: default_graveyard_types_progress(),
             devotion_pip_progress: default_devotion_pip_progress(),
@@ -950,6 +965,13 @@ fn default_self_cost_counter_replacement_prevented_penalty() -> f64 {
 /// ever throws the game away.
 fn default_loop_shortcut_winning_declare_bonus() -> f64 {
     8.0
+}
+
+fn default_mode_choice_damage_per_point() -> f64 {
+    0.15
+}
+fn default_mode_choice_loot_per_card() -> f64 {
+    1.0
 }
 
 fn default_lethality_tapout_penalty() -> f64 {
@@ -1308,6 +1330,14 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
     (
         "self_cost_counter_replacement_prevented_penalty",
         "SelfCostValuePolicy replacement-aware counter-replenishment guard; awaiting paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "mode_choice_damage_per_point",
+        "new ModeChoiceValuePolicy knob, set to the existing 0.15-a-point life weight; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "mode_choice_loot_per_card",
+        "new ModeChoiceValuePolicy knob, one card of exchanged quality per card-equivalent (the score unit); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
     ),
     (
         "loop_shortcut_winning_declare_bonus",

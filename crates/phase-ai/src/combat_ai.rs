@@ -2770,7 +2770,15 @@ fn block_is_futile(
 }
 
 /// Check if a creature can attack (not tapped, no defender, no summoning sickness).
-fn can_attack(state: &GameState, obj_id: ObjectId) -> bool {
+pub(crate) fn can_attack(state: &GameState, obj_id: ObjectId) -> bool {
+    state.objects.get(&obj_id).is_some_and(|obj| !obj.tapped)
+        && could_attack_if_untapped(state, obj_id)
+}
+
+/// CR 508.1a: every requirement [`can_attack`] reads except that the creature
+/// be untapped — whether a tapped creature could attack this turn once
+/// something untaps it.
+pub(crate) fn could_attack_if_untapped(state: &GameState, obj_id: ObjectId) -> bool {
     let obj = match state.objects.get(&obj_id) {
         Some(o) => o,
         None => return false,
@@ -2780,9 +2788,6 @@ fn can_attack(state: &GameState, obj_id: ObjectId) -> bool {
         return false;
     }
     if !obj.card_types.core_types.contains(&CoreType::Creature) {
-        return false;
-    }
-    if obj.tapped {
         return false;
     }
     if obj.has_keyword(&Keyword::Defender) {
@@ -3127,6 +3132,36 @@ fn block_exchange(blocker: &BlockStats, attacker: &BlockStats) -> (bool, bool) {
     atk.take_hit(b_p2, blocker.deathtouch, blocker.damage_as_counters);
 
     (atk.dead(), !blk.dead())
+}
+
+/// CR 514.2: whether the damage marked on a creature now is still on it in the
+/// combat being read. It is removed in the cleanup step, so a combat on a
+/// later turn sees none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkedDamage {
+    /// The combat is this turn's: the marked damage counts.
+    Kept,
+    /// The combat is on a later turn: the cleanup step has removed it.
+    Cleared,
+}
+
+/// CR 509.1a + CR 510.1: whether `blocker` blocking `attacker` holds — kills
+/// the attacker or survives the block — so an attack into it is no free
+/// damage. Only a chump (the blocker dies and the attacker lives) does not
+/// hold. Pair legality is the caller's ([`BlockLegalitySlices::can_block_pair`]).
+pub(crate) fn block_holds(
+    blocker: &engine::game::game_object::GameObject,
+    attacker: &engine::game::game_object::GameObject,
+    marked: MarkedDamage,
+) -> bool {
+    let mut blocker_stats = BlockStats::from_object(blocker);
+    let mut attacker_stats = BlockStats::from_object(attacker);
+    if marked == MarkedDamage::Cleared {
+        blocker_stats.damage_marked = 0;
+        attacker_stats.damage_marked = 0;
+    }
+    let (attacker_dies, blocker_survives) = block_exchange(&blocker_stats, &attacker_stats);
+    attacker_dies || blocker_survives
 }
 
 /// Evaluate whether a single blocker kills the attacker and/or survives combat.
