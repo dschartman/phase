@@ -12956,8 +12956,12 @@ mod tests {
     // library loses at the next state-based action check. A cast or activation
     // whose resolution makes the AI draw more cards than its library holds,
     // when every one of those draws is mandatory, loses the game: a gate
-    // reject. Drawing exactly the library is no loss (seed 1001 T23: P0 flashed
-    // back Twinned Vision at library 1 and decked at 17 life).
+    // reject (seed 1001 T23: P0 flashed back Twinned Vision at library 1 and
+    // decked at 17 life). Drawing exactly the library leaves it at 0 with the
+    // AI's own next draw step ahead (CR 504.1), the recurring check's
+    // `DecksOutBeforeOwnDraw` reading (`before_own_draw >= library`): the same
+    // reject, under that reason (lead ruling 2026-10-20; with "exact N kept",
+    // 1001 looted its last card with Murmuring Volume on T23 and decked T25).
 
     /// Twinned Vision's MTGJSON text, parsed by the shipped parser.
     const TWINNED_VISION_ORACLE: &str = "Draw a card. If this spell wasn't cast from your \
@@ -13076,19 +13080,40 @@ mod tests {
         );
     }
 
-    /// Guard: cast from hand it draws one, and one draw from a one-card
-    /// library is no loss.
+    /// Cast from hand it draws one, the whole of a one-card library: the AI
+    /// is at 0 with its own draw step ahead, the recurring reading's loss.
     #[test]
-    fn twinned_vision_from_hand_at_library_one_stays_a_candidate() {
+    fn twinned_vision_from_hand_at_library_one_is_rejected_as_decking_before_own_draw() {
         let (state, vision) = self_draw_table(1, twinned_vision_in(Zone::Hand));
         assert_twinned_vision_shape(&state, vision);
+        assert_eq!(
+            issued_cast_decision(&state, vision).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// Guard: from hand at library 2 it draws one and leaves one.
+    #[test]
+    fn twinned_vision_from_hand_at_library_two_stays_a_candidate() {
+        let (state, vision) = self_draw_table(2, twinned_vision_in(Zone::Hand));
         assert!(!issued_cast_decision(&state, vision).is_reject());
     }
 
-    /// Guard: flashback at library 2 draws exactly the library.
+    /// Flashback at library 2 draws exactly the library: decks before the
+    /// AI's own draw.
     #[test]
-    fn twinned_vision_flashback_at_library_two_stays_a_candidate() {
+    fn twinned_vision_flashback_at_library_two_is_rejected_as_decking_before_own_draw() {
         let (state, vision) = self_draw_table(2, twinned_vision_in(Zone::Graveyard));
+        assert_eq!(
+            issued_cast_decision(&state, vision).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// Guard: flashback at library 3 draws two and leaves one.
+    #[test]
+    fn twinned_vision_flashback_at_library_three_stays_a_candidate() {
+        let (state, vision) = self_draw_table(3, twinned_vision_in(Zone::Graveyard));
         assert!(!issued_cast_decision(&state, vision).is_reject());
     }
 
@@ -13113,11 +13138,22 @@ mod tests {
         );
     }
 
-    /// Guard: a one-shot draw of N with library exactly N survives its
-    /// resolution (CR 704.5b fires only on a draw from an empty library).
+    /// Divination at library 2: its own resolution survives (CR 704.5b fires
+    /// only on a draw from an empty library), and the AI's next draw step is
+    /// that draw (CR 504.1). The recurring reading's reject and reason.
     #[test]
-    fn a_draw_two_sorcery_at_library_two_stays_a_candidate() {
+    fn a_draw_two_sorcery_at_library_two_is_rejected_as_decking_before_own_draw() {
         let (state, spell) = self_draw_table(2, sorcery_in_hand(DIVINATION_ORACLE));
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// Guard: a draw two at library 3 leaves a card for the draw step.
+    #[test]
+    fn a_draw_two_sorcery_at_library_three_stays_a_candidate() {
+        let (state, spell) = self_draw_table(3, sorcery_in_hand(DIVINATION_ORACLE));
         assert!(!issued_cast_decision(&state, spell).is_reject());
     }
 
@@ -13219,16 +13255,200 @@ mod tests {
         );
     }
 
-    /// Guard: the same activation at library 1.
+    /// The same activation at library 1 draws the last card.
     #[test]
-    fn a_tap_draw_activation_at_library_one_stays_a_candidate() {
+    fn a_tap_draw_activation_at_library_one_is_rejected_as_decking_before_own_draw() {
         let (state, source) = self_draw_table(1, |scenario| {
+            scenario
+                .add_artifact_from_oracle(P0, "Draw Engine", TAP_DRAW_ORACLE)
+                .id()
+        });
+        assert_eq!(
+            issued_decision(&state, |action| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == source))
+                .reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// Guard: the same activation at library 2.
+    #[test]
+    fn a_tap_draw_activation_at_library_two_stays_a_candidate() {
+        let (state, source) = self_draw_table(2, |scenario| {
             scenario
                 .add_artifact_from_oracle(P0, "Draw Engine", TAP_DRAW_ORACLE)
                 .id()
         });
         assert!(!issued_decision(&state, |action| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == source))
             .is_reject());
+    }
+
+    /// Murmuring Volume's MTGJSON text: the loot is its second ability.
+    const MURMURING_VOLUME_ORACLE: &str =
+        "{T}: Add one mana of any color.\n{2}, {T}, Discard a card: Draw a card.";
+
+    /// The gate's verdict on Murmuring Volume's engine-issued loot, with a
+    /// spare card in hand to discard.
+    fn murmuring_volume_loot_decision(library: usize) -> GateDecision {
+        let (state, volume) = self_draw_table(library, |scenario| {
+            scenario.add_creature_to_hand(P0, "Spare Bear", 2, 2);
+            scenario
+                .add_artifact_from_oracle(P0, "Murmuring Volume", MURMURING_VOLUME_ORACLE)
+                .id()
+        });
+        let loot = state.objects[&volume]
+            .abilities
+            .iter()
+            .position(|ability| {
+                ability.kind == AbilityKind::Activated
+                    && matches!(&*ability.effect, Effect::Draw { .. })
+            })
+            .expect("fixture: Murmuring Volume carries the loot");
+        issued_decision(
+            &state,
+            |action| matches!(action, GameAction::ActivateAbility { source_id, ability_index } if *source_id == volume && *ability_index == loot),
+        )
+    }
+
+    /// Seed 1001 T23 after 8d2d0b716: with the flashback gated, the AI looted
+    /// its last card with Murmuring Volume and decked on its T25 draw.
+    #[test]
+    fn murmuring_volume_loot_at_library_one_is_rejected_as_decking_before_own_draw() {
+        assert_eq!(
+            murmuring_volume_loot_decision(1).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// Guard: the loot at library 2 leaves a card for the draw step.
+    #[test]
+    fn murmuring_volume_loot_at_library_two_stays_a_candidate() {
+        assert!(!murmuring_volume_loot_decision(2).is_reject());
+    }
+
+    /// A draw that wins first: the reading the gate already has for an
+    /// untargeted drain lethal to an opponent
+    /// (`untargeted_part_is_lethal_to_an_opponent`, CR 119.3 + CR 704.5a).
+    /// Drawing the last card and draining the opponent to 0 wins at the
+    /// state-based check after it resolves, before any draw step.
+    const DRAW_AND_DRAIN_ORACLE: &str = "Draw a card. Each opponent loses 2 life.";
+
+    fn draw_and_drain_decision(opponent_life: i32) -> GateDecision {
+        let (state, spell) = self_draw_table(1, |scenario| {
+            scenario.with_life(P1, opponent_life);
+            sorcery_in_hand(DRAW_AND_DRAIN_ORACLE)(scenario)
+        });
+        issued_cast_decision(&state, spell)
+    }
+
+    #[test]
+    fn a_draw_to_zero_that_drains_the_opponent_to_zero_stays_a_candidate() {
+        assert!(!draw_and_drain_decision(2).is_reject());
+    }
+
+    #[test]
+    fn a_draw_to_zero_whose_drain_is_not_lethal_is_rejected_as_decking_before_own_draw() {
+        assert_eq!(
+            draw_and_drain_decision(20).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// The gate's verdict on `action` read as a root candidate of the
+    /// current priority decision. The other cast actions (CR 601.2 casts
+    /// offered from a prompt or a permission) are not issued at a main-phase
+    /// priority, so the candidate is constructed: the draw reading depends on
+    /// the cast object and its zone, not on the prompt.
+    fn constructed_cast_decision(state: &GameState, action: GameAction) -> GateDecision {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action,
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        let context = AiContext::empty(&config.weights);
+        gate_decisions(state, &decision, &[candidate], P0, &config, &context)[0]
+    }
+
+    /// Every cast action family member other than `CastSpell`, casting
+    /// `object` (the creature to return is a stand-in: the reading does not
+    /// depend on it).
+    fn other_cast_actions(state: &GameState, object: ObjectId) -> Vec<GameAction> {
+        let card_id = state.objects[&object].card_id;
+        let payment_mode = CastPaymentMode::Auto;
+        vec![
+            GameAction::CastSpellForFree {
+                object_id: object,
+                card_id,
+                source_id: object,
+                payment_mode,
+            },
+            GameAction::CastSpellAsMiracle {
+                object_id: object,
+                card_id,
+                payment_mode,
+            },
+            GameAction::CastSpellAsMadness {
+                object_id: object,
+                card_id,
+                payment_mode,
+            },
+            GameAction::CastSpellAsSneak {
+                hand_object: object,
+                card_id,
+                creature_to_return: object,
+                payment_mode,
+            },
+            GameAction::CastSpellAsWebSlinging {
+                hand_object: object,
+                card_id,
+                creature_to_return: object,
+                payment_mode,
+            },
+        ]
+    }
+
+    /// Each other cast action reads the same count as `CastSpell`: a draw
+    /// two at library 1 draws past it, at library 2 draws to 0, at library 3
+    /// is kept.
+    #[test]
+    fn every_cast_action_reads_the_one_shot_draw_count() {
+        for (library, expected) in [
+            (1, Some(RejectReason::DrawsPastLibrary)),
+            (2, Some(RejectReason::DecksOutBeforeOwnDraw)),
+            (3, None),
+        ] {
+            let (state, spell) = self_draw_table(library, sorcery_in_hand(DIVINATION_ORACLE));
+            for action in other_cast_actions(&state, spell) {
+                assert_eq!(
+                    constructed_cast_decision(&state, action.clone()).reject_reason(),
+                    expected,
+                    "library {library}: {action:?}"
+                );
+            }
+        }
+    }
+
+    /// The cast origin is the source's current zone: Twinned Vision in the
+    /// graveyard ("wasn't cast from your hand" holds) draws two, in hand one,
+    /// whichever cast action casts it.
+    #[test]
+    fn every_cast_action_reads_the_origin_from_the_source_zone() {
+        for (zone, expected) in [
+            (Zone::Graveyard, Some(RejectReason::DecksOutBeforeOwnDraw)),
+            (Zone::Hand, None),
+        ] {
+            let (state, vision) = self_draw_table(2, twinned_vision_in(zone));
+            for action in other_cast_actions(&state, vision) {
+                assert_eq!(
+                    constructed_cast_decision(&state, action.clone()).reject_reason(),
+                    expected,
+                    "{zone:?}: {action:?}"
+                );
+            }
+        }
     }
 
     /// Guard: the recurring check keeps its own reason. The Theorist onto an
