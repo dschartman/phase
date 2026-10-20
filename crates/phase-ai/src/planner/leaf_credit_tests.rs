@@ -694,10 +694,13 @@ fn a_spell_no_one_can_answer_is_valued_as_resolved_at_the_rollout_leaf() {
     });
 }
 
-/// P1 holds Shock with a Mountain untapped, so the rollout leaf stops with
-/// The Theorist on the stack (P1's priority is a real decision). The spell is
-/// not a card lost: the leaf must be at least the value of holding her
-/// (her hand value times a resolve chance of at most one).
+/// P1 holds Shock with a Mountain untapped. The Theorist is the AI's own
+/// object on top of the stack, so the leaf passes for both players until she
+/// resolves (P1's response stays unmodeled, as in the forced-pass case;
+/// spec-ai-leaf-after-own-stack-2026-10-20). Before that rule the leaf
+/// stopped at P1's priority with her on the stack. Either way the spell is
+/// not a card lost: the leaf must be at least the value of holding her, and
+/// with her on the stack (no quiescence) it still is.
 #[test]
 fn a_spell_facing_an_open_instant_is_not_scored_as_a_card_lost() {
     let open_instant = |scenario: &mut GameScenario| {
@@ -722,15 +725,22 @@ fn a_spell_facing_an_open_instant_is_not_scored_as_a_card_lost() {
 
     with_services(|services| {
         let stack_leaf = services.quiesced_leaf_eval(&stacked);
-        assert_eq!(
-            services.quiesce(&stacked).stack.len(),
-            1,
-            "P1's open Shock stops quiescence with the spell on the stack"
+        assert!(
+            services.quiesce(&stacked).stack.is_empty(),
+            "the AI's own spell on top resolves at the leaf despite P1's open Shock"
         );
         let hand_leaf = services.quiesced_leaf_eval(&held);
         assert!(
             stack_leaf >= hand_leaf,
-            "The Theorist on the stack ({stack_leaf:.4}) scores below holding her ({hand_leaf:.4})"
+            "The Theorist at the leaf ({stack_leaf:.4}) scores below holding her ({hand_leaf:.4})"
+        );
+        // The stack credit, read without quiescence (the leaf when the stack
+        // does not resolve: a deadline, the step cap, an opposing object on top).
+        let unresolved = services.evaluate_for_planner(&stacked);
+        let unresolved = services.reduce_utility(&stacked, &unresolved);
+        assert!(
+            unresolved >= hand_leaf,
+            "The Theorist on the stack ({unresolved:.4}) scores below holding her ({hand_leaf:.4})"
         );
     });
 }

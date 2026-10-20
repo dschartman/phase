@@ -2821,6 +2821,130 @@ mod tests {
         );
     }
 
+    // --- the leaf is scored after the AI's own stack objects resolve --------
+    //
+    // simforge/docs/spec-ai-leaf-after-own-stack-2026-10-20.md (judge S2 on
+    // a85428a64): a leaf whose top stack object the AI controls passes
+    // priority for every player until no AI-controlled object remains, so a
+    // draw the candidate itself put on the stack reaches the leaf's score.
+
+    const DRAW_ROD_ORACLE: &str = "{T}: Draw a card.";
+    const OPEN_SHOCK_ORACLE: &str = "Shock deals 2 damage to any target.";
+
+    /// P0 on its own precombat main with two untapped "{T}: Draw a card."
+    /// artifacts and 10 cards in library; P1 with an untapped Mountain and
+    /// Shock in hand (an instant it could respond with). P0 activates the
+    /// first rod (CR 602.2), so its draw is on the stack and P0 holds
+    /// priority (CR 117.3c) with the second rod still a legal action.
+    /// Returns the state and the second rod's id.
+    fn own_draw_on_the_stack() -> (GameState, ObjectId) {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::mana::{ManaCost, ManaCostShard};
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..10 {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let rod = scenario
+            .add_artifact_from_oracle(P0, "Draw Rod", DRAW_ROD_ORACLE)
+            .id();
+        let spare = scenario
+            .add_artifact_from_oracle(P0, "Spare Rod", DRAW_ROD_ORACLE)
+            .id();
+        scenario.add_basic_land(P1, ManaColor::Red);
+        scenario
+            .add_spell_to_hand(P1, "Shock", true)
+            .from_oracle_text(OPEN_SHOCK_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            });
+        let mut runner = scenario.build();
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: rod,
+                ability_index: 0,
+            })
+            .expect("P0 activates the rod");
+        let mut state = runner.state().clone();
+        // The land drop is used, so the drawn Island stays in hand (quiescence
+        // otherwise plays it, `prefer_land_drop`).
+        state.lands_played_this_turn = 1;
+        assert_eq!(state.stack.len(), 1, "the rod's draw is on the stack");
+        assert_eq!(state.stack.back().map(|entry| entry.controller), Some(P0));
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 holds priority, got {:?}",
+            state.waiting_for
+        );
+        (state, spare)
+    }
+
+    /// CR 117.4 + CR 608.1: with the AI's draw on top, quiescence passes for
+    /// both players (P0's spare rod and P1's open Shock are not taken) until
+    /// the draw resolves, so the leaf sees the drawn card.
+    #[test]
+    fn quiesce_passes_until_the_ais_own_stack_object_resolves() {
+        let (state, spare) = own_draw_on_the_stack();
+        let hand_before = state.players[0].hand.len();
+        let library_before = state.players[0].library.len();
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = PlannerServices::new_default(PlayerId(0), &config, &policies);
+        // Reach-guard: the AI has a legal action other than passing here, so
+        // the forced-pass and single-candidate cases do not apply.
+        let ctx = services.build_decision_context(&state);
+        assert!(
+            ctx.candidates.iter().any(|c| matches!(
+                c.action,
+                GameAction::ActivateAbility { source_id, .. } if source_id == spare
+            )),
+            "reach-guard: the spare rod is a legal action at P0's priority"
+        );
+
+        let quiesced = services.quiesce(&state);
+        assert!(
+            quiesced.stack.is_empty(),
+            "the AI's draw must resolve at the leaf, {} stack entries left",
+            quiesced.stack.len()
+        );
+        assert_eq!(quiesced.players[0].hand.len(), hand_before + 1, "drew one");
+        assert_eq!(quiesced.players[0].library.len(), library_before - 1);
+        assert!(
+            !quiesced.objects[&spare].tapped,
+            "the AI's other legal actions are ignored while its object resolves"
+        );
+        assert_eq!(
+            quiesced.players[1].hand.len(),
+            state.players[1].hand.len(),
+            "the opponent's response stays unmodeled (Shock not cast)"
+        );
+    }
+
+    /// Guard: the same position searched for P1. Its top stack object is the
+    /// opponent's (P0's draw), so quiescence is unchanged: P0's priority, with
+    /// the spare rod legal, is a genuine decision and the leaf is scored with
+    /// the draw on the stack.
+    #[test]
+    fn quiesce_is_unchanged_when_the_opponents_object_is_on_top() {
+        let (state, _) = own_draw_on_the_stack();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = PlannerServices::new_default(PlayerId(1), &config, &policies);
+        let quiesced = services.quiesce(&state);
+        assert_eq!(
+            quiesced.stack.len(),
+            1,
+            "P0's draw is the opponent's object: quiescence stops as before"
+        );
+        assert_eq!(quiesced.players[0].hand.len(), state.players[0].hand.len());
+    }
+
     #[test]
     fn quiesced_leaf_eval_credits_pending_creature() {
         use engine::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
