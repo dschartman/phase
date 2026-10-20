@@ -2046,7 +2046,7 @@ fn spell_links<'a>(spell_abilities: &[&'a AbilityDefinition]) -> Vec<&'a Ability
 /// CR 109.4 + CR 115.1a: a filter that admits only permanents the caster
 /// controls ("target permanent you control"): a `You` controller on a typed
 /// leg, on any leg of an intersection, or on every leg of a union.
-fn filter_names_only_own_permanents(filter: &TargetFilter) -> bool {
+pub(crate) fn filter_names_only_own_permanents(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(typed) => matches!(typed.controller, Some(ControllerRef::You)),
         TargetFilter::And { filters } => filters.iter().any(filter_names_only_own_permanents),

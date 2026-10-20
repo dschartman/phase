@@ -632,7 +632,7 @@ pub(crate) fn appraise_cast_benefit(
 /// The effects a spell performs when cast from `origin`, in chain order, or
 /// `None` when the chain carries a condition, branch or mode that `origin`
 /// alone does not decide.
-fn effects_cast_from(ability: &AbilityDefinition, origin: Zone) -> Option<Vec<&Effect>> {
+pub(crate) fn effects_cast_from(ability: &AbilityDefinition, origin: Zone) -> Option<Vec<&Effect>> {
     let unbranched =
         |node: &AbilityDefinition| node.else_ability.is_none() && node.mode_abilities.is_empty();
     if ability.condition.is_some() || !unbranched(ability) {
