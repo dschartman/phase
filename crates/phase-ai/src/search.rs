@@ -32,7 +32,9 @@ use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
-use crate::card_value::{cmp_keep, intrinsic_value, keep_key, worth_drawing, KEEP_VALUE_FLOOR};
+use crate::card_value::{
+    cmp_keep, intrinsic_value, keep_key, keep_order_tie_break, worth_drawing, KEEP_VALUE_FLOOR,
+};
 use crate::cast_facts::cast_facts_for_action;
 use crate::combat_ai::{
     choose_attackers_with_targets_with_profile_and_deadline_and_threat,
@@ -564,6 +566,7 @@ fn choose_action_with_session_inner(
         Some((0, scored[0].0.clone()))
     } else {
         softmax_select_index(&scored, config.temperature, rng)
+            .map(|index| own_discard_tie_break(state, ai_player, session, &scored, index))
             .map(|index| (index, scored[index].0.clone()))
     };
     if let Some((_, action)) = &chosen {
@@ -591,6 +594,37 @@ fn choose_action_with_session_inner(
             .flatten(),
         action,
     }
+}
+
+/// CR 701.9a + CR 701.9b + CR 118.1: at a discard the AI makes from its own
+/// hand, a loot's or a rummage's `DiscardChoice` or a discard cost at
+/// `PayCost`, candidates the search scores within
+/// `card_value::DISCARD_TIE_BAND` of the selector's pick are settled by the
+/// keep order the discarding player's plan reads
+/// (`card_value::keep_order_tie_break`); any other prompt, and a discard
+/// decided for another player (CR 723.5), keeps the selector's index. The
+/// loot's own price (`card_value::expected_loot_gain`) assumes this order.
+pub(crate) fn own_discard_tie_break(
+    state: &GameState,
+    ai_player: PlayerId,
+    session: &AiSession,
+    scored: &[(GameAction, f64)],
+    chosen: usize,
+) -> usize {
+    let player = match &state.waiting_for {
+        WaitingFor::DiscardChoice { player, .. }
+        | WaitingFor::PayCost {
+            player,
+            kind: engine::types::game_state::PayCostKind::Discard,
+            ..
+        } if *player == ai_player => *player,
+        _ => return chosen,
+    };
+    let plan = session
+        .plan
+        .get(&player)
+        .map(|snapshot| PlanState::realize(state, player, snapshot));
+    keep_order_tie_break(state, plan, scored, chosen)
 }
 
 fn random_card_predicate_guess(
