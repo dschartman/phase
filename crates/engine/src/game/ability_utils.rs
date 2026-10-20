@@ -4222,6 +4222,34 @@ fn fight_declared_slot_filters<'a>(
         .filter(|filter| !filter.is_context_ref())
 }
 
+/// CR 115.6 + CR 601.2c: whether a `Fight` node's declared target slots may be
+/// left empty. The single authority for the node's slot builder, slot specs and
+/// target assignment.
+///
+/// A one-slot fight ("~ fights up to one target creature an opponent controls",
+/// Mind Meanderer) reads the zero-target authority `targeting_is_optional()`,
+/// which counts the min-0 `multi_target` the parser stamps for "up to one"
+/// alongside the ability-wide `optional_targeting`.
+///
+/// A two-slot fight's `multi_target` does not say which of its two instances of
+/// "target" is the "up to one": the second in "target creature you control
+/// fights up to one target creature you don't control" (Smell Fear, Favored
+/// Enemy), the first in "up to one target creature you control fights target
+/// creature you don't control" (Gut, Fanatical Priestess). Reading it would make
+/// the required instance optional too, so a two-slot fight keeps the
+/// ability-wide `optional_targeting` and its slots stay as required as before.
+pub(crate) fn fight_targeting_is_optional(
+    ability: &ResolvedAbility,
+    subject: &TargetFilter,
+    target: &TargetFilter,
+) -> bool {
+    if fight_declared_slot_filters(subject, target).count() == 1 {
+        ability.targeting_is_optional()
+    } else {
+        ability.optional_targeting
+    }
+}
+
 /// CR 601.2c: The recipient is mandatory independently of the source count.
 fn each_power_damage_recipient_slot_filter(ability: &ResolvedAbility) -> Option<&TargetFilter> {
     if ability.target_choice_timing != TargetChoiceTiming::Stack {
@@ -4656,6 +4684,7 @@ fn collect_target_slots_inner(
     // fights …" only surface the opponent as a target slot — the fighter is the
     // ability source or the host permanent.
     if let Effect::Fight { subject, target } = &ability.effect {
+        let optional = fight_targeting_is_optional(ability, subject, target);
         for filter in fight_declared_slot_filters(subject, target) {
             // CR 608.2c + CR 701.14a: A context-ref fighter (SelfRef, ParentTarget,
             // ParentTargetSlot, TrackedSet — the reciprocal "those creatures fight
@@ -4667,12 +4696,14 @@ fn collect_target_slots_inner(
             // cast (Malamet Battle Glyph).
             let legal_targets =
                 legal_targets_for_ability_filter(state, ability, filter, acc.built());
-            if legal_targets.is_empty() && !ability.optional_targeting {
+            // CR 115.6 + CR 601.2c + CR 603.3d: an "up to one" slot may be left
+            // empty, so it has a legal answer even with no legal target.
+            if legal_targets.is_empty() && !optional {
                 return Err(no_legal_target_slots());
             }
             acc.push(TargetSelectionSlot {
                 legal_targets,
-                optional: ability.optional_targeting,
+                optional,
                 chooser: None,
                 effect_kind: acc.current_effect_kind,
                 effect_detail: acc.current_effect_detail,
@@ -7599,13 +7630,15 @@ fn collect_target_slot_specs(
     // CR 701.14a + CR 115.1: Mirror the dual-fighter `Fight` branch in
     // `collect_target_slots` so per-slot specs line up one-for-one.
     if let Effect::Fight { subject, target } = &ability.effect {
+        // CR 115.6: same authority as collect_target_slots_inner's Fight arm.
+        let optional = fight_targeting_is_optional(ability, subject, target);
         for filter in fight_declared_slot_filters(subject, target) {
             // Keep per-slot metadata aligned with the surfaced cast-time slots.
             let id = TargetInstanceId(*next_instance);
             *next_instance += 1;
             specs.push(TargetSlotSpec {
                 filter: filter.clone(),
-                optional: ability.optional_targeting,
+                optional,
                 instance: id,
                 group: ability.declares_chosen_group,
             });
@@ -10358,11 +10391,13 @@ fn assign_targets_recursive(
             .into_iter()
             .filter(|filter| !filter.is_context_ref())
             .count();
+        // CR 115.6: same authority as collect_target_slots_inner's Fight arm.
+        let optional = fight_targeting_is_optional(ability, subject, target);
         for _ in 0..slot_count {
             if let Some(chosen) = targets.get(*next_target) {
                 ability.push_chosen_target(chosen.clone());
                 *next_target += 1;
-            } else if !ability.optional_targeting {
+            } else if !optional {
                 return Err(EngineError::InvalidAction(
                     "Missing required target".to_string(),
                 ));
@@ -10854,6 +10889,8 @@ fn assign_selected_slots_recursive(
             .into_iter()
             .filter(|filter| !filter.is_context_ref())
             .count();
+        // CR 115.6: same authority as collect_target_slots_inner's Fight arm.
+        let optional = fight_targeting_is_optional(ability, subject, target);
         for _ in 0..slot_count {
             let Some(selected_slot) = selected_slots.get(*next_slot) else {
                 return Err(EngineError::InvalidAction(
@@ -10862,7 +10899,7 @@ fn assign_selected_slots_recursive(
             };
             match selected_slot {
                 Some(chosen) => ability.push_chosen_target(chosen.clone()),
-                None if ability.optional_targeting => {}
+                None if optional => {}
                 None => {
                     return Err(EngineError::InvalidAction(
                         "Missing required target".to_string(),
