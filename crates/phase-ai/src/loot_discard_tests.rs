@@ -338,12 +338,9 @@ fn ld5_guard_the_search_overrules_the_keep_order_outside_the_band() {
     );
 }
 
-/// LD4, the discard as a cost (CR 118.1 + CR 701.9b): Murmuring Volume's
-/// "{2}, {T}, Discard a card: Draw a card." at six lands, the hand a Swamp
-/// and Extended Absence with a legal target. The same keep order applies:
-/// the land SHALL be discarded to pay the cost.
-#[test]
-fn ld4_discard_cost_follows_the_keep_order() {
+/// Murmuring Volume at six lands, the hand a Swamp and Extended Absence with
+/// a legal target: activate its loot and stop at the discard cost.
+fn volume_discard_cost() -> GameState {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     stock_libraries(&mut s, "Island");
@@ -374,10 +371,63 @@ fn ld4_discard_cost_follows_the_keep_order() {
         "reach-guard: discard cost, got {}",
         prompt.waiting_for.variant_name()
     );
+    prompt
+}
 
+/// The candidate that discards the card named `name`.
+fn discard_of(state: &GameState, name: &str) -> GameAction {
+    let id = state.players[P0.0 as usize]
+        .hand
+        .iter()
+        .copied()
+        .find(|id| state.objects[id].name == name)
+        .unwrap_or_else(|| panic!("{name} in hand"));
+    GameAction::SelectCards { cards: vec![id] }
+}
+
+/// LD4, the discard as a cost (CR 118.1 + CR 701.9b): Murmuring Volume's
+/// "{2}, {T}, Discard a card: Draw a card." at six lands, the hand a Swamp
+/// and Extended Absence with a legal target. The same keep order applies:
+/// the land SHALL be discarded to pay the cost.
+#[test]
+fn ld4_discard_cost_follows_the_keep_order() {
+    let prompt = volume_discard_cost();
     let session = planned_session();
     let scores = named_scores(&prompt, &session);
     eprintln!("LD4 cost scores {scores:?}");
     let pick = chosen(&prompt, &session);
     assert!(is_land(&pick), "discarded {pick}, scores {scores:?}");
+}
+
+/// LD6, the tie-break at the discard cost: at the LD4 prompt, with the search
+/// tying the spell and the land (scores supplied, as the run's flashback and
+/// Volume ties were), the selector's spell gives way to the land. The same
+/// tie-break reads the cost seam (CR 118.1 + CR 701.9b).
+#[test]
+fn ld6_tie_break_applies_at_the_discard_cost() {
+    let prompt = volume_discard_cost();
+    let session = planned_session();
+    let scored = vec![
+        (discard_of(&prompt, "Extended Absence"), 5.0),
+        (discard_of(&prompt, "Swamp"), 5.0),
+    ];
+    let index = crate::search::own_discard_tie_break(&prompt, P0, &session, &scored, 0);
+    assert_eq!(scored[index].0, discard_of(&prompt, "Swamp"));
+}
+
+/// LD7: a discard prompt that is not the AI's own (CR 723.5, deciding for
+/// another seat) keeps the selector's pick; the keep order serves the
+/// discarding player's interest, which is not the AI's there.
+#[test]
+fn ld7_tie_break_is_only_for_the_ais_own_discard() {
+    let prompt = volume_discard_cost();
+    let session = planned_session();
+    let scored = vec![
+        (discard_of(&prompt, "Extended Absence"), 5.0),
+        (discard_of(&prompt, "Swamp"), 5.0),
+    ];
+    assert_eq!(
+        crate::search::own_discard_tie_break(&prompt, P1, &session, &scored, 0),
+        0
+    );
 }

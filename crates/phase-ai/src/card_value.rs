@@ -48,11 +48,17 @@
 //! discard families —
 //! `WaitingFor::DiscardChoice` (rummage, Thoughtseize-likes),
 //! `ConniveDiscard`, `WardDiscardChoice` — have no
-//! deterministic arm at all; they fall through to the policy/eval scorer, so
-//! the tier does NOT apply to them. That division is deliberate: the eval path
-//! carries its own mana-source signal, and widening the tier to every discard
-//! family without evidence would be speculative. "The discard bug is fixed"
-//! means the cleanup family and the discard cost, not all discard.
+//! deterministic arm at all; they fall through to the policy/eval scorer.
+//! One of them reads the keep order after the search, as a tie-break only:
+//! at a `DiscardChoice` the AI makes from its own hand (a loot's or a
+//! rummage's discard), and at the discard cost, [`keep_order_tie_break`]
+//! settles candidates the search scores within [`DISCARD_TIE_BAND`] of each
+//! other by [`cmp_keep`]. The evidence: in the 2026-10-20 FRA run at
+//! e6602dad2, 34 of the 36 discards after a Divining Duelist loot were exact
+//! top-two ties settled by action order, and every tie with a land the plan
+//! did not need in hand pitched a spell (`fork-checks/e6602dad2/JUDGE.md`,
+//! focus 5). A search that separates the candidates still decides.
+//! `ConniveDiscard` and `WardDiscardChoice` are not reached.
 
 use std::cmp::{Ordering, Reverse};
 
@@ -64,6 +70,7 @@ use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, Effect, PtValue,
     QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
 };
+use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
@@ -267,6 +274,84 @@ pub(crate) fn keep_key(
 pub(crate) fn cmp_keep(a: &(KeepTier, f64), b: &(KeepTier, f64)) -> Ordering {
     a.0.cmp(&b.0)
         .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+}
+
+/// How close two discard candidates' search scores must be for the keep order
+/// to choose between them ([`keep_order_tie_break`]): equal to three decimals,
+/// the reading of the FRA signals script's `f_score_tie` diagnostic
+/// (`deck-builder/tools/phase_signals.py`). At the e6602dad2 run's loot
+/// discards the search either tied exactly (45 of 47 prompts) or separated
+/// the candidates by more than 0.2, so the band only has to absorb the float
+/// noise of a mean over determinized samples. A gap wider than this is the
+/// search reading the position, and the search's pick stands.
+pub(crate) const DISCARD_TIE_BAND: f64 = 0.001;
+
+/// CR 701.9a + CR 701.9b + CR 118.1: settle a discard the search cannot
+/// decide by the keep order. `scored` is the root's scored candidates and
+/// `chosen` the index the selector picked; the result is the index to play.
+///
+/// Among the `SelectCards` candidates that discard as many cards as the
+/// chosen one and score within [`DISCARD_TIE_BAND`] of it, the one whose
+/// cards come first in [`cmp_keep`] order is played: each candidate's cards
+/// are keyed by [`keep_key`] and sorted, and the sorted keys are compared
+/// element by element, the order the CR 514.1 cleanup arm ranks its issued
+/// selections by. So a land the plan does not need goes before a spell, the
+/// card `expected_loot_gain` priced the loot on. The chosen candidate is kept
+/// unless another is strictly earlier in keep order, so cards with equal keys
+/// (two basic lands) are left to the selector. A candidate outside the band,
+/// or of a different size (the empty answer of an "up to" discard), is never
+/// substituted: the search's reading stands there.
+///
+/// The caller decides that the prompt is a discard the AI makes from its own
+/// hand and supplies the discarding player's plan; this reads only the
+/// candidates' cards.
+pub(crate) fn keep_order_tie_break(
+    state: &GameState,
+    plan: Option<PlanState>,
+    scored: &[(GameAction, f64)],
+    chosen: usize,
+) -> usize {
+    let keys_of = |action: &GameAction| -> Option<Vec<(KeepTier, f64)>> {
+        let GameAction::SelectCards { cards } = action else {
+            return None;
+        };
+        let mut keys: Vec<_> = cards.iter().map(|&id| keep_key(state, id, plan)).collect();
+        keys.sort_by(cmp_keep);
+        Some(keys)
+    };
+    let Some((chosen_action, chosen_score)) = scored.get(chosen) else {
+        return chosen;
+    };
+    let Some(chosen_keys) = keys_of(chosen_action) else {
+        return chosen;
+    };
+    let mut best = (chosen, chosen_keys);
+    for (index, (action, score)) in scored.iter().enumerate() {
+        let within_band = matches!(
+            (score - chosen_score).abs().partial_cmp(&DISCARD_TIE_BAND),
+            Some(Ordering::Less | Ordering::Equal)
+        );
+        if !within_band {
+            continue;
+        }
+        let Some(keys) = keys_of(action) else {
+            continue;
+        };
+        if keys.len() == best.1.len() && cmp_keep_vectors(&keys, &best.1) == Ordering::Less {
+            best = (index, keys);
+        }
+    }
+    best.0
+}
+
+/// [`cmp_keep`] over two equal-length selections whose keys are each sorted
+/// by [`cmp_keep`]: the first differing card decides.
+fn cmp_keep_vectors(a: &[(KeepTier, f64)], b: &[(KeepTier, f64)]) -> Ordering {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| cmp_keep(x, y))
+        .find(|order| order.is_ne())
+        .unwrap_or(Ordering::Equal)
 }
 
 /// The [`cmp_keep`] order as prices, for a give-up decision that is *scored*
@@ -1384,6 +1469,84 @@ mod tests {
 
     fn price_of(prices: &[(ObjectId, f64)], id: ObjectId) -> f64 {
         prices.iter().find(|(card, _)| *card == id).unwrap().1
+    }
+
+    fn discard(cards: &[ObjectId]) -> GameAction {
+        GameAction::SelectCards {
+            cards: cards.to_vec(),
+        }
+    }
+
+    /// KT1, the band's edge: a land past the plan's target (Surplus) and a
+    /// spell. The selector picked the spell; a land within
+    /// `DISCARD_TIE_BAND` of it is played instead, one just outside it is
+    /// not (the search's pick stands).
+    #[test]
+    fn keep_order_tie_break_reads_the_band() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let spell = spell_card(&mut state, "Spell", 2);
+        let plan = behind(-1, 0);
+        assert_eq!(keep_tier(&state, land, plan), KeepTier::Surplus);
+        for (gap, expected) in [
+            (0.0, land),
+            (DISCARD_TIE_BAND * 0.9, land),
+            (DISCARD_TIE_BAND * 1.1, spell),
+            (0.5, spell),
+        ] {
+            let scored = vec![(discard(&[spell]), 10.0), (discard(&[land]), 10.0 - gap)];
+            let index = keep_order_tie_break(&state, plan, &scored, 0);
+            assert_eq!(
+                scored[index].0,
+                discard(&[expected]),
+                "gap {gap}: expected {expected:?}"
+            );
+        }
+    }
+
+    /// KT2: the chosen candidate is kept when nothing in the band is strictly
+    /// earlier in keep order (two lands with equal keys), when the other
+    /// candidate discards a different number of cards (an "up to" discard's
+    /// empty answer), and when the chosen action is not a selection.
+    #[test]
+    fn keep_order_tie_break_keeps_the_pick_without_a_strictly_earlier_peer() {
+        let mut state = GameState::new_two_player(7);
+        let land_a = land_card(&mut state);
+        let land_b = land_card(&mut state);
+        let spell = spell_card(&mut state, "Spell", 2);
+        let plan = behind(-1, 0);
+
+        let equal_keys = vec![(discard(&[land_a]), 4.0), (discard(&[land_b]), 4.0)];
+        assert_eq!(keep_order_tie_break(&state, plan, &equal_keys, 1), 1);
+        assert_eq!(keep_order_tie_break(&state, plan, &equal_keys, 0), 0);
+
+        let sizes = vec![(discard(&[]), 4.0), (discard(&[spell]), 4.0)];
+        assert_eq!(keep_order_tie_break(&state, plan, &sizes, 0), 0);
+        let sizes = vec![(discard(&[spell]), 4.0), (discard(&[land_a, land_b]), 4.0)];
+        assert_eq!(keep_order_tie_break(&state, plan, &sizes, 0), 0);
+
+        let not_a_selection = vec![(GameAction::PassPriority, 4.0), (discard(&[land_a]), 4.0)];
+        assert_eq!(keep_order_tie_break(&state, plan, &not_a_selection, 0), 0);
+    }
+
+    /// KT3: a discard of two compares the selections card by card in keep
+    /// order, as the cleanup arm's rank vector does: {surplus land, spell}
+    /// goes before {spell, spell}, and a needed land (behind the plan) is the
+    /// last card given up, so {spell, spell} goes before {needed land, spell}.
+    #[test]
+    fn keep_order_tie_break_orders_multi_card_discards_card_by_card() {
+        let mut state = GameState::new_two_player(7);
+        let land = land_card(&mut state);
+        let one = spell_card(&mut state, "One", 2);
+        let two = spell_card(&mut state, "Two", 2);
+        let scored = vec![(discard(&[one, two]), 1.0), (discard(&[land, two]), 1.0)];
+
+        let flooded = behind(-1, 0);
+        assert_eq!(keep_order_tie_break(&state, flooded, &scored, 0), 1);
+
+        let short = behind(2, 0);
+        assert_eq!(keep_tier(&state, land, short), KeepTier::NeededManaSource);
+        assert_eq!(keep_order_tie_break(&state, short, &scored, 1), 0);
     }
 
     /// Order: `keep_prices` ranks a mixed pool exactly as `cmp_keep` sorts it,
