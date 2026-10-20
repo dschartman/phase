@@ -144,6 +144,9 @@ pub enum RejectReason {
     ConvokeStrandsPip,
     /// `CancelCast` is never a strategic choice.
     CancelCast,
+    /// A one-shot cast or activation whose mandatory draws are more than the
+    /// AI's library holds (CR 121.4 + CR 704.5b).
+    DrawsPastLibrary,
 }
 
 impl RejectReason {
@@ -167,6 +170,7 @@ impl RejectReason {
             RejectReason::UnpayableWard => "unpayable_ward",
             RejectReason::ConvokeStrandsPip => "convoke_strands_pip",
             RejectReason::CancelCast => "cancel_cast",
+            RejectReason::DrawsPastLibrary => "draws_past_library",
         }
     }
 }
@@ -12900,6 +12904,252 @@ mod tests {
     fn upkeep_self_draw_enchantment_onto_two_cards_stays_a_candidate() {
         let (state, arena) = self_draw_table(2, arena_in_hand);
         assert_eq!(offered_and_kept(&state, arena), (true, true));
+    }
+
+    // --- a one-shot mandatory draw past the library -------------------------
+    //
+    // CR 121.4 + CR 704.5b: a player who attempted to draw from an empty
+    // library loses at the next state-based action check. A cast or activation
+    // whose resolution makes the AI draw more cards than its library holds,
+    // when every one of those draws is mandatory, loses the game: a gate
+    // reject. Drawing exactly the library is no loss (seed 1001 T23: P0 flashed
+    // back Twinned Vision at library 1 and decked at 17 life).
+
+    /// Twinned Vision's MTGJSON text, parsed by the shipped parser.
+    const TWINNED_VISION_ORACLE: &str = "Draw a card. If this spell wasn't cast from your \
+        hand, draw two cards instead.\nFlashback\u{2014}{1}{U/R}{U/R}, Discard a card. (You may \
+        cast this card from your graveyard for its flashback cost. Then exile it.)";
+    const MAY_DRAW_TWO_ORACLE: &str = "You may draw two cards.";
+    const TAP_DRAW_ORACLE: &str = "{T}: Draw a card.";
+
+    /// Twinned Vision in `zone` of P0, with a spare card in hand to discard.
+    fn twinned_vision_in(zone: Zone) -> impl FnOnce(&mut GameScenario) -> ObjectId {
+        move |scenario| {
+            scenario.add_creature_to_hand(P0, "Spare Bear", 2, 2);
+            match zone {
+                Zone::Graveyard => scenario.add_spell_to_graveyard(P0, "Twinned Vision", true),
+                _ => scenario.add_spell_to_hand(P0, "Twinned Vision", true),
+            }
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::BlueRed],
+                generic: 1,
+            })
+            .from_oracle_text_with_keywords(&["Flashback"], TWINNED_VISION_ORACLE)
+            .id()
+        }
+    }
+
+    fn sorcery_in_hand(oracle: &'static str) -> impl FnOnce(&mut GameScenario) -> ObjectId {
+        move |scenario| {
+            scenario
+                .add_spell_to_hand(P0, "Draw Spell", false)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 2,
+                })
+                .from_oracle_text(oracle)
+                .id()
+        }
+    }
+
+    /// The gate's verdict on the engine-issued cast of `spell` (reach-guard:
+    /// the engine must issue it).
+    fn issued_cast_decision(state: &GameState, spell: ObjectId) -> GateDecision {
+        issued_decision(
+            state,
+            |action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == spell),
+        )
+    }
+
+    fn issued_decision(state: &GameState, matches: impl Fn(&GameAction) -> bool) -> GateDecision {
+        let issued = candidate_actions(state);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        let context = AiContext::empty(&config.weights);
+        let decisions = gate_decisions(state, &decision, &issued, P0, &config, &context);
+        let index = issued
+            .iter()
+            .position(|candidate| matches(&candidate.action))
+            .expect("reach-guard: the engine issues the candidate");
+        decisions[index]
+    }
+
+    /// The fixture parses as the card data does: Draw 1, with a Draw 2
+    /// sub-ability under `ConditionInstead { Not(And[WasCast { Hand },
+    /// SourceMatchesFilter owned by you]) }` (`client/public/card-data.json`).
+    fn assert_twinned_vision_shape(state: &GameState, vision: ObjectId) {
+        let spell = state.objects[&vision]
+            .abilities
+            .iter()
+            .find(|ability| ability.kind == AbilityKind::Spell)
+            .expect("Twinned Vision has a spell ability");
+        let draws = |effect: &Effect, n: i32| matches!(effect, Effect::Draw { count: QuantityExpr::Fixed { value }, target: TargetFilter::Controller } if *value == n);
+        assert!(draws(&spell.effect, 1), "root: {:?}", spell.effect);
+        let sub = spell.sub_ability.as_deref().expect("the instead leg");
+        assert!(draws(&sub.effect, 2), "instead leg: {:?}", sub.effect);
+        let Some(AbilityCondition::ConditionInstead { inner }) = &sub.condition else {
+            panic!("instead leg condition: {:?}", sub.condition);
+        };
+        let AbilityCondition::Not { condition } = inner.as_ref() else {
+            panic!("inner: {inner:?}");
+        };
+        let AbilityCondition::And { conditions } = condition.as_ref() else {
+            panic!("negated: {condition:?}");
+        };
+        assert!(
+            matches!(
+                conditions.as_slice(),
+                [
+                    AbilityCondition::WasCast {
+                        zone: Some(Zone::Hand)
+                    },
+                    AbilityCondition::SourceMatchesFilter { .. }
+                ]
+            ),
+            "conjuncts: {conditions:?}"
+        );
+    }
+
+    /// Seed 1001 T23: flashback from the graveyard at library 1. The
+    /// condition "wasn't cast from your hand" holds, so the instead leg draws
+    /// two (CR 702.34a: the flashback cast is from the graveyard), and the
+    /// second draw is from an empty library.
+    #[test]
+    fn twinned_vision_flashback_at_library_one_is_rejected_as_drawing_past_the_library() {
+        let (state, vision) = self_draw_table(1, twinned_vision_in(Zone::Graveyard));
+        assert_twinned_vision_shape(&state, vision);
+        assert_eq!(
+            issued_cast_decision(&state, vision).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary),
+            "two mandatory draws from a one-card library lose the game"
+        );
+        assert_eq!(
+            RejectReason::DrawsPastLibrary.as_str(),
+            "draws_past_library"
+        );
+    }
+
+    /// Guard: cast from hand it draws one, and one draw from a one-card
+    /// library is no loss.
+    #[test]
+    fn twinned_vision_from_hand_at_library_one_stays_a_candidate() {
+        let (state, vision) = self_draw_table(1, twinned_vision_in(Zone::Hand));
+        assert_twinned_vision_shape(&state, vision);
+        assert!(!issued_cast_decision(&state, vision).is_reject());
+    }
+
+    /// Guard: flashback at library 2 draws exactly the library.
+    #[test]
+    fn twinned_vision_flashback_at_library_two_stays_a_candidate() {
+        let (state, vision) = self_draw_table(2, twinned_vision_in(Zone::Graveyard));
+        assert!(!issued_cast_decision(&state, vision).is_reject());
+    }
+
+    /// From hand at library 0 even the one draw is from an empty library.
+    /// Whichever leg resolves, at least one card is drawn.
+    #[test]
+    fn twinned_vision_from_hand_at_library_zero_is_rejected_as_drawing_past_the_library() {
+        let (state, vision) = self_draw_table(0, twinned_vision_in(Zone::Hand));
+        assert_eq!(
+            issued_cast_decision(&state, vision).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// The class: a plain "Draw two cards." at library 1.
+    #[test]
+    fn a_draw_two_sorcery_at_library_one_is_rejected_as_drawing_past_the_library() {
+        let (state, spell) = self_draw_table(1, sorcery_in_hand(DIVINATION_ORACLE));
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// Guard: a one-shot draw of N with library exactly N survives its
+    /// resolution (CR 704.5b fires only on a draw from an empty library).
+    #[test]
+    fn a_draw_two_sorcery_at_library_two_stays_a_candidate() {
+        let (state, spell) = self_draw_table(2, sorcery_in_hand(DIVINATION_ORACLE));
+        assert!(!issued_cast_decision(&state, spell).is_reject());
+    }
+
+    /// Guard: a "may draw" can be declined at resolution, so it is no proven
+    /// loss whatever the library.
+    #[test]
+    fn an_optional_draw_two_at_library_one_stays_a_candidate() {
+        let (state, spell) = self_draw_table(1, sorcery_in_hand(MAY_DRAW_TWO_ORACLE));
+        let ability = state.objects[&spell]
+            .abilities
+            .iter()
+            .find(|ability| ability.kind == AbilityKind::Spell)
+            .expect("a spell ability");
+        assert!(
+            ability.optional && matches!(&*ability.effect, Effect::Draw { .. }),
+            "fixture parses as an optional draw: {ability:?}"
+        );
+        assert!(!issued_cast_decision(&state, spell).is_reject());
+    }
+
+    /// Guard: a draw the replacement pipeline substitutes away (CR 614.6,
+    /// CR 614.11: even from an empty library) is no deck-out, the reading the
+    /// recurring check shares.
+    #[test]
+    fn a_draw_two_sorcery_under_a_draw_replacement_stays_a_candidate() {
+        let mut spell = None;
+        let (state, _) = self_draw_table(0, |scenario| {
+            scenario.add_enchantment_from_oracle(
+                P0,
+                "Draw Shield",
+                "If you would draw one or more cards, you gain 1 life instead.",
+            );
+            let id = sorcery_in_hand(DIVINATION_ORACLE)(scenario);
+            spell = Some(id);
+            id
+        });
+        let spell = spell.expect("the sorcery was added");
+        assert!(!issued_cast_decision(&state, spell).is_reject());
+    }
+
+    /// The class covers activations: "{T}: Draw a card." at library 0.
+    #[test]
+    fn a_tap_draw_activation_at_library_zero_is_rejected_as_drawing_past_the_library() {
+        let (state, source) = self_draw_table(0, |scenario| {
+            scenario
+                .add_artifact_from_oracle(P0, "Draw Engine", TAP_DRAW_ORACLE)
+                .id()
+        });
+        assert_eq!(
+            issued_decision(&state, |action| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == source))
+                .reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// Guard: the same activation at library 1.
+    #[test]
+    fn a_tap_draw_activation_at_library_one_stays_a_candidate() {
+        let (state, source) = self_draw_table(1, |scenario| {
+            scenario
+                .add_artifact_from_oracle(P0, "Draw Engine", TAP_DRAW_ORACLE)
+                .id()
+        });
+        assert!(!issued_decision(&state, |action| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == source))
+            .is_reject());
+    }
+
+    /// Guard: the recurring check keeps its own reason. The Theorist onto an
+    /// empty library is still `DecksOutBeforeOwnDraw`.
+    #[test]
+    fn the_theorist_onto_an_empty_library_keeps_the_recurring_reason() {
+        let (state, theorist) = self_draw_table(0, theorist_in_hand);
+        assert_eq!(
+            issued_cast_decision(&state, theorist).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
     }
 
     // --- a creature spell's cast is judged by what the spell does ----------
