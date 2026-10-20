@@ -1197,6 +1197,7 @@ mod mill_double_redirect_choice_continuation;
 mod mill_rest_in_peace_redirect;
 mod mimeoplasm_interactive_exile;
 mod min_blocker_floor_block_candidates_7183;
+mod mind_meanderer_up_to_one_fight;
 mod mindblade_render_warrior_intervening_if_2867;
 mod mirror_march_copy_token_exile;
 mod mirror_strike_redirect;
