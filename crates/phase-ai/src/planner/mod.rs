@@ -2100,6 +2100,9 @@ pub fn apply_candidate(state: &GameState, candidate: &CandidateAction) -> Option
 }
 
 #[cfg(test)]
+mod leaf_credit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
