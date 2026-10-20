@@ -24,6 +24,10 @@
 //!   you don't control" (Primal Might): the second target may be declined, and
 //!   then the first target fights nothing.
 //! - S2: the same spell is castable with no creature to fight (CR 115.6).
+//! - N1: the reflexive form, "When you do, equipped creature fights up to one
+//!   target creature an opponent controls" (Novel Nunchaku), with no opposing
+//!   creature: the fight surfaces no target slot, so the reflexive trigger goes
+//!   on the stack with no target (CR 603.3d) and resolves as no fight.
 //! - M1, guard: a mandatory fight ("that creature fights target creature an
 //!   opponent controls", Gruul Ragebeast) with no legal target is removed from
 //!   the stack (CR 603.3d).
@@ -56,6 +60,14 @@ const MIND_MEANDERER_TEXT: &str = "Flying\nThis creature has vigilance as long a
 const PRIMAL_MIGHT_TEXT: &str = "Target creature you control gets +X/+X until end of turn. \
     Then it fights up to one target creature you don't control. (Each deals damage equal to its \
     power to the other.)";
+
+/// Verbatim from MTGJSON `AtomicCards.json` (Novel Nunchaku, Equipment): a
+/// reflexive one-slot fight whose fighter is the equipped creature.
+const NOVEL_NUNCHAKU_TEXT: &str = "When this Equipment enters, attach it to target creature you \
+    control. When you do, equipped creature fights up to one target creature an opponent \
+    controls. (Each deals damage equal to its power to the other.)\nEquipped creature gets +1/+1 \
+    and has trample.\nEquip {3} ({3}: Attach to target creature you control. Equip only as a \
+    sorcery.)";
 
 /// Verbatim from MTGJSON `AtomicCards.json` (Smell Fear, sorcery): a two-fighter
 /// fight whose second instance of "target" is "up to one".
@@ -646,4 +658,52 @@ fn primal_might_is_castable_with_nothing_to_fight() {
         cast_is_offered(runner.state(), spell),
         "CR 115.6: \"up to one\" has a legal answer, so the cast is offered"
     );
+}
+
+/// N1. CR 603.3d + CR 115.6: with no creature an opponent controls, zero targets
+/// is the only legal answer for Novel Nunchaku's reflexive "fights up to one
+/// target creature", so the reflexive trigger is put on the stack with no target
+/// and resolves with nothing to fight (CR 701.14b): the host is untouched.
+///
+/// Fails before the slot rule: the fight surfaced an optional slot with no legal
+/// target, which the trigger prompt auto-skipped into a prompt with no active
+/// slot; at fc6e40a8e the reflexive trigger was removed instead.
+#[test]
+fn novel_nunchaku_reflexive_fight_with_no_opposing_creature_resolves_as_no_fight() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let nunchaku = scenario
+        .add_artifact_to_hand_from_oracle(P0, "Novel Nunchaku", NOVEL_NUNCHAKU_TEXT)
+        .with_subtypes(vec!["Equipment"])
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let host = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+
+    let outcome = runner.cast(nunchaku).target_objects(&[host]).resolve();
+
+    assert_resolved_to_priority(&outcome);
+    assert_eq!(
+        outcome
+            .state()
+            .objects
+            .get(&nunchaku)
+            .and_then(|object| object.attached_to.as_ref())
+            .and_then(|target| target.as_object()),
+        Some(host),
+        "REACH GUARD: the Equipment attached, so \"When you do\" triggered"
+    );
+    assert!(
+        fight_resolved(&outcome, nunchaku),
+        "CR 603.3d + CR 701.14b: the reflexive fight goes on the stack with no target and \
+         resolves as no fight (events were {:?})",
+        outcome.events()
+    );
+    assert_untouched(&outcome, &[host]);
 }
