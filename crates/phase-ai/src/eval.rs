@@ -165,6 +165,9 @@ pub struct EvaluationBreakdown {
     /// The combat value of the creatures an attached Aura or Equipment holds
     /// out of combat, at the board weights (`EvalFeatures::neutralized_*`).
     pub neutralized: f64,
+    /// The draws each side's library is short of [`LIBRARY_FLOOR`], at the
+    /// hand-size weight (`EvalFeatures::library_floor`).
+    pub library_floor: f64,
 }
 
 impl EvaluationBreakdown {
@@ -187,6 +190,7 @@ impl EvaluationBreakdown {
             mana_development,
             card_credit,
             neutralized,
+            library_floor,
         } = self;
         life + board_presence
             + board_power
@@ -197,6 +201,7 @@ impl EvaluationBreakdown {
             + mana_development
             + card_credit
             + neutralized
+            + library_floor
     }
 }
 
@@ -268,6 +273,24 @@ pub struct EvalFeatures {
     pub neutralized_presence: f64,
     pub neutralized_power: f64,
     pub neutralized_toughness: f64,
+    /// CR 121.4 + CR 704.5b: a player who draws from an empty library loses.
+    /// The (opponent - self) differential of the draws each library is short
+    /// of [`LIBRARY_FLOOR`] (`LIBRARY_FLOOR - library`, zero at the floor or
+    /// above), one card per draw, opponents aggregated like
+    /// `card_advantage_breakdown`. Priced at the **hand-size weight**, so a
+    /// self-mill or a draw into a short library costs what the cards are
+    /// worth in hand. Not a 17Lands column: `FeatureRow::extract` folds it into
+    /// the harvested `hand_size`, the weight it multiplies.
+    pub library_floor: f64,
+}
+
+/// The library size below which the leaf charges each missing card as a
+/// draw lost (`EvalFeatures::library_floor`): three cards is one draw short.
+pub const LIBRARY_FLOOR: usize = 4;
+
+/// The draws `player`'s library is short of [`LIBRARY_FLOOR`].
+fn library_shortfall(state: &GameState, player: PlayerId) -> f64 {
+    LIBRARY_FLOOR.saturating_sub(state.players[player.0 as usize].library.len()) as f64
 }
 
 impl EvalFeatures {
@@ -287,6 +310,7 @@ impl EvalFeatures {
             + self.neutralized_presence * w.board_presence
             + self.neutralized_power * w.board_power
             + self.neutralized_toughness * w.board_toughness
+            + self.library_floor * w.hand_size
     }
 }
 
@@ -510,6 +534,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let mut weighted_opp_hand = 0.0;
         let mut weighted_opp_nc = 0.0;
         let mut weighted_opp_sources = 0.0;
+        let mut weighted_opp_shortfall = 0.0;
         let mut weighted_opp_credit = StructuralCredit::default();
 
         for &(opp, threat) in &threats {
@@ -523,6 +548,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             weighted_opp_hand += o.hand.len() as f64 * w;
             weighted_opp_nc += opp_stats.non_creatures as f64 * w;
             weighted_opp_sources += opp_stats.mana_sources as f64 * w;
+            weighted_opp_shortfall += library_shortfall(state, opp) * w;
             weighted_opp_credit.add_scaled(&structural_credit(state, opp), w);
         }
 
@@ -537,6 +563,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         features.hand_size = p.hand.len() as f64 - weighted_opp_hand;
         features.card_advantage_breakdown = my_stats.non_creatures as f64 - weighted_opp_nc;
         features.set_structural_credit(&structural_credit(state, player), &weighted_opp_credit);
+        features.library_floor = weighted_opp_shortfall - library_shortfall(state, player);
 
         if p.life as f64 > weighted_opp_life && my_stats.power > 0 {
             features.aggression = my_stats.power as f64;
@@ -550,6 +577,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let mut total_opp_hand_size = 0;
         let mut total_opp_nc = 0;
         let mut total_opp_sources = 0;
+        let mut total_opp_shortfall = 0.0;
         let mut opp_credit = StructuralCredit::default();
         for &opp in &opponents {
             let o = &state.players[opp.0 as usize];
@@ -561,6 +589,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             total_opp_hand_size += o.hand.len();
             total_opp_nc += opp_stats.non_creatures;
             total_opp_sources += opp_stats.mana_sources;
+            total_opp_shortfall += library_shortfall(state, opp);
             opp_credit.add_scaled(&structural_credit(state, opp), 1.0 / opp_count);
         }
 
@@ -579,6 +608,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         features.card_advantage_breakdown = my_stats.non_creatures as f64 - avg_opp_nc;
         // Averaged over opponents exactly like `card_advantage_breakdown`.
         features.set_structural_credit(&structural_credit(state, player), &opp_credit);
+        features.library_floor = total_opp_shortfall / opp_count - library_shortfall(state, player);
 
         // Mirrors `card_advantage_breakdown` above — an AVERAGE, not a raw total
         // (§6.4): at exactly one opponent the two agree, and the distinction
@@ -634,6 +664,7 @@ pub fn evaluate_state_breakdown(
         neutralized: features.neutralized_presence * weights.board_presence
             + features.neutralized_power * weights.board_power
             + features.neutralized_toughness * weights.board_toughness,
+        library_floor: features.library_floor * weights.hand_size,
     };
 
     // CR 107.14: energy is a fixed-coefficient offset added AFTER weighting, so
