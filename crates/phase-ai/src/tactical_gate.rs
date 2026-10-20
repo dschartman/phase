@@ -11527,4 +11527,357 @@ mod tests {
             "a shrink that lets our attacker kill its blocker was rejected"
         );
     }
+
+    // --- Harmful targeted spells and modes with no opposing legal target ---
+
+    const EXTENDED_ABSENCE_ORACLE: &str = "Exile target creature or planeswalker. \
+        Extended Absence deals 1 damage to each opponent and you gain 1 life.";
+    const MULTIPLY_BY_ZERO_ORACLE: &str =
+        "Target creature has base power and toughness 0/0 until end of turn.";
+    const SHRINK_OR_EXILE_ORACLE: &str = "Choose one —\n\
+        • Target creature gets -2/-2 until end of turn.\n\
+        • Exile target creature.";
+
+    fn spell_effect_kinds(state: &GameState, spell: ObjectId) -> Vec<EffectKind> {
+        state.objects[&spell]
+            .abilities
+            .iter()
+            .flat_map(crate::cast_facts::collect_definition_effects)
+            .map(EffectKind::from)
+            .collect()
+    }
+
+    fn assert_extended_absence_shape(state: &GameState, spell: ObjectId) {
+        assert_eq!(
+            spell_effect_kinds(state, spell),
+            vec![
+                EffectKind::ChangeZone,
+                EffectKind::DamageEachPlayer,
+                EffectKind::GainLife
+            ],
+            "fixture Oracle text no longer parses as exile, drain each opponent, gain life"
+        );
+    }
+
+    fn assert_multiply_by_zero_shape(state: &GameState, spell: ObjectId) {
+        let effects: Vec<&Effect> = state.objects[&spell]
+            .abilities
+            .iter()
+            .flat_map(crate::cast_facts::collect_definition_effects)
+            .collect();
+        assert!(
+            matches!(effects.as_slice(), [Effect::GenericEffect { static_abilities, .. }]
+                if static_abilities.iter().any(|definition| definition.modifications.iter().any(
+                    |modification| matches!(modification, ContinuousModification::SetToughness { value: 0 })))),
+            "fixture Oracle text no longer parses as a base 0/0 setter: {effects:?}"
+        );
+    }
+
+    /// The engine-issued pool at `state` after the gate: the actions it keeps.
+    fn gated_actions(state: &GameState) -> Vec<GameAction> {
+        let issued = candidate_actions(state);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        gate_candidates(
+            state,
+            &decision,
+            issued,
+            P0,
+            &config,
+            &AiContext::empty(&config.weights),
+        )
+        .into_iter()
+        .map(|gated| gated.candidate.action)
+        .collect()
+    }
+
+    /// CR 601.2a + CR 601.2b: announce `spell` through the engine's own issued
+    /// cast and stop at its mode choice.
+    fn announce_to_mode_choice(state: &GameState, spell: ObjectId) -> GameRunner {
+        let root = candidate_actions(state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(&candidate.action, GameAction::CastSpell { object_id, .. } if *object_id == spell)
+            })
+            .expect("reach-guard: the engine issues this cast");
+        let mut runner = GameRunner::from_state(state.clone());
+        runner.act(root.action).unwrap();
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::ModeChoice { .. }),
+            "reach-guard: the cast stops at its mode choice, got {:?}",
+            runner.state().waiting_for
+        );
+        runner
+    }
+
+    fn fund_blue_black(state: &mut GameState) {
+        for unit in [
+            ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]),
+        ] {
+            state.players[P0.0 as usize].mana_pool.add(unit);
+        }
+    }
+
+    /// CR 115.1a + CR 601.2c: Extended Absence exiles target creature or
+    /// planeswalker. When every legal target is the AI's own (a creature and a
+    /// planeswalker) and the drain is not lethal, casting it only exiles one of
+    /// its own permanents (signals a3: seeds 1007, 1029, 1031, 1034). Checked in
+    /// the windows those casts came in: own main phase, own upkeep and draw
+    /// step, and the opponent's end step.
+    #[test]
+    fn extended_absence_rejected_when_every_legal_target_is_own() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Divining Duelist", 2, 2);
+        scenario.add_planeswalker_from_oracle(P0, "Liliana", "Liliana", 3, "+1: You gain 1 life.");
+        scenario.with_life(P1, 7);
+        let absence = scenario
+            .add_spell_to_hand_from_oracle(P0, "Extended Absence", true, EXTENDED_ABSENCE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        assert_extended_absence_shape(state, absence);
+
+        for (phase, active) in [
+            (Phase::PreCombatMain, P0),
+            (Phase::Upkeep, P0),
+            (Phase::Draw, P0),
+            (Phase::End, P1),
+        ] {
+            set_priority_window(state, phase, active);
+            assert_eq!(
+                gate_spell_cast(state, absence),
+                GateDecision::Reject,
+                "Extended Absence with only own targets was a candidate in {phase:?}"
+            );
+        }
+    }
+
+    /// Guard: an opposing creature, or an opposing planeswalker alone, is a
+    /// legal target the exile is for, so the cast stays a candidate.
+    #[test]
+    fn extended_absence_allowed_with_an_opposing_creature_or_planeswalker() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Divining Duelist", 2, 2);
+        scenario.add_creature(P1, "Fblthp", 1, 1);
+        let absence = scenario
+            .add_spell_to_hand_from_oracle(P0, "Extended Absence", true, EXTENDED_ABSENCE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert_extended_absence_shape(state, absence);
+        assert_ne!(gate_spell_cast(state, absence), GateDecision::Reject);
+
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Divining Duelist", 2, 2);
+        scenario.add_planeswalker_from_oracle(P1, "Jace", "Jace", 3, "+1: Draw a card.");
+        let absence = scenario
+            .add_spell_to_hand_from_oracle(P0, "Extended Absence", true, EXTENDED_ABSENCE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert_ne!(gate_spell_cast(state, absence), GateDecision::Reject);
+    }
+
+    /// CR 120.3a + CR 704.5a: the untargeted 1 damage to each opponent wins the
+    /// game when an opponent is at 1 life, so the cast is kept even though the
+    /// exile can only hit the AI's own creature. At 2 life it is not lethal and
+    /// the cast is rejected as above.
+    #[test]
+    fn extended_absence_allowed_when_its_drain_is_lethal() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Divining Duelist", 2, 2);
+        scenario.with_life(P1, 1);
+        let absence = scenario
+            .add_spell_to_hand_from_oracle(P0, "Extended Absence", true, EXTENDED_ABSENCE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert_extended_absence_shape(state, absence);
+        assert_ne!(
+            gate_spell_cast(state, absence),
+            GateDecision::Reject,
+            "lethal drain was gated"
+        );
+
+        state.players[P1.0 as usize].life = 2;
+        assert_eq!(gate_spell_cast(state, absence), GateDecision::Reject);
+    }
+
+    /// CR 613.4b: base power and toughness 0/0 on the AI's own creature puts it
+    /// at 0 toughness (CR 704.5f), which is harm to that creature by what it
+    /// does to it, not by a polarity label. With no opposing creature the cast
+    /// is rejected (signals a3: seeds 1008, 1019); with one it is removal.
+    #[test]
+    fn multiply_by_zero_rejected_with_only_own_targets() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Rank Rat", 1, 1);
+        scenario.add_creature(P0, "Divining Duelist", 2, 2);
+        let zero = scenario
+            .add_spell_to_hand_from_oracle(P0, "Multiply by Zero", true, MULTIPLY_BY_ZERO_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        assert_multiply_by_zero_shape(state, zero);
+        for (phase, active) in [(Phase::PreCombatMain, P0), (Phase::Upkeep, P0)] {
+            set_priority_window(state, phase, active);
+            assert_eq!(
+                gate_spell_cast(state, zero),
+                GateDecision::Reject,
+                "Multiply by Zero with only own targets was a candidate in {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiply_by_zero_allowed_with_an_opposing_creature() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Rank Rat", 1, 1);
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let zero = scenario
+            .add_spell_to_hand_from_oracle(P0, "Multiply by Zero", true, MULTIPLY_BY_ZERO_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert_multiply_by_zero_shape(state, zero);
+        assert_ne!(gate_spell_cast(state, zero), GateDecision::Reject);
+    }
+
+    /// CR 700.2a + CR 601.2b: Theorix Charm with only the AI's own creature on
+    /// the battlefield and nothing on the stack. The cast stays a candidate for
+    /// its mill-and-draw mode, but at the mode choice the -2/-2 mode, whose only
+    /// legal targets are the AI's own creatures, is pruned and mill-and-draw is
+    /// kept (signals a3: seeds 1025, 1027).
+    #[test]
+    fn theorix_charm_shrink_mode_rejected_at_mode_choice_with_only_own_targets() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Variable Chaser", 4, 2);
+        let charm = scenario
+            .add_spell_to_hand_from_oracle(P0, "Theorix Charm", true, THEORIX_CHARM_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        fund_blue_black(state);
+        assert_modal_with_modes(state, charm, 3);
+        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+
+        let announced = announce_to_mode_choice(state, charm);
+        let issued: Vec<GameAction> = candidate_actions(announced.state())
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .collect();
+        let shrink = GameAction::SelectModes { indices: vec![1] };
+        let mill = GameAction::SelectModes { indices: vec![2] };
+        assert!(
+            issued.contains(&shrink) && issued.contains(&mill),
+            "reach-guard: the engine offers the shrink and mill modes: {issued:?}"
+        );
+        let kept = gated_actions(announced.state());
+        assert!(
+            !kept.contains(&shrink),
+            "the self-shrink mode was kept: {kept:?}"
+        );
+        assert!(kept.contains(&mill), "mill-and-draw was pruned: {kept:?}");
+    }
+
+    /// Guard: with an opposing 2/2 the -2/-2 mode kills it, so both modes stay.
+    #[test]
+    fn theorix_charm_shrink_mode_kept_at_mode_choice_with_an_opposing_target() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Variable Chaser", 4, 2);
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let charm = scenario
+            .add_spell_to_hand_from_oracle(P0, "Theorix Charm", true, THEORIX_CHARM_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        fund_blue_black(state);
+
+        let announced = announce_to_mode_choice(state, charm);
+        let kept = gated_actions(announced.state());
+        assert!(kept.contains(&GameAction::SelectModes { indices: vec![1] }));
+        assert!(kept.contains(&GameAction::SelectModes { indices: vec![2] }));
+    }
+
+    /// CR 700.2a: a modal spell is judged mode by mode. With only the AI's own
+    /// creature, the -2/-2 mode kills nothing opposing and the exile mode
+    /// reaches only its own creature, so no mode is worth casting and the cast
+    /// is rejected. If such a cast is announced anyway, the mode choice keeps
+    /// its continuations: a mode is pruned only while another one survives.
+    #[test]
+    fn modal_spell_every_mode_self_harm_rejected_but_mode_choice_never_emptied() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, "Shrink or Exile", true, SHRINK_OR_EXILE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert_modal_with_modes(state, spell, 2);
+        assert_eq!(gate_spell_cast(state, spell), GateDecision::Reject);
+
+        let announced = announce_to_mode_choice(state, spell);
+        let kept = gated_actions(announced.state());
+        assert!(kept.contains(&GameAction::SelectModes { indices: vec![0] }));
+        assert!(kept.contains(&GameAction::SelectModes { indices: vec![1] }));
+    }
+
+    /// Class guards that must stay candidates with only the AI's own creature
+    /// as a legal target: a +1/+1 counter helps its target; exiling a card
+    /// from the AI's own graveyard is not harm to a permanent; and a creature
+    /// spell is not judged by its activated ability ("{T}: Exile target
+    /// creature or planeswalker").
+    #[test]
+    fn own_target_class_guards_stay_candidates() {
+        let cases: [(&str, &str); 2] = [
+            ("Grow", "Put a +1/+1 counter on target creature."),
+            ("Graveyard Exile", "Exile target card from a graveyard."),
+        ];
+        for (name, oracle) in cases {
+            let mut scenario = GameScenario::new();
+            scenario.add_creature(P0, "Our Bear", 2, 2);
+            scenario.add_creature_to_graveyard(P0, "Dead Bear", 2, 2);
+            let spell = scenario
+                .add_spell_to_hand_from_oracle(P0, name, true, oracle)
+                .id();
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            set_priority_window(state, Phase::PreCombatMain, P0);
+            assert_ne!(
+                gate_spell_cast(state, spell),
+                GateDecision::Reject,
+                "{name} with only own targets was gated"
+            );
+        }
+
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        let warden = scenario
+            .add_creature_to_hand_from_oracle(
+                P0,
+                "Exile Warden",
+                1,
+                1,
+                "{T}: Exile target creature or planeswalker.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert_ne!(
+            gate_spell_cast(state, warden),
+            GateDecision::Reject,
+            "a creature spell was judged by its activated ability"
+        );
+    }
 }
