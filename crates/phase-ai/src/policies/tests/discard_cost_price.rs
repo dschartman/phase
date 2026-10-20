@@ -48,7 +48,21 @@ enum Held {
     GoodCreature,
     /// A {1}{U} instant: `intrinsic_value` 0.5 * 2 = 1.0.
     CheapInstant,
+    /// Last Gasp ({1}{B}, "Target creature gets -3/-3 until end of turn.")
+    /// with an opposing 3/3 it kills: removal, worth more than a draw.
+    Removal,
+    /// The Theorist, Jace Beleren ({2}{U}{U}, loyalty 3): a planeswalker,
+    /// worth more than two draws.
+    Planeswalker,
 }
+
+const LAST_GASP_TEXT: &str = "Target creature gets -3/-3 until end of turn.";
+const THEORIST_TEXT: &str = "At the beginning of each opponent's draw step, you draw a card.\n\
+    [+1]: Create a 1/1 blue Illusion creature token.\n\
+    [−2]: For each opponent, return up to one target artifact or creature that player controls \
+    to its owner's hand.\n\
+    [−6]: Draw three cards. Then put X +1/+1 counters on each creature you control, where X is \
+    the number of cards in your hand.";
 
 struct Board {
     state: GameState,
@@ -86,6 +100,31 @@ fn board(held: Held, with_volume: bool, with_twinned_vision: bool) -> Board {
             .with_mana_cost(ManaCost::Cost {
                 shards: vec![ManaCostShard::Blue],
                 generic: 1,
+            })
+            .id(),
+        Held::Removal => {
+            scenario
+                .add_creature(P1, "Opposing Bear", 3, 3)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 2,
+                });
+            scenario
+                .add_spell_to_hand_from_oracle(P0, "Last Gasp", true, LAST_GASP_TEXT)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Black],
+                    generic: 1,
+                })
+                .id()
+        }
+        Held::Planeswalker => scenario
+            .add_spell_to_hand(P0, "The Theorist, Jace Beleren", false)
+            .from_oracle_text(THEORIST_TEXT)
+            .as_planeswalker_with_loyalty("Jace", 3)
+            .as_legendary()
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                generic: 2,
             })
             .id(),
     };
@@ -196,4 +235,29 @@ fn twinned_vision_flashback_stays_available_when_the_lone_card_is_cheap() {
         score,
         "flashing back by discarding a card worth a third of a draw",
     );
+}
+
+/// The target shape of the noncreature-value round (`fork-checks/9f72018f4/
+/// OPEN.md`): a lone removal spell, priced 1.0 at 0.5 a pip, was looted away
+/// against an expected draw of 3.0. Removal with a creature to answer is worth
+/// more than one draw, so the loot must not be chosen.
+#[test]
+fn volume_loot_does_not_throw_away_a_lone_removal_spell() {
+    let board = board(Held::Removal, true, false);
+    let (offered, score) = measure(&board, is_loot);
+    assert!(offered > 0, "fixture must offer the Volume loot");
+    assert_rejected(
+        score,
+        "looting away the only card, a removal spell with a target,",
+    );
+}
+
+/// Twinned Vision's flashback draws two; a lone planeswalker (The Theorist,
+/// priced 2.0 at 0.5 a pip) is worth more than two expected draws.
+#[test]
+fn twinned_vision_flashback_does_not_throw_away_a_lone_planeswalker() {
+    let board = board(Held::Planeswalker, false, true);
+    let (offered, score) = measure(&board, is_flashback);
+    assert!(offered > 0, "fixture must offer the flashback cast");
+    assert_rejected(score, "flashing back by discarding The Theorist");
 }

@@ -17,6 +17,7 @@ pub mod graveyard_types;
 pub mod lifegain_payoff;
 pub mod mill_payoff;
 pub mod mulligan_input_lint;
+pub mod noncreature_value;
 pub mod own_board_only_activation_repro;
 pub mod poison;
 pub mod reanimator_payoff;
