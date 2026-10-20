@@ -73,3 +73,23 @@ pub(crate) fn context_with_plans(
     }
     build_ai_context_with_session(state, ai_player, config, Arc::new(session))
 }
+
+/// Put `count` cards in every player's library. An empty library at a leaf
+/// that is not over is the loss (`eval::evaluate_features`, CR 504.1 +
+/// CR 121.4), so a hand-built position whose libraries are not under test
+/// needs cards in them for its evaluation to read the board.
+pub(crate) fn stock_libraries(state: &mut GameState, count: usize) {
+    for seat in 0..state.players.len() {
+        let player = PlayerId(seat as u8);
+        for _ in 0..count {
+            let card_id = engine::types::identifiers::CardId(state.next_object_id);
+            engine::game::zones::create_object(
+                state,
+                card_id,
+                player,
+                "Library card".to_string(),
+                engine::types::zones::Zone::Library,
+            );
+        }
+    }
+}

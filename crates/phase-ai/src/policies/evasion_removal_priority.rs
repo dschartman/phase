@@ -590,6 +590,11 @@ mod tests {
     fn burn_prefers_the_killable_body_over_the_bigger_unkillable_threat() {
         let mut scenario = GameScenario::new_n_player(2, 42);
         scenario.at_phase(Phase::PreCombatMain);
+        for player in [P0, engine::types::player::PlayerId(1)] {
+            for _ in 0..20 {
+                scenario.add_land_to_library_top(player, "Plains");
+            }
+        }
         let bolt = scenario
             .add_spell_to_hand_from_oracle(P0, "Lightning Bolt", true, LIGHTNING_BOLT_ORACLE)
             .with_mana_cost(ManaCost::Cost {

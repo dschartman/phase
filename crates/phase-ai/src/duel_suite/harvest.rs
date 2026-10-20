@@ -343,6 +343,7 @@ mod tests {
         let mut harvester = GameHarvester::new(42, "unit".to_string(), 0);
 
         let mut state = GameState::new_two_player(42);
+        crate::test_support::stock_libraries(&mut state, 20);
 
         // Turn 1: a NON-empty-stack boundary (reach-guard — the gate must filter
         // this) then an empty-stack boundary that sets pending.
@@ -398,6 +399,7 @@ mod tests {
         let build = || {
             let mut h = GameHarvester::new(1, "m".to_string(), 3);
             let mut state = GameState::new_two_player(1);
+            crate::test_support::stock_libraries(&mut state, 20);
             state.turn_number = 1;
             h.observe(&state, &session); // empty stack ⇒ pending turn 1
             state.turn_number = 2;
