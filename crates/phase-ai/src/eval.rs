@@ -523,6 +523,9 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
 
     let mut features = EvalFeatures::default();
     let opp_count = opponents.len().max(1) as f64;
+    // CR 514.2: the board sums read each permanent as it will be after this
+    // turn's cleanup (`AfterCleanup`), one engine view for every player.
+    let after_cleanup = AfterCleanup::of(state);
 
     // Both branches below assign these exactly once: the evaluator's own board
     // accounting, and the branch's own aggregation of opponent mana sources
@@ -553,7 +556,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         for &(opp, threat) in &threats {
             let w = threat / total_threat;
             let o = &state.players[opp.0 as usize];
-            let opp_stats = board_stats(state, opp);
+            let opp_stats = leaf_board_stats(state, opp, &after_cleanup);
             weighted_opp_life += o.life as f64 * w;
             weighted_opp_creatures += opp_stats.creatures as f64 * w;
             weighted_opp_power += opp_stats.power as f64 * w;
@@ -562,20 +565,23 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             weighted_opp_nc += opp_stats.non_creatures as f64 * w;
             weighted_opp_sources += opp_stats.mana_sources as f64 * w;
             weighted_opp_shortfall += library_shortfall(state, opp) * w;
-            weighted_opp_credit.add_scaled(&structural_credit(state, opp), w);
+            weighted_opp_credit.add_scaled(&structural_credit(state, opp, &after_cleanup), w);
         }
 
         // Life differential (against threat-weighted opponent)
         features.life = p.life as f64 - weighted_opp_life;
 
-        my_stats = board_stats(state, player);
+        my_stats = leaf_board_stats(state, player, &after_cleanup);
         opp_sources = weighted_opp_sources;
         features.board_presence = my_stats.creatures as f64 - weighted_opp_creatures;
         features.board_power = my_stats.power as f64 - weighted_opp_power;
         features.board_toughness = my_stats.toughness as f64 - weighted_opp_toughness;
         features.hand_size = p.hand.len() as f64 - weighted_opp_hand;
         features.card_advantage_breakdown = my_stats.non_creatures as f64 - weighted_opp_nc;
-        features.set_structural_credit(&structural_credit(state, player), &weighted_opp_credit);
+        features.set_structural_credit(
+            &structural_credit(state, player, &after_cleanup),
+            &weighted_opp_credit,
+        );
         features.library_floor = weighted_opp_shortfall - library_shortfall(state, player);
 
         if p.life as f64 > weighted_opp_life && my_stats.power > 0 {
@@ -595,7 +601,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         for &opp in &opponents {
             let o = &state.players[opp.0 as usize];
             total_opp_life += o.life;
-            let opp_stats = board_stats(state, opp);
+            let opp_stats = leaf_board_stats(state, opp, &after_cleanup);
             total_opp_creatures += opp_stats.creatures;
             total_opp_power += opp_stats.power;
             total_opp_toughness += opp_stats.toughness;
@@ -603,13 +609,16 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             total_opp_nc += opp_stats.non_creatures;
             total_opp_sources += opp_stats.mana_sources;
             total_opp_shortfall += library_shortfall(state, opp);
-            opp_credit.add_scaled(&structural_credit(state, opp), 1.0 / opp_count);
+            opp_credit.add_scaled(
+                &structural_credit(state, opp, &after_cleanup),
+                1.0 / opp_count,
+            );
         }
 
         let avg_opp_life = total_opp_life as f64 / opp_count;
         features.life = p.life as f64 - avg_opp_life;
 
-        my_stats = board_stats(state, player);
+        my_stats = leaf_board_stats(state, player, &after_cleanup);
         features.board_presence = (my_stats.creatures - total_opp_creatures) as f64;
         features.board_power = (my_stats.power - total_opp_power) as f64;
         features.board_toughness = (my_stats.toughness - total_opp_toughness) as f64;
@@ -620,7 +629,10 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let avg_opp_nc = total_opp_nc as f64 / opp_count;
         features.card_advantage_breakdown = my_stats.non_creatures as f64 - avg_opp_nc;
         // Averaged over opponents exactly like `card_advantage_breakdown`.
-        features.set_structural_credit(&structural_credit(state, player), &opp_credit);
+        features.set_structural_credit(
+            &structural_credit(state, player, &after_cleanup),
+            &opp_credit,
+        );
         features.library_floor = total_opp_shortfall / opp_count - library_shortfall(state, player);
 
         // Mirrors `card_advantage_breakdown` above — an AVERAGE, not a raw total
@@ -732,7 +744,11 @@ impl EvalFeatures {
     }
 }
 
-fn structural_credit(state: &GameState, player: PlayerId) -> StructuralCredit {
+fn structural_credit(
+    state: &GameState,
+    player: PlayerId,
+    after_cleanup: &AfterCleanup,
+) -> StructuralCredit {
     let resolved: f64 = state
         .battlefield
         .iter()
@@ -757,7 +773,7 @@ fn structural_credit(state: &GameState, player: PlayerId) -> StructuralCredit {
         .sum();
     StructuralCredit {
         cards: resolved + on_stack,
-        neutralized: neutralized_creatures(state, player),
+        neutralized: neutralized_creatures(state, player, after_cleanup),
     }
 }
 
@@ -770,7 +786,11 @@ fn structural_credit(state: &GameState, player: PlayerId) -> StructuralCredit {
 /// can't block, or that it doesn't untap (CR 502.3) while it is tapped: a
 /// tapped creature can't be declared an attacker or a blocker (CR 508.1a,
 /// CR 509.1a).
-fn neutralized_creatures(state: &GameState, player: PlayerId) -> CombatTotals {
+fn neutralized_creatures(
+    state: &GameState,
+    player: PlayerId,
+    after_cleanup: &AfterCleanup,
+) -> CombatTotals {
     let mut held: Vec<ObjectId> = Vec::new();
     for attachment in state
         .battlefield
@@ -795,15 +815,17 @@ fn neutralized_creatures(state: &GameState, player: PlayerId) -> CombatTotals {
             held.push(host_id);
         }
     }
-    held.iter().filter_map(|id| state.objects.get(id)).fold(
-        CombatTotals::default(),
-        |mut totals, host| {
+    // Each host as the board sums read it (`AfterCleanup::creature`): a host
+    // that is no creature after cleanup is held out of nothing.
+    held.iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter_map(|host| after_cleanup.creature(host))
+        .fold(CombatTotals::default(), |mut totals, (power, toughness)| {
             totals.count += 1.0;
-            totals.power += f64::from(host.power.unwrap_or(0));
-            totals.toughness += f64::from(host.toughness.unwrap_or(0));
+            totals.power += f64::from(power);
+            totals.toughness += f64::from(toughness);
             totals
-        },
-    )
+        })
 }
 
 fn attachment_holds_out_of_combat(
@@ -925,6 +947,114 @@ pub fn board_stats(state: &GameState, player: PlayerId) -> BoardStats {
         non_creatures,
         mana_sources,
     }
+}
+
+/// The battlefield as it will be after this turn's cleanup step, for the
+/// leaf's board sums (`evaluate_features`).
+///
+/// CR 514.2: in the cleanup step "all 'until end of turn' and 'this turn'
+/// effects end", and CR 511.2: "until end of combat" effects end with the
+/// combat phase, before it. A creature under an until-end-of-turn -3/-3 that
+/// survived is, from the next turn on, the creature it was, and a pumped one
+/// is its unpumped self; the leaf is a position the game continues from, so
+/// a temporary change is not priced as lasting. What such a change does before
+/// cleanup (a combat it decides, a kill it makes) is resolved by the search
+/// itself and is already in the position the leaf reads.
+///
+/// The view is the engine's own: a copy of the state with the engine's
+/// end-of-combat and cleanup prunes applied (`layers::prune_end_of_combat_effects`,
+/// `layers::prune_end_of_turn_effects`, the functions the turn structure calls)
+/// and the layers settled again (`layers::flush_layers`, CR 613.1). Counters,
+/// static abilities and effects with a longer duration are untouched, so they
+/// read as they are. Only built when the state holds an effect those prunes
+/// end; otherwise every permanent already reads as it will.
+struct AfterCleanup {
+    view: Option<GameState>,
+}
+
+impl AfterCleanup {
+    fn of(state: &GameState) -> Self {
+        use engine::types::ability::Duration;
+        let ends_by_cleanup = state.transient_continuous_effects.iter().any(|effect| {
+            matches!(
+                effect.duration,
+                Duration::UntilEndOfTurn | Duration::UntilEndOfCombat
+            )
+        });
+        if !ends_by_cleanup {
+            return Self { view: None };
+        }
+        let mut view = state.clone();
+        engine::game::layers::prune_end_of_combat_effects(&mut view);
+        engine::game::layers::prune_end_of_turn_effects(&mut view);
+        engine::game::layers::flush_layers(&mut view);
+        Self { view: Some(view) }
+    }
+
+    /// `live` as it will be after cleanup (itself when nothing it has ends).
+    fn object<'a>(
+        &'a self,
+        live: &'a engine::game::game_object::GameObject,
+    ) -> &'a engine::game::game_object::GameObject {
+        self.view
+            .as_ref()
+            .and_then(|view| view.objects.get(&live.id))
+            .unwrap_or(live)
+    }
+
+    /// The power and toughness the leaf sums for `live`: `None` when it is no
+    /// creature after cleanup, or one whose toughness is then 0 or less
+    /// (CR 704.5f + CR 514.3a: it is put into its owner's graveyard in that
+    /// cleanup step). Power is floored at 0: CR 107.1b lets a power be below
+    /// zero, and CR 510.1a: a creature with 0 or less power assigns no combat
+    /// damage, so a negative power is worth nothing to either side.
+    fn creature(&self, live: &engine::game::game_object::GameObject) -> Option<(i32, i32)> {
+        let lasting = self.object(live);
+        if !lasting.card_types.core_types.contains(&CoreType::Creature) {
+            return None;
+        }
+        let toughness = lasting.toughness.unwrap_or(0);
+        (toughness > 0).then(|| (lasting.power.unwrap_or(0).max(0), toughness))
+    }
+}
+
+/// [`board_stats`] as the leaf reads it: each permanent as it will be after
+/// this turn's cleanup ([`AfterCleanup`]), creature power floored at 0. The
+/// controller and the mana sources are read as they are now.
+fn leaf_board_stats(
+    state: &GameState,
+    player: PlayerId,
+    after_cleanup: &AfterCleanup,
+) -> BoardStats {
+    let mut stats = BoardStats {
+        creatures: 0,
+        power: 0,
+        toughness: 0,
+        non_creatures: 0,
+        mana_sources: 0,
+    };
+    for obj in state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter(|obj| obj.controller == player)
+    {
+        let lasting = after_cleanup.object(obj);
+        if lasting.card_types.core_types.contains(&CoreType::Creature) {
+            if let Some((power, toughness)) = after_cleanup.creature(obj) {
+                stats.creatures += 1;
+                stats.power += power;
+                stats.toughness += toughness;
+            }
+        } else if !lasting.card_types.core_types.contains(&CoreType::Land) {
+            stats.non_creatures += 1;
+        }
+        // Cross-cuts the partition above: see `BoardStats::mana_sources`.
+        if zone_eval::is_intrinsic_mana_source(obj) {
+            stats.mana_sources += 1;
+        }
+    }
+    stats
 }
 
 /// Marginal value of one unit of mana-source differential, in the same units as
