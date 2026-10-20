@@ -7331,6 +7331,16 @@ mod tests {
         // → recipient target), exactly as the game loop replays candidate
         // actions, and record every object it picks as a ChooseTarget target.
         let mut picked: Vec<ObjectId> = Vec::new();
+        // The cast is committed here: this row is about the targets, and
+        // whether to cast at all is the root's call (with the interior search
+        // no longer taking CancelCast, the trade of the 2/2 for a 0/1 is not
+        // made by itself).
+        let cast = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .find(|action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == spell))
+            .expect("reach-guard: the engine issues the Self-Destruct cast");
+        engine::game::engine::apply_as_current(&mut state, cast).expect("the cast starts");
         for _ in 0..20 {
             let Some(action) = choose_action(&state, P0, &config, &mut rng) else {
                 break;

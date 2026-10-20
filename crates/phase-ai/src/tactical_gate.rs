@@ -13864,7 +13864,7 @@ mod tests {
     // `phase/.git/fork-checks/a85428a64/JUDGE.md`, rows JR1 to JR9, landed
     // without their diagnostics. JR2, JR4 and JR9 asserted the withdrawn
     // "exact N kept" premise; they land with the draw-to-zero reading (lead
-    // ruling 2026-10-20). JR10 belongs to the leaf-after-own-stack spec (S2).
+    // ruling 2026-10-20). JR10 (S2) follows JR9, with its CancelCast guards.
 
     const JR_LOOT_ORACLE: &str = "{2}, {T}, Discard a card: Draw a card.";
     const JR_FLIP_ORACLE: &str = "Draw two cards. If this spell was cast from a graveyard, draw a card instead.\nFlashback {2}{U}";
@@ -14086,6 +14086,172 @@ mod tests {
         assert_eq!(
             issued_cast_decision(&state2, spell).reject_reason(),
             Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// JR10 (judge S2 on a85428a64): the search sees the loot's own draw.
+    /// With nothing else different, the loot-minus-pass gap at library 2 (loot
+    /// to 1, three short of the library floor, against pass two short) sits
+    /// one hand-size card below the gap at library 5 (no floor term either
+    /// way). The loot's discard cost leaves its root successor at a PayCost
+    /// prompt, where the engine also issues CancelCast; while the interior
+    /// search could take it, the loot scored as the best of its own line and
+    /// a cancel back to the root (the PlayLand line), 6.521 at both
+    /// libraries. The judge's board compared library 1, where the loot is now
+    /// rejected as `DecksOutBeforeOwnDraw` (draw to 0, 782e5f146); library 2
+    /// is the shortest library it is still scored at (CR 601.2, CR 602.2,
+    /// CR 121.4, CR 704.5b).
+    #[test]
+    fn jr10_search_leaf_sees_the_loot_draw() {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let board = |library| {
+            self_draw_table(library, |scenario| {
+                scenario.add_land_to_hand(P0, "Swamp");
+                scenario.add_land_to_hand(P0, "Swamp");
+                scenario
+                    .add_artifact_from_oracle(P0, "Loot Volume", JR_LOOT_ORACLE)
+                    .id()
+            })
+        };
+        let is_loot = |source: ObjectId| move |action: &GameAction| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == source);
+        let gap = |library| {
+            let (state, source) = board(library);
+            let scored = crate::search::score_candidates(&state, P0, &config);
+            let loot = scored
+                .iter()
+                .find(|(action, _)| is_loot(source)(action))
+                .map(|(_, score)| *score)
+                .expect("the loot is scored");
+            let pass = scored
+                .iter()
+                .find(|(action, _)| matches!(action, GameAction::PassPriority))
+                .map(|(_, score)| *score)
+                .expect("pass is scored");
+            loot - pass
+        };
+        // Reach-guard: at library 1 the loot draws to 0 and is gated, so the
+        // judge's library-1 board cannot score it.
+        let (state1, source1) = board(1);
+        assert_eq!(
+            issued_decision(&state1, is_loot(source1)).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+        let (g5, g2) = (gap(5), gap(2));
+        let hand_size = config
+            .weights
+            .for_turn(1)
+            .hand_size
+            .min(config.weights.for_turn(30).hand_size);
+        assert!(
+            g2 < g5 - 0.5 * hand_size,
+            "the leaf does not separate the loot to 1 from pass at 2: gap at 5 {g5:.3}, \
+             at 2 {g2:.3} (hand-size weight {hand_size:.3})"
+        );
+    }
+
+    /// The loot's PayCost prompt with nothing left to pay with: the engine
+    /// issues CancelCast alone. Built from the real prompt by clearing its
+    /// choices (the engine's entry check keeps a real game from reaching it).
+    fn jr10_unpayable_cost() -> GameState {
+        let (state, source) = self_draw_table(5, |scenario| {
+            scenario.add_land_to_hand(P0, "Swamp");
+            scenario.add_land_to_hand(P0, "Swamp");
+            scenario
+                .add_artifact_from_oracle(P0, "Loot Volume", JR_LOOT_ORACLE)
+                .id()
+        });
+        let mut stuck = state;
+        engine::game::engine::apply_as_current(
+            &mut stuck,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            },
+        )
+        .expect("the loot is activated");
+        match &mut stuck.waiting_for {
+            WaitingFor::PayCost { choices, .. } => choices.clear(),
+            other => panic!("the loot's discard cost is a PayCost prompt, got {other:?}"),
+        }
+        let issued: Vec<_> = candidate_actions(&stuck)
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .collect();
+        assert_eq!(
+            issued,
+            vec![GameAction::CancelCast],
+            "reach-guard: CancelCast alone"
+        );
+        stuck
+    }
+
+    /// Guard: at the root the engine still issues CancelCast at the loot's
+    /// PayCost prompt; the root scores the payments (the gate's CancelCast
+    /// reject, unchanged), and with nothing to pay the root chooses CancelCast.
+    #[test]
+    fn jr10_cancel_cast_stays_a_root_candidate() {
+        let (state, source) = self_draw_table(5, |scenario| {
+            scenario.add_land_to_hand(P0, "Swamp");
+            scenario.add_land_to_hand(P0, "Swamp");
+            scenario
+                .add_artifact_from_oracle(P0, "Loot Volume", JR_LOOT_ORACLE)
+                .id()
+        });
+        let mut prompt = state;
+        engine::game::engine::apply_as_current(
+            &mut prompt,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            },
+        )
+        .expect("the loot is activated");
+        assert!(
+            candidate_actions(&prompt)
+                .iter()
+                .any(|candidate| matches!(candidate.action, GameAction::CancelCast)),
+            "the engine issues CancelCast at the root's PayCost prompt"
+        );
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let scored = crate::search::score_candidates(&prompt, P0, &config);
+        assert_eq!(scored.len(), 2, "both discards scored: {scored:?}");
+        assert!(scored
+            .iter()
+            .all(|(action, _)| matches!(action, GameAction::SelectCards { .. })));
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+        assert_eq!(
+            crate::search::choose_action(&jr10_unpayable_cost(), P0, &config, &mut rng),
+            Some(GameAction::CancelCast),
+            "with nothing to pay, the root withdraws the activation"
+        );
+    }
+
+    /// Guard: an interior node whose only candidate is CancelCast (a cost the
+    /// AI cannot pay) still resolves: the search keeps the engine's escape
+    /// there and returns a finite, non-terminal value.
+    #[test]
+    fn jr10_an_unpayable_cost_still_resolves_in_the_search() {
+        let stuck = jr10_unpayable_cost();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = crate::policies::PolicyRegistry::default();
+        let planner = crate::planner::BeamContinuationPlanner {
+            depth: 1,
+            rollout_depth: 1,
+        };
+        let mut services = crate::planner::PlannerServices::new_default(P0, &config, &policies);
+        let mut budget = crate::planner::SearchBudget::new(100_000);
+        let value = planner.search_value(
+            &stuck,
+            1,
+            0,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            &mut services,
+            &mut budget,
+        );
+        assert!(
+            value.is_finite() && value.abs() < 1000.0,
+            "the search resolves past the unpayable cost, got {value}"
         );
     }
 
