@@ -829,7 +829,7 @@ fn slot_is_beneficial(
 /// merely follows the target wherever it lands (Beast Within's "its controller
 /// creates a 3/3", which gifts the token to whoever controlled the destroyed
 /// permanent) can never buy an exemption.
-fn is_deliberate_self_target_rider(effect: &&Effect) -> bool {
+pub(crate) fn is_deliberate_self_target_rider(effect: &&Effect) -> bool {
     // A bounce whose filter can legally reach anyone is a value play on one's
     // own permanent (re-buy an ETB, rescue it in response to removal).
     // `score_pre_cast` excludes `Effect::Bounce` from its harmful-target class
