@@ -39,8 +39,9 @@ use engine::game::triggers::{
 };
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    ContinuousModification, CostCategory, Effect, PlayerFilter, PtValue, QuantityExpr,
-    ResolvedAbility, TargetFilter, TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
+    ContinuousModification, ControllerRef, CostCategory, Effect, PlayerFilter, PtValue,
+    QuantityExpr, ResolvedAbility, TargetFilter, TargetRef, TargetSelectionMode, TypeFilter,
+    TypedFilter,
 };
 use engine::types::ability_visit::visit_ability_def;
 use engine::types::actions::GameAction;
@@ -394,10 +395,14 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
 }
 
 /// CR 700.2a + CR 601.2b: at the mode choice of a spell the AI is casting, a
-/// mode choice is pruned when any mode it selects gets the per-mode verdict
-/// `Reject` from `assess_cast_effects`, the same reading that kept the cast
-/// for another mode. It is pruned only while another issued mode choice
-/// passes that reading, so the announced cast always keeps a continuation.
+/// mode choice is pruned when any mode it selects aims a harmful effect only at
+/// the AI's own permanents (`harmful_target_reaches_only_own_permanents`, the
+/// rule `assess_cast_effects` applies to that mode at the cast). Timing
+/// verdicts (the pump window, the -X/-X kill test) are not applied here: the
+/// spell is already announced, so there is no later window to wait for.
+/// Counter modes are judged after this by `assess_counter_announcement`. A
+/// choice is pruned only while another issued mode choice passes, so the
+/// announced cast always keeps a continuation.
 fn spell_mode_choice_is_futile(ctx: &PolicyContext<'_>, indices: &[usize]) -> bool {
     let casting_own_spell = matches!(
         &ctx.decision.waiting_for,
@@ -431,10 +436,7 @@ fn spell_mode_choice_is_futile(ctx: &PolicyContext<'_>, indices: &[usize]) -> bo
 fn selected_modes_have_a_futile_mode(ctx: &PolicyContext<'_>, indices: &[usize]) -> bool {
     selected_mode_abilities(ctx.state, &ctx.decision.waiting_for, indices)
         .into_iter()
-        .any(|definition| {
-            let effects = crate::cast_facts::collect_definition_effects(definition);
-            assess_cast_effects(ctx, &effects, &[definition]) == GateDecision::Reject
-        })
+        .any(|definition| harmful_target_reaches_only_own_permanents(ctx, &[definition]))
 }
 
 /// CR 701.6a + CR 115.1: one mode of a modal spell that is a plain counter is
@@ -532,16 +534,22 @@ fn assess_cast_effects(
         return GateDecision::Allow;
     }
 
-    // Overlaps the own-permanent rule below on creature-only harm with only
-    // own targets. It stays as its own check because it is wider elsewhere:
-    // it also applies to activations, and it rejects when the only opposing
-    // creatures are already dying to the stack.
-    if is_redundant_creature_only_removal(ctx, effects) {
-        return GateDecision::Reject;
-    }
-
-    if harmful_target_reaches_only_own_permanents(ctx, spell_abilities) {
-        return GateDecision::Reject;
+    // Which check decides: for a spell, the own-permanent rule's stand-downs
+    // (`own_target_rule_stands_down`: a bounce or flicker rider, a mass effect,
+    // a slot that names the caster's own permanents, an untargeted part lethal
+    // to an opponent) come first and keep the cast away from both checks.
+    // Past them, `is_redundant_creature_only_removal` decides creature-only
+    // harm (and, for spells and activations alike, also rejects when the only
+    // opposing creatures are already dying to the stack), and the own-permanent
+    // rule decides every other filter and harm read on the target. An
+    // activation has no spell reading, so only the creature-only check applies.
+    if !own_target_rule_stands_down(ctx, spell_abilities) {
+        if is_redundant_creature_only_removal(ctx, effects) {
+            return GateDecision::Reject;
+        }
+        if harmful_target_reaches_only_own_permanents(ctx, spell_abilities) {
+            return GateDecision::Reject;
+        }
     }
 
     if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(effects) {
@@ -1985,14 +1993,11 @@ fn target_choice_penalty(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
 /// creature-only filter and a polarity label: an exile of "target creature or
 /// planeswalker" and a base 0/0 setter both count, a +1/+1 counter does not.
 ///
-/// It stands down (the cast stays a candidate) when a reading's target slot
-/// may be left empty ("up to one", "you may"); when any legal target is a
-/// player, a card off the battlefield, or another player's object; when there
-/// is no legal target at all (a whiff, priced by `AntiSelfHarm`); when the
-/// reading carries a deliberate self-target rider (bounce, flicker) or a mass
-/// effect, whose untargeted population is a line of its own (CR 115.10a); and
-/// when an untargeted damage effect of the same reading is lethal to an
-/// opponent (CR 120.3a + CR 704.5a: Extended Absence with its drain at 1 life).
+/// A link stands down when its target slot may be left empty ("up to one",
+/// "you may"), when any legal target is a player, a card off the battlefield,
+/// or another player's object, or when there is no legal target at all (a
+/// whiff, priced by `AntiSelfHarm`). The whole reading stands down on
+/// `own_target_rule_stands_down`.
 fn harmful_target_reaches_only_own_permanents(
     ctx: &PolicyContext<'_>,
     spell_abilities: &[&AbilityDefinition],
@@ -2000,19 +2005,56 @@ fn harmful_target_reaches_only_own_permanents(
     let Some(source) = ctx.source_object() else {
         return false;
     };
+    if own_target_rule_stands_down(ctx, spell_abilities) {
+        return false;
+    }
+    spell_links(spell_abilities)
+        .iter()
+        .any(|node| harmful_node_reaches_only_own_permanents(ctx, source.id, node))
+}
+
+/// The spell reading keeps the cast whatever its targets: it carries a
+/// deliberate self-target rider (bounce, flicker); a mass effect, whose
+/// untargeted population is a line of its own (CR 115.10a); a slot whose own
+/// filter names the caster's permanents ("target land you control"), which
+/// asks for an own permanent by design (CR 115.1a); or an untargeted part
+/// lethal to an opponent (CR 120.3a + CR 119.3 + CR 704.5a: Extended Absence
+/// with its drain at 1 life). No spell reading (an activation) never stands down.
+fn own_target_rule_stands_down(
+    ctx: &PolicyContext<'_>,
+    spell_abilities: &[&AbilityDefinition],
+) -> bool {
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let nodes = spell_links(spell_abilities);
+    nodes.iter().any(|node| {
+        is_deliberate_self_target_rider(&node.effect.as_ref())
+            || is_mass_effect(&node.effect)
+            || extract_target_filter(&node.effect).is_some_and(filter_names_only_own_permanents)
+    }) || untargeted_part_is_lethal_to_an_opponent(ctx, source.id, &nodes)
+}
+
+fn spell_links<'a>(spell_abilities: &[&'a AbilityDefinition]) -> Vec<&'a AbilityDefinition> {
     let mut nodes = Vec::new();
     for ability in spell_abilities {
         push_definition_chain(&mut nodes, ability);
     }
-    if nodes.iter().any(|node| {
-        is_deliberate_self_target_rider(&node.effect.as_ref()) || is_mass_effect(&node.effect)
-    }) || untargeted_damage_is_lethal_to_an_opponent(ctx, source.id, &nodes)
-    {
-        return false;
-    }
     nodes
-        .iter()
-        .any(|node| harmful_node_reaches_only_own_permanents(ctx, source.id, node))
+}
+
+/// CR 109.4 + CR 115.1a: a filter that admits only permanents the caster
+/// controls ("target permanent you control"): a `You` controller on a typed
+/// leg, on any leg of an intersection, or on every leg of a union.
+fn filter_names_only_own_permanents(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => matches!(typed.controller, Some(ControllerRef::You)),
+        TargetFilter::And { filters } => filters.iter().any(filter_names_only_own_permanents),
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(filter_names_only_own_permanents)
+        }
+        _ => false,
+    }
 }
 
 /// An ability definition and every link of its chain (`sub_ability`, and the
@@ -2086,21 +2128,34 @@ fn harmful_node_reaches_only_own_permanents(
         })
 }
 
-/// CR 120.3a + CR 704.5a: damage dealt to each opponent by the reading's own
-/// untargeted effect brings some opponent to 0 or less life. An amount that
-/// cannot be resolved here counts as lethal (fail open).
-fn untargeted_damage_is_lethal_to_an_opponent(
+/// CR 120.3a + CR 119.3 + CR 704.5a: damage dealt to, or life lost by, each
+/// opponent through the reading's own untargeted effect brings some opponent to
+/// 0 or less life: "deals N damage to each opponent" (`DamageEachPlayer`) or
+/// "each opponent loses N life" (`LoseLife` with no target, scoped to the
+/// opponents by the link's `player_scope`). An amount that cannot be resolved
+/// here counts as lethal (fail open).
+fn untargeted_part_is_lethal_to_an_opponent(
     ctx: &PolicyContext<'_>,
     source_id: ObjectId,
     nodes: &[&AbilityDefinition],
 ) -> bool {
     nodes.iter().any(|node| {
-        let Effect::DamageEachPlayer {
-            amount,
-            player_filter,
-        } = node.effect.as_ref()
-        else {
-            return false;
+        let (amount, player_filter) = match (node.effect.as_ref(), &node.player_scope) {
+            (
+                Effect::DamageEachPlayer {
+                    amount,
+                    player_filter,
+                },
+                _,
+            ) => (amount, player_filter),
+            (
+                Effect::LoseLife {
+                    amount,
+                    target: None,
+                },
+                Some(scope),
+            ) => (amount, scope),
+            _ => return false,
         };
         if matches!(player_filter, PlayerFilter::Controller) {
             return false;
