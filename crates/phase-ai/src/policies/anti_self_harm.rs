@@ -840,13 +840,11 @@ impl SelfDrawExposure {
     }
 }
 
-/// `None` unless the candidate casts a permanent with a recurring mandatory
-/// "you draw" trigger whose draws would be delivered.
+/// `None` unless the candidate casts (by any cast action,
+/// `PolicyContext::cast_source_object`) a permanent with a recurring
+/// mandatory "you draw" trigger whose draws would be delivered.
 fn self_draw_exposure(ctx: &PolicyContext<'_>) -> Option<SelfDrawExposure> {
-    let GameAction::CastSpell { .. } = &ctx.candidate.action else {
-        return None;
-    };
-    let source = ctx.source_object()?;
+    let source = ctx.cast_source_object()?;
     recurring_self_draw_exposure(ctx.state, source, ctx.ai_player)
 }
 
