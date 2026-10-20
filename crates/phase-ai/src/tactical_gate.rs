@@ -23,7 +23,7 @@ use engine::game::functioning_abilities::{
     active_replacements, active_trigger_definitions, battlefield_active_triggers,
     game_active_statics, game_functioning_statics,
 };
-use engine::game::players::is_opponent;
+use engine::game::players::{is_opponent, opponents};
 use engine::game::quantity::{
     ability_definition_has_only_unbound_variable_quantities_for_pre_cast,
     ability_definition_is_cast_stable_for_pre_cast, additional_cost_is_cast_stable_for_pre_cast,
@@ -39,8 +39,8 @@ use engine::game::triggers::{
 };
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    ContinuousModification, CostCategory, Effect, PtValue, ResolvedAbility, TargetFilter,
-    TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
+    ContinuousModification, CostCategory, Effect, PlayerFilter, PtValue, QuantityExpr,
+    ResolvedAbility, TargetFilter, TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use engine::types::ability_visit::visit_ability_def;
 use engine::types::actions::GameAction;
@@ -63,11 +63,12 @@ use crate::combat_ai::is_lethal_attack_available;
 use crate::config::AiConfig;
 use crate::context::AiContext;
 use crate::planner::PreparedCandidate;
+use crate::policies::anti_self_harm::is_deliberate_self_target_rider;
 use crate::policies::context::{
-    collect_ability_effects, collect_resolved_abilities, PolicyContext,
+    collect_ability_effects, collect_resolved_abilities, selected_mode_abilities, PolicyContext,
 };
 use crate::policies::effect_classify::{
-    effect_polarity, extract_target_filter, targets_creatures_only, EffectPolarity,
+    effect_polarity, extract_target_filter, object_impact, targets_creatures_only, EffectPolarity,
 };
 use crate::policies::removal_lethality::toughness_reduction_is_lethal;
 use crate::policies::stack_awareness::{has_pending_removal, will_target_die_from_stack};
@@ -214,6 +215,9 @@ pub(crate) fn gate_prepared_candidates(
 fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
     match &ctx.candidate.action {
         GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => assess_pre_cast(ctx),
+        GameAction::SelectModes { indices } if spell_mode_choice_is_futile(ctx, indices) => {
+            GateDecision::Reject
+        }
         GameAction::ChooseX { .. } | GameAction::SelectModes { .. } => {
             assess_counter_announcement(ctx).unwrap_or(GateDecision::Allow)
         }
@@ -372,11 +376,65 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
             if counter_mode_reaches_nothing_foreign(ctx, definition, effects) {
                 GateDecision::Reject
             } else {
-                assess_cast_effects(ctx, effects)
+                assess_cast_effects(ctx, effects, &[*definition])
             }
         }));
     }
-    assess_cast_effects(ctx, &ctx.effects())
+    // A modal spell reaches here only through the flattened fallback, whose
+    // abilities are every mode at once: no spell-kind reading for it.
+    let spell_abilities: Vec<&AbilityDefinition> = match &ctx.candidate.action {
+        GameAction::CastSpell { .. } => ctx
+            .source_object()
+            .filter(|source| source.modal.is_none())
+            .map(|source| modal_spell_mode_ability_refs(source).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    assess_cast_effects(ctx, &ctx.effects(), &spell_abilities)
+}
+
+/// CR 700.2a + CR 601.2b: at the mode choice of a spell the AI is casting, a
+/// mode choice is pruned when any mode it selects gets the per-mode verdict
+/// `Reject` from `assess_cast_effects`, the same reading that kept the cast
+/// for another mode. It is pruned only while another issued mode choice
+/// passes that reading, so the announced cast always keeps a continuation.
+fn spell_mode_choice_is_futile(ctx: &PolicyContext<'_>, indices: &[usize]) -> bool {
+    let casting_own_spell = matches!(
+        &ctx.decision.waiting_for,
+        WaitingFor::ModeChoice { pending_cast, .. }
+            if pending_cast.ability.controller == ctx.ai_player
+    );
+    if !casting_own_spell || !selected_modes_have_a_futile_mode(ctx, indices) {
+        return false;
+    }
+    ctx.decision.candidates.iter().any(|sibling| {
+        let GameAction::SelectModes { indices: other } = &sibling.action else {
+            return false;
+        };
+        other.as_slice() != indices
+            && !selected_modes_have_a_futile_mode(
+                &PolicyContext {
+                    state: ctx.state,
+                    decision: ctx.decision,
+                    candidate: sibling,
+                    ai_player: ctx.ai_player,
+                    config: ctx.config,
+                    context: ctx.context,
+                    cast_facts: None,
+                    search_depth: ctx.search_depth,
+                },
+                other,
+            )
+    })
+}
+
+fn selected_modes_have_a_futile_mode(ctx: &PolicyContext<'_>, indices: &[usize]) -> bool {
+    selected_mode_abilities(ctx.state, &ctx.decision.waiting_for, indices)
+        .into_iter()
+        .any(|definition| {
+            let effects = crate::cast_facts::collect_definition_effects(definition);
+            assess_cast_effects(ctx, &effects, &[definition]) == GateDecision::Reject
+        })
 }
 
 /// CR 701.6a + CR 115.1: one mode of a modal spell that is a plain counter is
@@ -461,12 +519,28 @@ fn best_mode_decision(decisions: impl Iterator<Item = GateDecision>) -> GateDeci
 
 /// Effect-level futility checks for one cast or activation reading: the whole
 /// effect list of a non-modal candidate, or one mode of a modal spell.
-fn assess_cast_effects(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> GateDecision {
+/// `spell_abilities` are the spell-kind abilities that reading resolves (the
+/// mode's own ability for a modal spell, every spell ability of a non-modal
+/// one, none for an activation); the own-permanent rule reads only those, so a
+/// permanent spell is never judged by its activated abilities.
+fn assess_cast_effects(
+    ctx: &PolicyContext<'_>,
+    effects: &[&Effect],
+    spell_abilities: &[&AbilityDefinition],
+) -> GateDecision {
     if effects.is_empty() {
         return GateDecision::Allow;
     }
 
+    // Overlaps the own-permanent rule below on creature-only harm with only
+    // own targets. It stays as its own check because it is wider elsewhere:
+    // it also applies to activations, and it rejects when the only opposing
+    // creatures are already dying to the stack.
     if is_redundant_creature_only_removal(ctx, effects) {
+        return GateDecision::Reject;
+    }
+
+    if harmful_target_reaches_only_own_permanents(ctx, spell_abilities) {
         return GateDecision::Reject;
     }
 
@@ -1900,6 +1974,147 @@ fn target_choice_penalty(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
     } else {
         0.0
     }
+}
+
+/// CR 115.1a + CR 601.2c: a spell, or one mode of a modal spell, is futile when
+/// one of its targeted effects harms its target and every engine-legal target
+/// of that effect is a permanent the AI controls, so the only thing it can do
+/// is damage the AI's own board. Legality is the engine's (`find_legal_targets`
+/// applies hexproof, shroud and protection), and harm is read from what the
+/// effect does to each of those permanents (`object_impact`), not from a
+/// creature-only filter and a polarity label: an exile of "target creature or
+/// planeswalker" and a base 0/0 setter both count, a +1/+1 counter does not.
+///
+/// It stands down (the cast stays a candidate) when a reading's target slot
+/// may be left empty ("up to one", "you may"); when any legal target is a
+/// player, a card off the battlefield, or another player's object; when there
+/// is no legal target at all (a whiff, priced by `AntiSelfHarm`); when the
+/// reading carries a deliberate self-target rider (bounce, flicker) or a mass
+/// effect, whose untargeted population is a line of its own (CR 115.10a); and
+/// when an untargeted damage effect of the same reading is lethal to an
+/// opponent (CR 120.3a + CR 704.5a: Extended Absence with its drain at 1 life).
+fn harmful_target_reaches_only_own_permanents(
+    ctx: &PolicyContext<'_>,
+    spell_abilities: &[&AbilityDefinition],
+) -> bool {
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let mut nodes = Vec::new();
+    for ability in spell_abilities {
+        push_definition_chain(&mut nodes, ability);
+    }
+    if nodes.iter().any(|node| {
+        is_deliberate_self_target_rider(&node.effect.as_ref()) || is_mass_effect(&node.effect)
+    }) || untargeted_damage_is_lethal_to_an_opponent(ctx, source.id, &nodes)
+    {
+        return false;
+    }
+    nodes
+        .iter()
+        .any(|node| harmful_node_reaches_only_own_permanents(ctx, source.id, node))
+}
+
+/// An ability definition and every link of its chain (`sub_ability`, and the
+/// `else_ability` leg, which is a real outcome of the same ability).
+fn push_definition_chain<'a>(
+    nodes: &mut Vec<&'a AbilityDefinition>,
+    ability: &'a AbilityDefinition,
+) {
+    nodes.push(ability);
+    if let Some(sub) = &ability.sub_ability {
+        push_definition_chain(nodes, sub);
+    }
+    if let Some(otherwise) = &ability.else_ability {
+        push_definition_chain(nodes, otherwise);
+    }
+}
+
+/// CR 115.10a: an effect on a whole population, chosen at resolution rather
+/// than targeted.
+fn is_mass_effect(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::DestroyAll { .. }
+            | Effect::DamageAll { .. }
+            | Effect::BounceAll { .. }
+            | Effect::ChangeZoneAll { .. }
+            | Effect::PumpAll { .. }
+    )
+}
+
+/// CR 115.1a + CR 601.2c: one link's target slot, read on its own: it must be
+/// filled, its every legal target is a battlefield permanent the AI controls,
+/// and the link harms each of them.
+fn harmful_node_reaches_only_own_permanents(
+    ctx: &PolicyContext<'_>,
+    source_id: ObjectId,
+    node: &AbilityDefinition,
+) -> bool {
+    // CR 115.1d + CR 608.2d: "up to" a number of targets, an optional target,
+    // or "you may" leaves the AI a way to cast it without touching its own board.
+    let may_choose_no_target = node.optional_targeting
+        || node.optional
+        || node
+            .multi_target
+            .as_ref()
+            .is_some_and(|spec| !matches!(spec.min, QuantityExpr::Fixed { value } if value > 0));
+    if may_choose_no_target {
+        return false;
+    }
+    let Some(filter) = extract_target_filter(&node.effect) else {
+        return false;
+    };
+    if filter.is_context_ref() {
+        return false;
+    }
+    let targets = find_legal_targets(ctx.state, filter, ctx.ai_player, source_id);
+    !targets.is_empty()
+        && targets.iter().all(|target| match target {
+            TargetRef::Object(id) => ctx.state.objects.get(id).is_some_and(|object| {
+                object.zone == Zone::Battlefield
+                    && object.controller == ctx.ai_player
+                    && object_impact(
+                        ctx.state,
+                        Some(ctx.ai_player),
+                        Some(source_id),
+                        &node.effect,
+                        *id,
+                    ) < 0.0
+            }),
+            TargetRef::Player(_) => false,
+        })
+}
+
+/// CR 120.3a + CR 704.5a: damage dealt to each opponent by the reading's own
+/// untargeted effect brings some opponent to 0 or less life. An amount that
+/// cannot be resolved here counts as lethal (fail open).
+fn untargeted_damage_is_lethal_to_an_opponent(
+    ctx: &PolicyContext<'_>,
+    source_id: ObjectId,
+    nodes: &[&AbilityDefinition],
+) -> bool {
+    nodes.iter().any(|node| {
+        let Effect::DamageEachPlayer {
+            amount,
+            player_filter,
+        } = node.effect.as_ref()
+        else {
+            return false;
+        };
+        if matches!(player_filter, PlayerFilter::Controller) {
+            return false;
+        }
+        let Some(damage) =
+            try_resolve_quantity_in_source_context(ctx.state, amount, ctx.ai_player, source_id)
+        else {
+            return true;
+        };
+        opponents(ctx.state, ctx.ai_player).iter().any(|opponent| {
+            let player = &ctx.state.players[opponent.0 as usize];
+            !player.is_eliminated && player.life <= damage
+        })
+    })
 }
 
 fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
@@ -11834,12 +12049,17 @@ mod tests {
 
     /// Class guards that must stay candidates with only the AI's own creature
     /// as a legal target: a +1/+1 counter helps its target; exiling a card
-    /// from the AI's own graveyard is not harm to a permanent; and a creature
-    /// spell is not judged by its activated ability ("{T}: Exile target
-    /// creature or planeswalker").
+    /// from the AI's own graveyard is not harm to a permanent; "up to one"
+    /// target may be cast with none (CR 115.1d); and a creature spell is not
+    /// judged by its activated ability ("{T}: Exile target creature or
+    /// planeswalker").
     #[test]
     fn own_target_class_guards_stay_candidates() {
-        let cases: [(&str, &str); 2] = [
+        let cases: [(&str, &str); 3] = [
+            (
+                "Partial Absence",
+                "Exile up to one target creature or planeswalker. You gain 1 life.",
+            ),
             ("Grow", "Put a +1/+1 counter on target creature."),
             ("Graveyard Exile", "Exile target card from a graveyard."),
         ];

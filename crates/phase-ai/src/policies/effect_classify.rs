@@ -1498,16 +1498,74 @@ pub(crate) fn targeted_object_impact(ctx: &PolicyContext<'_>, object_id: ObjectI
     for effect in ctx.effects() {
         if effect_targets_object(ctx, effect, object_id) {
             found_targeted_effect = true;
-            impact += player_impact(
-                Some(ctx.state),
+            impact += object_impact(
+                ctx.state,
                 ctx.source_object().map(|object| object.controller),
                 Some(effect_source_id(ctx)),
                 effect,
+                object_id,
             );
         }
     }
 
     found_targeted_effect.then_some(impact)
+}
+
+/// What `effect` does to the object `object_id` it lands on, on
+/// `player_impact`'s scale. An effect whose polarity label is `Contextual`
+/// because its direction depends on the object (a base power/toughness setter)
+/// is read against that object; every other effect by its player impact.
+pub(crate) fn object_impact(
+    state: &GameState,
+    source_controller: Option<PlayerId>,
+    source_id: Option<ObjectId>,
+    effect: &Effect,
+    object_id: ObjectId,
+) -> f64 {
+    let target_relative = matches!(effect_polarity(effect), EffectPolarity::Contextual)
+        .then(|| state.objects.get(&object_id))
+        .flatten()
+        .and_then(|object| base_pt_setter_impact(effect, object));
+    target_relative
+        .unwrap_or_else(|| player_impact(Some(state), source_controller, source_id, effect))
+}
+
+/// CR 613.4b: a fixed base power/toughness setter on its target ("target
+/// creature has base power and toughness 0/0") changes that object by the gap
+/// between the set values and its current base (the layer 7a/7b result): a
+/// lower base is harm (-1.0), a higher one benefit (+1.0). `None` when the
+/// effect sets no fixed base power or toughness on its target, or raises one
+/// and lowers the other.
+fn base_pt_setter_impact(effect: &Effect, object: &GameObject) -> Option<f64> {
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = effect
+    else {
+        return None;
+    };
+    let base_power = object.layer_base_power.or(object.base_power)?;
+    let base_toughness = object.layer_base_toughness.or(object.base_toughness)?;
+    let gaps: Vec<i32> = static_abilities
+        .iter()
+        .filter(|definition| {
+            matches!(definition.mode, StaticMode::Continuous)
+                && matches!(definition.affected, Some(TargetFilter::ParentTarget))
+        })
+        .flat_map(|definition| &definition.modifications)
+        .filter_map(|modification| match modification {
+            ContinuousModification::SetPower { value } => Some(value - base_power),
+            ContinuousModification::SetToughness { value } => Some(value - base_toughness),
+            _ => None,
+        })
+        .collect();
+    match (
+        gaps.iter().any(|gap| *gap < 0),
+        gaps.iter().any(|gap| *gap > 0),
+    ) {
+        (true, false) => Some(-1.0),
+        (false, true) => Some(1.0),
+        _ => None,
+    }
 }
 
 pub(crate) fn effect_targets_object(
