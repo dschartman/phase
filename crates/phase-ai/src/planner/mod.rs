@@ -2234,6 +2234,9 @@ mod leaf_eot_judge_rows_tests;
 mod precombat_pump_tests;
 
 #[cfg(test)]
+mod own_trigger_window_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};

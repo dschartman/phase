@@ -135,7 +135,7 @@ fn prowess_credit(phase: Phase, monk: Monk) -> f64 {
 fn j4_precombat_cast_with_a_prowess_attacker_scores_at_least_the_vanilla_cast() {
     let credit = prowess_credit(Phase::PreCombatMain, Monk::Ready);
     assert!(
-        credit >= 0.0,
+        credit >= -1e-9,
         "the prowess cast SHALL score at least as high as the vanilla cast (credit {credit:.3})"
     );
 }
@@ -159,7 +159,7 @@ fn j4_strict_prowess_precombat_cast_is_credited_by_combat() {
 fn postcombat_cast_with_a_prowess_creature_gets_no_damage_credit() {
     let credit = prowess_credit(Phase::PostCombatMain, Monk::Ready);
     assert!(
-        credit <= 1e-9,
+        credit.abs() < 1e-9,
         "no damage credit postcombat (credit {credit:.3})"
     );
 }
@@ -170,7 +170,7 @@ fn postcombat_cast_with_a_prowess_creature_gets_no_damage_credit() {
 fn precombat_cast_with_a_tapped_prowess_creature_gets_no_damage_credit() {
     let credit = prowess_credit(Phase::PreCombatMain, Monk::Tapped);
     assert!(
-        credit <= 1e-9,
+        credit.abs() < 1e-9,
         "no damage credit when tapped (credit {credit:.3})"
     );
 }
@@ -181,7 +181,7 @@ fn precombat_cast_with_a_tapped_prowess_creature_gets_no_damage_credit() {
 fn precombat_cast_with_a_summoning_sick_prowess_creature_gets_no_damage_credit() {
     let credit = prowess_credit(Phase::PreCombatMain, Monk::SummoningSick);
     assert!(
-        credit <= 1e-9,
+        credit.abs() < 1e-9,
         "no damage credit when summoning sick (credit {credit:.3})"
     );
 }
