@@ -401,7 +401,21 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
         })
         .unwrap_or(0.0);
 
-    let effects = ctx.effects();
+    // A cast is judged by what the spell does when it resolves: its spell-kind
+    // abilities ([`action_ability_definitions`]), the same reading as the
+    // no-friendly-recipient check. CR 115.1c + CR 602.2b + CR 606.3: a
+    // permanent's activated and loyalty abilities declare their targets later,
+    // each when it is activated by its own action, so The Theorist's [-2]
+    // bounce or Royal Assassin's {T} Destroy with nothing to hit today is no
+    // reason to hold the card. An activation keeps `ctx.effects()`, which
+    // reads only the announced ability's root mode (CR 700.2a).
+    let effects: Vec<&Effect> = match &ctx.candidate.action {
+        GameAction::CastSpell { .. } => action_ability_definitions(ctx)
+            .into_iter()
+            .flat_map(collect_definition_effects)
+            .collect(),
+        _ => ctx.effects(),
+    };
 
     // A `ChangeZone` onto the battlefield draws its target from the library,
     // graveyard, hand or exile — never from our own battlefield — so the
@@ -666,6 +680,7 @@ fn etb_trigger_has_valid_targets(
         _ => return true, // Not a cast action — assume valid
     };
 
+    let mut declares_a_target = false;
     for trigger in &facts.immediate_etb_triggers {
         let Some(execute) = &trigger.execute else {
             continue;
@@ -679,6 +694,18 @@ fn etb_trigger_has_valid_targets(
         let mut node = Some(execute.as_ref());
         while let Some(def) = node {
             if let Some(filter) = extract_target_filter(&def.effect) {
+                // CR 115.10a + CR 303.4b + CR 301.5a: "enchanted creature" and
+                // "equipped creature" name the object the source is attached
+                // to, not a target. At cast time nothing is attached yet, so
+                // the filter matches nothing, and that is no whiff: Infinite
+                // Coursework's "tap enchanted creature" taps whatever its
+                // Enchant target became (CR 303.4a; the Aura branch of
+                // `score_pre_cast` checks that target).
+                if filter.contains_source_attachment_host() {
+                    node = def.sub_ability.as_deref();
+                    continue;
+                }
+                declares_a_target |= !filter.is_context_ref();
                 if !find_legal_targets(ctx.state, filter, ctx.ai_player, source_id).is_empty() {
                     return true;
                 }
@@ -687,7 +714,8 @@ fn etb_trigger_has_valid_targets(
         }
     }
 
-    false
+    // CR 115.1d: a trigger that declares no target cannot whiff on one.
+    !declares_a_target
 }
 
 fn has_opponent_bounce_target(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
