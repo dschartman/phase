@@ -13931,7 +13931,7 @@ mod tests {
     /// and P0 loses; the gate should read the board condition and reject it
     /// as a draw past the library. The lower bound counts one (a draw to 0).
     #[test]
-    #[ignore = "S5: needs a pub engine predicate evaluating an AbilityCondition for a prospective cast (queued with draw_prohibited); the gate reads a board-conditioned instead leg as the fewer draw"]
+    #[ignore = "S5: the gate reads a board-conditioned instead leg as the fewer draw; at library 1 it already rejects (DecksOutBeforeOwnDraw), so the queued engine condition predicate fixes the reason label here and the real miss at library 2 (two draws from two, kept)"]
     fn jr3_state_conditioned_instead_with_an_artifact_draws_past_the_library() {
         let (state, spell) = self_draw_table(1, |scenario| {
             scenario.add_artifact_from_oracle(P0, "Trinket", "");
@@ -14045,5 +14045,108 @@ mod tests {
             issued_cast_decision(&state2, spell).reject_reason(),
             Some(RejectReason::DecksOutBeforeOwnDraw)
         );
+    }
+
+    // --- judge rows (782e5f146): the win-first exception is a win ----------
+    //
+    // A draw to 0 is kept only when the same resolution's untargeted drain,
+    // at a resolved amount, brings every opponent still in the game to 0 or
+    // less and leaves the AI above 0 (CR 104.2a + CR 104.4a + CR 704.5a).
+
+    /// P0 with four Islands and one card in library in a `players`-player
+    /// game, every other player with 25; `setup` sets life totals.
+    fn jg_drain_scenario(players: u8, setup: impl FnOnce(&mut GameScenario)) -> GameScenario {
+        let mut scenario = GameScenario::new_n_player(players, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..4 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
+        }
+        scenario.add_land_to_library_top(P0, "Island");
+        for p in 1..players {
+            for _ in 0..25 {
+                scenario.add_land_to_library_top(PlayerId(p), "Plains");
+            }
+        }
+        setup(&mut scenario);
+        scenario
+    }
+
+    /// The gate's verdict on casting `oracle`, and the engine's state after
+    /// it resolves.
+    fn jg_drain_verdict_and_outcome(
+        players: u8,
+        oracle: &'static str,
+        setup: impl Fn(&mut GameScenario),
+    ) -> (Option<RejectReason>, GameState) {
+        let mut scenario = jg_drain_scenario(players, &setup);
+        let spell = sorcery_in_hand(oracle)(&mut scenario);
+        let state = scenario.build().state().clone();
+        let verdict = issued_cast_decision(&state, spell).reject_reason();
+        let mut scenario = jg_drain_scenario(players, &setup);
+        let spell = sorcery_in_hand(oracle)(&mut scenario);
+        let mut runner = scenario.build();
+        let _commit = runner.cast(spell).commit();
+        runner.resolve_top();
+        (verdict, runner.state().clone())
+    }
+
+    /// JG7: three players; the drain kills P1 (at 2) and not P2 (at 20). The
+    /// game goes on with the AI at library 0: no win.
+    #[test]
+    fn jg7_a_drain_lethal_to_one_opponent_of_two_is_no_win() {
+        let (verdict, after) =
+            jg_drain_verdict_and_outcome(3, "Draw a card. Each opponent loses 2 life.", |s| {
+                s.with_life(P1, 2);
+            });
+        assert!(
+            after.players[1].is_eliminated && !after.players[2].is_eliminated,
+            "engine truth: P1 out, P2 in"
+        );
+        assert!(!matches!(after.waiting_for, WaitingFor::GameOver { .. }));
+        assert_eq!(after.players[0].library.len(), 0);
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
+    }
+
+    /// JG8: "each player loses 2 life" with both at 2: the AI dies too, and
+    /// the engine ends the game as a draw (CR 104.4a).
+    #[test]
+    fn jg8_a_drain_that_also_kills_the_ai_is_no_win() {
+        let (verdict, after) =
+            jg_drain_verdict_and_outcome(2, "Draw a card. Each player loses 2 life.", |s| {
+                s.with_life(P0, 2);
+                s.with_life(P1, 2);
+            });
+        assert_eq!(after.waiting_for, WaitingFor::GameOver { winner: None });
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
+    }
+
+    /// Guard (judge S5): more draws than the library with a lethal drain is
+    /// still a draw past the library: both losses are state-based and checked
+    /// at once (CR 104.4a), so it is no win.
+    #[test]
+    fn a_draw_past_the_library_with_a_lethal_drain_is_still_drawing_past_the_library() {
+        let (state, spell) = self_draw_table(1, |scenario| {
+            scenario.with_life(P1, 2);
+            sorcery_in_hand("Draw two cards. Each opponent loses 2 life.")(scenario)
+        });
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// Judge S6: the recurring reading reads every cast action. The Theorist
+    /// cast for free (or by any other cast action) at library 1 decks before
+    /// the AI's own draw, as `CastSpell` does (JR9).
+    #[test]
+    fn every_cast_action_reads_the_recurring_self_draw() {
+        let (state, theorist) = self_draw_table(1, theorist_in_hand);
+        for action in other_cast_actions(&state, theorist) {
+            assert_eq!(
+                constructed_cast_decision(&state, action.clone()).reject_reason(),
+                Some(RejectReason::DecksOutBeforeOwnDraw),
+                "{action:?}"
+            );
+        }
     }
 }
