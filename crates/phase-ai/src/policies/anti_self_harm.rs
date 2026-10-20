@@ -3722,6 +3722,300 @@ mod tests {
         );
     }
 
+    // --- pre-cast whiff penalty: only targets the cast declares ------------
+    //
+    // CR 115.1 + CR 601.2c: a spell's targets are declared as it is cast, and
+    // an Aura spell's only target is the one its enchant keyword defines
+    // (CR 115.1b + CR 303.4a). CR 115.1c + CR 602.2b + CR 606.3: a permanent's
+    // activated and loyalty abilities declare their targets later, each when
+    // it is activated by its own action. CR 115.1d + CR 603.3d: an ETB trigger
+    // declares its targets as it goes on the stack. CR 115.10a + CR 303.4b:
+    // "enchanted creature" is the object the Aura is attached to, not a target.
+    //
+    // FRA sealed, seeds 1000-1039 at 520bbe69d
+    // (`deck-builder/sims/fra-phase/2026-10-19-value/investigation-held-castable.md`):
+    // the pre-cast score charged The Theorist a whole wasted cast for its [-2]
+    // bounce with nothing to bounce, and Infinite Coursework a whole wasted cast
+    // for "tap enchanted creature" while nothing is enchanted yet.
+
+    const THE_THEORIST_ORACLE: &str =
+        "At the beginning of each opponent's draw step, you draw a card.\n\
+         [+1]: Create a 1/1 blue Illusion creature token.\n\
+         [\u{2212}2]: For each opponent, return up to one target artifact or creature that player \
+         controls to its owner's hand.\n\
+         [\u{2212}6]: Draw three cards. Then put X +1/+1 counters on each creature you control, \
+         where X is the number of cards in your hand.";
+
+    const INFINITE_COURSEWORK_ORACLE: &str =
+        "Enchant creature\nWhen this Aura enters, tap enchanted creature. It becomes \
+         unprepared.\nEnchanted creature loses all abilities and doesn't untap during its \
+         controller's untap step.";
+
+    const RAVENOUS_CHUPACABRA_ORACLE: &str =
+        "When this creature enters, destroy target creature an opponent controls.";
+
+    const MEMORY_TRAP_ORACLE: &str =
+        "When this enchantment enters, exile target nonland permanent an opponent controls \
+         until this enchantment leaves the battlefield.";
+
+    const ROYAL_ASSASSIN_ORACLE: &str = "{T}: Destroy target tapped creature.";
+
+    const LAST_GASP_ORACLE: &str = "Target creature gets -3/-3 until end of turn.";
+
+    fn mana(shards: &[ManaCostShard], generic: u32) -> ManaCost {
+        ManaCost::Cost {
+            shards: shards.to_vec(),
+            generic,
+        }
+    }
+
+    /// The AI (P0) on its own precombat main with priority and five untapped
+    /// basics (two Islands, two Swamps, a Plains), enough for every card below
+    /// at its printed cost. The opponent has two Plains and, when asked, an
+    /// untapped vanilla 3/3: no other creature or artifact.
+    fn precast_table(opposing_creature: bool) -> engine::game::scenario::GameScenario {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for color in [
+            ManaColor::Blue,
+            ManaColor::Blue,
+            ManaColor::Black,
+            ManaColor::Black,
+            ManaColor::White,
+        ] {
+            scenario.add_basic_land(P0, color);
+        }
+        scenario.add_basic_land(P1, ManaColor::White);
+        scenario.add_basic_land(P1, ManaColor::White);
+        if opposing_creature {
+            scenario.add_vanilla(P1, 3, 3);
+        }
+        scenario
+    }
+
+    /// `score_pre_cast` for the engine-offered cast of `spell` (the cast
+    /// facts computed from the live state, as the registry does).
+    fn pre_cast_score(state: &GameState, spell: ObjectId) -> f64 {
+        let candidate = engine::ai_support::candidate_actions(state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == spell)
+            })
+            .unwrap_or_else(|| panic!("the engine must offer the cast of {spell:?}"));
+        let config = AiConfig::default();
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: engine::ai_support::candidate_actions(state),
+        };
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        score_pre_cast(&ctx)
+    }
+
+    fn wasted_cast_penalty() -> f64 {
+        AiConfig::default().policy_penalties.wasted_cast_penalty
+    }
+
+    fn the_theorist_on(table: &mut engine::game::scenario::GameScenario) -> ObjectId {
+        let mut builder = table.add_spell_to_hand(PlayerId(0), "The Theorist, Jace Beleren", false);
+        builder
+            .from_oracle_text(THE_THEORIST_ORACLE)
+            .as_planeswalker_with_loyalty("Jace", 3)
+            .as_legendary()
+            .with_mana_cost(mana(&[ManaCostShard::Blue, ManaCostShard::Blue], 2))
+            .id()
+    }
+
+    fn infinite_coursework_on(table: &mut engine::game::scenario::GameScenario) -> ObjectId {
+        let mut builder = table.add_spell_to_hand(PlayerId(0), "Infinite Coursework", false);
+        builder.as_enchantment();
+        builder.with_subtypes(vec!["Aura"]);
+        builder
+            .from_oracle_text_with_keywords(&["Enchant"], INFINITE_COURSEWORK_ORACLE)
+            .with_mana_cost(mana(&[ManaCostShard::Blue], 2))
+            .id()
+    }
+
+    /// The [-2] is a loyalty ability: it declares its "up to one target
+    /// artifact or creature" only when activated, on a later action
+    /// (CR 606.3 + CR 115.1c). Casting The Theorist declares no target, so an
+    /// empty opposing board is no reason to charge the cast a wasted card.
+    #[test]
+    fn the_theorist_cast_carries_no_whiff_for_its_loyalty_bounce() {
+        let mut table = precast_table(false);
+        let theorist = the_theorist_on(&mut table);
+        let state = table.build().state().clone();
+        assert!(
+            state.objects[&theorist]
+                .abilities
+                .iter()
+                .any(|ability| matches!(*ability.effect, Effect::Bounce { .. })),
+            "the fixture must carry the [-2] bounce it is about"
+        );
+
+        let score = pre_cast_score(&state, theorist);
+        assert_eq!(
+            score, 0.0,
+            "The Theorist with no opposing creature or artifact carries no pre-cast whiff \
+             penalty; got {score}"
+        );
+    }
+
+    /// Infinite Coursework's ETB taps "enchanted creature": the creature it
+    /// is attached to, not a target (CR 115.10a + CR 303.4b). At cast time
+    /// nothing is enchanted yet; the Aura's real target is its Enchant
+    /// creature (CR 303.4a), and the opponent's 3/3 is a legal one.
+    #[test]
+    fn infinite_coursework_cast_facing_a_creature_carries_no_etb_whiff() {
+        let mut table = precast_table(true);
+        let coursework = infinite_coursework_on(&mut table);
+        let state = table.build().state().clone();
+        assert!(
+            !state.objects[&coursework].trigger_definitions.is_empty(),
+            "the fixture must carry the ETB trigger it is about"
+        );
+
+        let score = pre_cast_score(&state, coursework);
+        assert_eq!(
+            score, 0.0,
+            "Infinite Coursework with an opposing creature to enchant carries no pre-cast whiff \
+             penalty; got {score}"
+        );
+    }
+
+    /// Guard: with no opposing creature, the Aura's only legal targets are the
+    /// AI's own creatures (CR 303.4a + CR 601.2c), so the engine offers the
+    /// cast, and the pre-cast score still charges at least one wasted cast
+    /// for a harmful Aura with no opposing creature to enchant (seed 1012 T32
+    /// held it correctly).
+    #[test]
+    fn infinite_coursework_with_no_opposing_creature_is_still_penalized() {
+        let mut table = precast_table(false);
+        table.add_vanilla(PlayerId(0), 2, 2);
+        let coursework = infinite_coursework_on(&mut table);
+        let state = table.build().state().clone();
+
+        let score = pre_cast_score(&state, coursework);
+        assert!(
+            score <= wasted_cast_penalty(),
+            "Infinite Coursework with no opposing creature to enchant must still be penalized at \
+             least one wasted cast; got {score}"
+        );
+    }
+
+    /// Guard: a creature whose ETB trigger declares "target creature an
+    /// opponent controls" (CR 115.1d + CR 603.3d) with no such creature still
+    /// wastes its trigger, and the pre-cast score still says so.
+    #[test]
+    fn creature_etb_removal_with_no_opposing_creature_is_still_penalized() {
+        let mut table = precast_table(false);
+        let chupacabra = table
+            .add_creature_to_hand_from_oracle(
+                PlayerId(0),
+                "Ravenous Chupacabra",
+                2,
+                2,
+                RAVENOUS_CHUPACABRA_ORACLE,
+            )
+            .with_mana_cost(mana(&[ManaCostShard::Black, ManaCostShard::Black], 2))
+            .id();
+        let state = table.build().state().clone();
+
+        let score = pre_cast_score(&state, chupacabra);
+        assert_eq!(
+            score,
+            wasted_cast_penalty(),
+            "Ravenous Chupacabra with no opposing creature still carries the ETB whiff penalty"
+        );
+    }
+
+    /// Guard: Memory Trap's ETB declares "target nonland permanent an opponent
+    /// controls"; an opponent with only lands gives it none.
+    #[test]
+    fn enchantment_etb_exile_with_no_opposing_nonland_permanent_is_still_penalized() {
+        let mut table = precast_table(false);
+        let mut builder = table.add_spell_to_hand(PlayerId(0), "Memory Trap", false);
+        builder.as_enchantment();
+        let trap = builder
+            .from_oracle_text(MEMORY_TRAP_ORACLE)
+            .with_mana_cost(mana(&[ManaCostShard::White], 2))
+            .id();
+        let state = table.build().state().clone();
+
+        let score = pre_cast_score(&state, trap);
+        assert_eq!(
+            score,
+            wasted_cast_penalty(),
+            "Memory Trap facing only lands still carries the ETB whiff penalty"
+        );
+    }
+
+    /// Royal Assassin's "{T}: Destroy target tapped creature" is an activated
+    /// ability of the permanent (CR 115.1c + CR 602.2b): it names its target
+    /// when activated, not when the creature is cast. Same class as The
+    /// Theorist's bounce.
+    #[test]
+    fn creature_with_an_activated_removal_ability_carries_no_whiff_when_cast() {
+        let mut table = precast_table(false);
+        let assassin = table
+            .add_creature_to_hand_from_oracle(
+                PlayerId(0),
+                "Royal Assassin",
+                1,
+                1,
+                ROYAL_ASSASSIN_ORACLE,
+            )
+            .with_mana_cost(mana(&[ManaCostShard::Black, ManaCostShard::Black], 1))
+            .id();
+        let state = table.build().state().clone();
+        assert!(
+            state.objects[&assassin]
+                .abilities
+                .iter()
+                .any(|ability| ability.kind == AbilityKind::Activated
+                    && matches!(*ability.effect, Effect::Destroy { .. })),
+            "the fixture must carry the activated Destroy it is about"
+        );
+
+        let score = pre_cast_score(&state, assassin);
+        assert_eq!(
+            score, 0.0,
+            "Royal Assassin with no opposing creature carries no pre-cast whiff penalty; got \
+             {score}"
+        );
+    }
+
+    /// Guard: an instant's own "target creature" is declared as it is cast
+    /// (CR 115.1a + CR 601.2c), so a removal instant whose only legal target
+    /// is the AI's own creature still charges the wasted cast.
+    #[test]
+    fn removal_instant_with_no_opposing_creature_is_still_penalized() {
+        let mut table = precast_table(false);
+        table.add_vanilla(PlayerId(0), 2, 2);
+        let gasp = table
+            .add_spell_to_hand_from_oracle(PlayerId(0), "Last Gasp", true, LAST_GASP_ORACLE)
+            .with_mana_cost(mana(&[ManaCostShard::Black], 1))
+            .id();
+        let state = table.build().state().clone();
+
+        let score = pre_cast_score(&state, gasp);
+        assert!(
+            score <= wasted_cast_penalty(),
+            "Last Gasp with no opposing creature must still be penalized at least one wasted \
+             cast; got {score}"
+        );
+    }
+
     #[test]
     fn requisition_raid_counter_player_slot_prefers_self() {
         let mut state = make_state();
