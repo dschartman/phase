@@ -588,8 +588,9 @@ fn meanderer_fight_on_top() -> (GameState, ObjectId, ObjectId, ObjectId) {
 /// search SHALL NOT count the fight's kill as certain: the on-top value SHALL
 /// be below the value after the trigger resolves with the kill (equal at
 /// 3b773d68b). The value after the response is printed, not bounded: the
-/// opponent's node adds its move-ordering prior to each line (`+ score *
-/// 0.05`), here 0.025 on a response line 0.8 below the kill line.
+/// window searches the response one ply shallower than this position at
+/// depth 2 (`OwnTriggerStop::child_depth`), so the two mix depths (judge S3
+/// on 19b88154a); JB pins the window against the response at the child depth.
 #[test]
 fn break_under_pressure_over_a_fight_trigger_is_searched() {
     let (top, meanderer, rival, pressure) = meanderer_fight_on_top();
