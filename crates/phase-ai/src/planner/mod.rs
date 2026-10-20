@@ -785,6 +785,11 @@ enum QuiesceStep {
     Failed,
 }
 
+/// Whether `player` controls any object on the stack (CR 405.1).
+fn controls_a_stack_object(state: &GameState, player: PlayerId) -> bool {
+    state.stack.iter().any(|entry| entry.controller == player)
+}
+
 pub struct PlannerServices<'a> {
     pub ai_player: PlayerId,
     pub config: &'a AiConfig,
@@ -1452,7 +1457,11 @@ impl<'a> PlannerServices<'a> {
     /// over). This prevents the horizon effect where the search evaluates
     /// mid-stack-resolution positions that misleadingly penalize spell casting.
     ///
-    /// Handles three categories of non-strategic actions:
+    /// Handles four categories of non-strategic actions:
+    /// 0. The AI's own stack objects: when the leaf's top stack object is the
+    ///    AI's, priority is passed for every player until no AI-controlled
+    ///    object remains on the stack, whatever else is legal at those points
+    ///    (opponent responses stay unmodeled, the optimism of case 1)
     /// 1. Forced priority passes (only PassPriority is legal)
     /// 2. Single-action states (only one legal action exists)
     /// 3. Deterministic mechanical choices (scry, surveil, discard-to-hand-size, etc.)
@@ -1519,6 +1528,13 @@ impl<'a> PlannerServices<'a> {
     ) -> QuiesceCursor<'s> {
         const MAX_QUIESCE_STEPS: u32 = 20;
 
+        // Case 0 is entered from the leaf as given: its top stack object is the
+        // AI's (CR 405.5: the top object resolves first). A leaf whose top
+        // object is an opponent's is quiesced by cases 1 to 3 alone.
+        let resolve_own = state
+            .stack
+            .back()
+            .is_some_and(|top| top.controller == self.ai_player);
         let mut cursor = QuiesceCursor::Borrowed(state);
         for _ in 0..MAX_QUIESCE_STEPS {
             // Search wall-clock bound (CR-agnostic): once the deadline is blown,
@@ -1538,6 +1554,28 @@ impl<'a> PlannerServices<'a> {
 
             if matches!(cursor.state().waiting_for, WaitingFor::GameOver { .. }) {
                 break;
+            }
+
+            // Case 0: the AI's own objects resolve before the leaf is scored.
+            // CR 117.4 + CR 608.1: when all players pass in succession, the top
+            // object resolves, so a draw or mill the candidate put on the stack
+            // reaches the score. Choices inside a resolution fall to cases 2
+            // and 3.
+            if resolve_own
+                && matches!(cursor.state().waiting_for, WaitingFor::Priority { .. })
+                && controls_a_stack_object(cursor.state(), self.ai_player)
+            {
+                match self.quiesce_step(
+                    node,
+                    &mut cursor,
+                    engine::types::actions::GameAction::PassPriority,
+                ) {
+                    QuiesceStep::Advanced(next) => {
+                        node = next;
+                        continue;
+                    }
+                    QuiesceStep::Failed => break,
+                }
             }
 
             let ctx = self.exact_decision_context(node, cursor.state());
