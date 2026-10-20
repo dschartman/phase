@@ -1458,9 +1458,10 @@ impl<'a> PlannerServices<'a> {
     /// matches a killer slot at `ply` to the front of the already-truncated beam
     /// (slot 0 before slot 1), preserving relative order among killers and among
     /// non-killers. **Scores are never modified** — killers change only visit
-    /// order, so the value function (`ranked.score` uses at planner/mod.rs and
-    /// search.rs) is untouched. Increments `killer_orderings` only when a killer
-    /// was actually present in the beam.
+    /// order, so no value moves: interior and rollout values carry no ranked
+    /// score, and the root's tactical blend (`run_iterative_deepening` in
+    /// search.rs) reads the score, not the visit order. Increments
+    /// `killer_orderings` only when a killer was actually present in the beam.
     fn order_killers_first(&mut self, ply: usize, ranked: &mut [RankedCandidate]) {
         if ply >= MAX_KILLER_PLY {
             return;
@@ -2062,13 +2063,16 @@ impl<'a> PlannerServices<'a> {
             return self.quiesced_leaf_eval_at(node, state);
         }
         let is_maximizing = rollout_player == self.ai_player;
+        // The prior decides which continuations are sampled and in what order
+        // (`sample_backfilled_edges`); the value is the sampled children's
+        // searched values alone, so a child's prior never moves the node.
         continuations
             .into_iter()
-            .map(|(prior, action, child, sim)| {
+            .map(|(_prior, action, child, sim)| {
                 let child_depth = stop.child_depth(&action, depth);
                 self.searching_child(child_depth == depth, |services| {
                     services.rollout_estimate_at(child, &sim, child_depth)
-                }) + (prior * 0.05)
+                })
             })
             .reduce(|best, value| {
                 if is_maximizing {
@@ -2189,7 +2193,10 @@ impl BeamContinuationPlanner {
         );
         // Move ordering: try killer moves (prior beta-cutoff causers at this ply)
         // first to maximize alpha-beta pruning. Reorder-only — candidate scores
-        // are never mutated (they leak into the value function below).
+        // are never mutated. The ranked score decides only the beam (what is
+        // searched) and the order (what is searched first); the value a child
+        // returns is its searched value alone, so equal children tie exactly and
+        // the first searched (higher score, then `cmp_stable`) is kept.
         services.order_killers_first(ply, &mut ranked);
 
         // Alpha-beta pruning: explicit loop for early cutoff.
@@ -2227,7 +2234,7 @@ impl BeamContinuationPlanner {
                     services,
                     budget,
                 )
-            }) + (ranked.score * 0.05);
+            });
 
             if is_maximizing {
                 best = best.max(value);
