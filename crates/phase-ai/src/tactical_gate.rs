@@ -12508,6 +12508,64 @@ mod tests {
         assert_eq!(offered_and_kept(&state, arena), (true, false));
     }
 
+    /// P0 controls an enchantment whose mandatory draw replacement is read
+    /// at `scope`'s stage, and The Theorist is in hand over an empty library.
+    fn the_theorist_under_a_draw_replacement(
+        oracle: &str,
+        scope: engine::types::ability::DrawReplacementScope,
+    ) -> (GameState, ObjectId) {
+        let mut shield = None;
+        let (state, theorist) = self_draw_table(0, |scenario| {
+            shield = Some(
+                scenario
+                    .add_enchantment_from_oracle(P0, "Draw Shield", oracle)
+                    .id(),
+            );
+            theorist_in_hand(scenario)
+        });
+        let shield = shield.expect("the shield was added");
+        let scopes: Vec<_> = state.objects[&shield]
+            .replacement_definitions
+            .iter_unchecked()
+            .map(|def| def.draw_scope)
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![Some(scope)],
+            "the shield parses one draw replacement, read at the intended stage"
+        );
+        (state, theorist)
+    }
+
+    /// CR 121.2a + CR 614.6: a count-form "if you would draw one or more
+    /// cards" replacement modifies the draw instruction before any individual
+    /// draw. When it substitutes the draw away, her trigger never draws from
+    /// the empty library, so the cast is no deck-out (CR 614.11: the
+    /// replacement applies even with no cards to draw).
+    #[test]
+    fn the_theorist_onto_an_empty_library_whose_draw_instruction_is_replaced_stays_a_candidate() {
+        let (state, theorist) = the_theorist_under_a_draw_replacement(
+            "If you would draw one or more cards, you gain 1 life instead.",
+            engine::types::ability::DrawReplacementScope::InstructionCount,
+        );
+        assert_eq!(
+            offered_and_kept(&state, theorist),
+            (true, true),
+            "an instruction-stage replacement removes her draw: no deck-out to veto"
+        );
+    }
+
+    /// Guard: the same at the individual-draw stage (CR 121.6b), the leg
+    /// already read.
+    #[test]
+    fn the_theorist_onto_an_empty_library_whose_individual_draw_is_replaced_stays_a_candidate() {
+        let (state, theorist) = the_theorist_under_a_draw_replacement(
+            "If you would draw a card, you gain 1 life instead.",
+            engine::types::ability::DrawReplacementScope::IndividualDraw,
+        );
+        assert_eq!(offered_and_kept(&state, theorist), (true, true));
+    }
+
     #[test]
     fn upkeep_self_draw_enchantment_onto_two_cards_stays_a_candidate() {
         let (state, arena) = self_draw_table(2, arena_in_hand);
