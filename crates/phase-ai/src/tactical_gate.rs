@@ -65,7 +65,8 @@ use crate::config::AiConfig;
 use crate::context::AiContext;
 use crate::planner::PreparedCandidate;
 use crate::policies::anti_self_harm::{
-    cast_self_draw_decks_before_own_draw, is_deliberate_self_target_rider,
+    cast_self_draw_decks_before_own_draw, draw_survives_replacement,
+    is_deliberate_self_target_rider,
 };
 use crate::policies::context::{
     collect_ability_effects, collect_resolved_abilities, selected_mode_abilities, PolicyContext,
@@ -74,6 +75,7 @@ use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, object_impact, targets_creatures_only, EffectPolarity,
 };
 use crate::policies::removal_lethality::toughness_reduction_is_lethal;
+use crate::policies::self_cost::fewest_mandatory_self_draws;
 use crate::policies::stack_awareness::{has_pending_removal, will_target_die_from_stack};
 use crate::policies::strategy_helpers::can_pay_ward_cost;
 use crate::search::ability_is_temporary_combat_modifier;
@@ -420,6 +422,12 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject(RejectReason::DecksOutBeforeOwnDraw);
     }
 
+    // CR 121.4 + CR 704.5b: a one-shot cast or activation whose own
+    // resolution draws more cards than the AI's library holds loses the game.
+    if resolution_draws_past_library(ctx) {
+        return GateDecision::Reject(RejectReason::DrawsPastLibrary);
+    }
+
     // CR 601.2c + CR 608.2c: Target-sourced self-damage and fight exchanges are
     // evaluated from reducer-issued, fully-bound target paths before scoring.
     // `Indeterminate` stays fail-open: this is a proof-backed veto only.
@@ -519,6 +527,42 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         _ => Vec::new(),
     };
     assess_cast_effects(ctx, &candidate_effects(ctx), &spell_abilities)
+}
+
+/// CR 121.4 + CR 704.5b: whether the candidate's own resolution makes the AI
+/// draw from an empty library: the fewest mandatory draws it makes
+/// (`self_cost::fewest_mandatory_self_draws`, a lower bound read for the
+/// zone the spell is cast from, so Twinned Vision flashed back from the
+/// graveyard draws two) are more than the library will hold, and the draw
+/// survives the replacement pipeline (`draw_survives_replacement`, the reading
+/// the recurring check shares). Drawing exactly the library is no loss. A
+/// spell cast from its owner's library leaves it first (CR 601.2a). A modal
+/// spell is not read (its mode is a later choice). Not read, as in the
+/// recurring check: a `CantDraw` static or a per-turn draw limit, and a draw
+/// replacement conditioned on the library being empty (Laboratory Maniac),
+/// which this check over-rejects.
+fn resolution_draws_past_library(ctx: &PolicyContext<'_>) -> bool {
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let draws = match &ctx.candidate.action {
+        GameAction::CastSpell { .. } if source.modal.is_none() => {
+            fewest_mandatory_self_draws(modal_spell_mode_ability_refs(source), Some(source.zone))
+        }
+        GameAction::ActivateAbility { ability_index, .. } => {
+            fewest_mandatory_self_draws(source.abilities.get(*ability_index), None)
+        }
+        _ => return false,
+    };
+    let player = &ctx.state.players[ctx.ai_player.0 as usize];
+    let leaves_library = matches!(ctx.candidate.action, GameAction::CastSpell { .. })
+        && source.zone == Zone::Library
+        && player.library.contains(&source.id);
+    let library = player
+        .library
+        .len()
+        .saturating_sub(usize::from(leaves_library));
+    draws as usize > library && draw_survives_replacement(ctx.state, ctx.ai_player, draws)
 }
 
 /// The effects the gate's effect-level checks read for a cast or an
@@ -13092,6 +13136,52 @@ mod tests {
             "fixture parses as an optional draw: {ability:?}"
         );
         assert!(!issued_cast_decision(&state, spell).is_reject());
+    }
+
+    /// The premise the optional guard rests on: at the resolution-time
+    /// "may draw" prompt the AI's chooser declines two draws from a one-card
+    /// library and takes them from a full one (CR 121.4 + CR 704.5b).
+    fn optional_draw_answer(library: usize) -> GameAction {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..3 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
+        }
+        for _ in 0..library {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let spell = sorcery_in_hand(MAY_DRAW_TWO_ORACLE)(&mut scenario);
+        let mut runner = scenario.build();
+        let _commit = runner.cast(spell).commit();
+        runner.resolve_top();
+        let state = runner.state().clone();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { player, .. } if player == P0),
+            "reach-guard: resolution stops at the may-draw prompt, got {:?}",
+            state.waiting_for
+        );
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+        crate::search::choose_action(&state, P0, &config, &mut rng).expect("an answer")
+    }
+
+    #[test]
+    fn the_resolution_time_may_draw_is_declined_at_library_one() {
+        assert_eq!(
+            optional_draw_answer(1),
+            GameAction::DecideOptionalEffect { accept: false }
+        );
+    }
+
+    #[test]
+    fn the_resolution_time_may_draw_is_accepted_from_a_full_library() {
+        assert_eq!(
+            optional_draw_answer(25),
+            GameAction::DecideOptionalEffect { accept: true }
+        );
     }
 
     /// Guard: a draw the replacement pipeline substitutes away (CR 614.6,

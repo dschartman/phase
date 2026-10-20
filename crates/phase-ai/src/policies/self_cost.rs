@@ -696,6 +696,82 @@ fn cast_origin_holds(condition: &AbilityCondition, origin: Zone) -> Option<bool>
     }
 }
 
+/// The fewest cards the resolution of `abilities` (in order) makes its
+/// controller draw with no way to decline, read along the chain the way
+/// [`effects_cast_from`] reads it. `origin` is the zone a spell is cast from;
+/// `None` (an activation) leaves every cast-origin condition undecided.
+///
+/// A lower bound, so a caller can treat more draws than the library as a
+/// proven loss: an "instead" leg (CR 614.1a) whose condition `origin` decides
+/// replaces or keeps its parent's draws ([`cast_origin_holds`]; Twinned Vision
+/// flashed back from the graveyard draws two), and one it does not decide
+/// counts the fewer of the two. A draw counts only when it is the
+/// controller's, a fixed number, and mandatory (not "may", not an unless
+/// payment, not per player or repeated). The count stops, keeping what came
+/// before, at any other condition, branch or mode, and at the first
+/// instruction other than a draw, which could put cards into the library
+/// before a later draw (CR 608.2c: instructions are followed in order).
+pub(crate) fn fewest_mandatory_self_draws<'a>(
+    abilities: impl IntoIterator<Item = &'a AbilityDefinition>,
+    origin: Option<Zone>,
+) -> u32 {
+    let branched = |node: &AbilityDefinition| {
+        node.else_ability.is_some() || !node.mode_abilities.is_empty() || node.modal.is_some()
+    };
+    // `None` is an instruction other than a draw: the count stops there.
+    let draws = |node: &AbilityDefinition| -> Option<u32> {
+        let Effect::Draw { count, target } = &*node.effect else {
+            return None;
+        };
+        let mandatory_own = matches!(target, TargetFilter::Controller)
+            && !node.optional
+            && node.optional_player.is_none()
+            && node.optional_for.is_none()
+            && node.unless_pay.is_none()
+            && node.repeat_for.is_none()
+            && node.player_scope.is_none();
+        Some(match count {
+            QuantityExpr::Fixed { value } if mandatory_own => u32::try_from(*value).unwrap_or(0),
+            _ => 0,
+        })
+    };
+    let mut steps: Vec<Option<u32>> = Vec::new();
+    for ability in abilities {
+        if ability.condition.is_some() || branched(ability) {
+            steps.push(None);
+            break;
+        }
+        steps.push(draws(ability));
+        let mut next = ability.sub_ability.as_deref();
+        while let Some(node) = next {
+            if branched(node) {
+                steps.push(None);
+                break;
+            }
+            match &node.condition {
+                None => steps.push(draws(node)),
+                // CR 614.1a: "instead" replaces the parent instruction.
+                Some(AbilityCondition::ConditionInstead { inner }) => {
+                    let leg = draws(node);
+                    if let Some(parent) = steps.last_mut() {
+                        match origin.and_then(|zone| cast_origin_holds(inner, zone)) {
+                            Some(true) => *parent = leg,
+                            Some(false) => {}
+                            None => *parent = parent.zip(leg).map(|(a, b)| a.min(b)),
+                        }
+                    }
+                }
+                Some(_) => {
+                    steps.push(None);
+                    break;
+                }
+            }
+            next = node.sub_ability.as_deref();
+        }
+    }
+    steps.into_iter().map_while(|step| step).sum()
+}
+
 /// The shared walk behind [`appraise_benefit`] and [`appraise_cast_benefit`].
 fn appraise_effects(
     state: &GameState,
