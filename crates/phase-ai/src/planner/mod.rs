@@ -813,6 +813,19 @@ fn controls_a_stack_object(state: &GameState, player: PlayerId) -> bool {
     state.stack.iter().any(|entry| entry.controller == player)
 }
 
+/// Whether the top object of the stack (CR 405.5: it resolves first) is a
+/// triggered ability `player` controls (CR 603.3a: controlled by the player
+/// who controlled its source when it triggered).
+fn top_is_own_trigger(state: &GameState, player: PlayerId) -> bool {
+    state.stack.back().is_some_and(|top| {
+        top.controller == player
+            && matches!(
+                top.kind,
+                engine::types::game_state::StackEntryKind::TriggeredAbility { .. }
+            )
+    })
+}
+
 pub struct PlannerServices<'a> {
     pub ai_player: PlayerId,
     pub config: &'a AiConfig,
@@ -1668,6 +1681,45 @@ impl<'a> PlannerServices<'a> {
         cursor
     }
 
+    /// Resolve the AI's own triggered abilities on top of the stack without
+    /// spending search depth: while a player has priority and the top object
+    /// is a triggered ability the AI controls, priority is passed (CR 117.4 +
+    /// CR 608.1: when all players pass in succession, the top object
+    /// resolves). The interior search and the rollout call this on entry, so
+    /// a prowess trigger (CR 702.108a) or any other own trigger takes no ply
+    /// that the same line without the trigger spends on reaching combat.
+    /// Opponents' triggers, spells and activations stay search nodes; so do
+    /// a trigger's resolution choices (not a priority point). The response
+    /// window over the trigger is not modelled, the optimism of quiescence's
+    /// case 0; responses to the object under it still are.
+    ///
+    /// Returns the identity of the position reached (when tracked) and a
+    /// cursor at it, still borrowing `state` when no step was taken. A failed
+    /// apply falls back to `state` itself.
+    fn resolve_own_triggers_at<'s>(
+        &mut self,
+        node: Option<SearchNodeId>,
+        state: &'s GameState,
+    ) -> (Option<SearchNodeId>, QuiesceCursor<'s>) {
+        const MAX_OWN_TRIGGER_PASSES: u32 = 20;
+
+        let mut reached = node;
+        let mut cursor = QuiesceCursor::Borrowed(state);
+        for _ in 0..MAX_OWN_TRIGGER_PASSES {
+            if self.deadline.expired()
+                || !matches!(cursor.state().waiting_for, WaitingFor::Priority { .. })
+                || !top_is_own_trigger(cursor.state(), self.ai_player)
+            {
+                break;
+            }
+            match self.quiesce_step(reached, &mut cursor, GameAction::PassPriority) {
+                QuiesceStep::Advanced(next) => reached = next,
+                QuiesceStep::Failed => return (node, QuiesceCursor::Borrowed(state)),
+            }
+        }
+        (reached, cursor)
+    }
+
     /// Evaluate a leaf state with quiescence: if the stack is non-empty and only
     /// forced passes remain, resolve through them before evaluating.
     /// Once the wall-clock deadline is blown, skip quiescence — the cached
@@ -1874,6 +1926,12 @@ impl<'a> PlannerServices<'a> {
         if depth == 0 || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             return self.quiesced_leaf_eval_at(node, state);
         }
+        // The AI's own triggers on top resolve at this depth.
+        let (node, own_resolved) = self.resolve_own_triggers_at(node, state);
+        let state = own_resolved.state();
+        if matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
+            return self.quiesced_leaf_eval_at(node, state);
+        }
 
         let evaluation = self.planner_evaluation_at(node, state);
         if evaluation.priors.is_empty() {
@@ -1969,6 +2027,9 @@ impl BeamContinuationPlanner {
         if depth == 0 {
             return services.rollout_estimate_at(node, state, self.rollout_depth);
         }
+        // The AI's own triggers on top resolve at this depth.
+        let (node, own_resolved) = services.resolve_own_triggers_at(node, state);
+        let state = own_resolved.state();
         if budget.exhausted() || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             return services.evaluate_state_quiesced_at(node, state);
         }
