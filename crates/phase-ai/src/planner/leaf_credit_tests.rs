@@ -294,27 +294,157 @@ fn the_theorists_intrinsic_value_at_one_loyalty_is_her_one_payable_line() {
 }
 
 /// At 6 loyalty every ability is payable ([+1] 2.5, [-2] 0 on an empty
-/// opposing board, [-6] draw three 9.0), but she activates one a turn
-/// (CR 606.3): her best line, the [-6], against her loyalty 6, so
-/// 1 + (9.0 + 3.0) / 3.0 = 5.0 cards, not every payable ability summed on top
-/// of her loyalty (7.83).
+/// opposing board, [-6] draw three 9.0), and she activates one a turn
+/// (CR 606.3). Her [-6] removes all six counters (CR 606.4), and at 0 loyalty
+/// she is put into her owner's graveyard (CR 704.5i), so the line is its draws
+/// with nothing left after it and her draw trigger never fires: 9.0 + 0. Her
+/// loyalty and her trigger are 6 + 3.0 = 9.0 too, so
+/// 1 + 9.0 / 3.0 = 4.0 cards (it was 5.0: the trigger credited beside an
+/// ultimate that kills her).
 #[test]
-fn the_theorists_leaf_credit_at_six_loyalty_is_her_best_line_not_the_sum() {
+fn the_theorists_leaf_credit_at_six_loyalty_drops_her_trigger_under_a_lethal_ultimate() {
     let (credit, _) = the_theorist_prices_at(6);
     assert!(
-        (credit - 5.0).abs() < 1e-9,
-        "card + max(loyalty 6, [-6] 9.0) + draw 3.0, in draws; got {credit:.4}"
+        (credit - 4.0).abs() < 1e-9,
+        "card + max(loyalty 6 + draw 3.0, [-6] 9.0 + 0 left), in draws; got {credit:.4}"
     );
 }
 
-/// `intrinsic_value` at 6 loyalty: 2.0 + max(6, 9.0) + 3.0 = 14.0, not the
-/// sum's 22.5.
+/// `intrinsic_value` at 6 loyalty: 2.0 + max(6 + 3.0, 9.0 + 0) = 11.0 (it was
+/// 14.0).
 #[test]
-fn the_theorists_intrinsic_value_at_six_loyalty_is_her_best_line_not_the_sum() {
+fn the_theorists_intrinsic_value_at_six_loyalty_drops_her_trigger_under_a_lethal_ultimate() {
     let (_, intrinsic) = the_theorist_prices_at(6);
     assert!(
-        (intrinsic - 14.0).abs() < 1e-9,
-        "pips 2.0 + max(loyalty 6, [-6] 9.0) + draw 3.0; got {intrinsic:.4}"
+        (intrinsic - 11.0).abs() < 1e-9,
+        "pips 2.0 + max(loyalty 6 + draw 3.0, [-6] 9.0 + 0 left); got {intrinsic:.4}"
+    );
+}
+
+/// At 7 loyalty her [-6] leaves her at 1 (CR 606.4), so she survives it and
+/// her draw trigger is still to fire: 9.0 + 1 + 3.0 = 13.0 over her loyalty
+/// and trigger's 7 + 3.0, so 1 + 13.0 / 3.0 = 5.33 cards (it was 5.0, the same
+/// as at 6).
+#[test]
+fn the_theorists_leaf_credit_at_seven_loyalty_counts_the_loyalty_her_ultimate_leaves() {
+    let (credit, _) = the_theorist_prices_at(7);
+    assert!(
+        (credit - (1.0 + 13.0 / 3.0)).abs() < 1e-9,
+        "card + [-6] 9.0 + 1 left + draw 3.0, in draws; got {credit:.4}"
+    );
+}
+
+/// `intrinsic_value` at 7 loyalty: 2.0 + 9.0 + 1 + 3.0 = 15.0 (it was 14.0).
+#[test]
+fn the_theorists_intrinsic_value_at_seven_loyalty_counts_the_loyalty_her_ultimate_leaves() {
+    let (_, intrinsic) = the_theorist_prices_at(7);
+    assert!(
+        (intrinsic - 15.0).abs() < 1e-9,
+        "pips 2.0 + [-6] 9.0 + 1 left + draw 3.0; got {intrinsic:.4}"
+    );
+}
+
+// --- A minus line and the loyalty it leaves ---------------------------------
+
+const LILIANA_OF_THE_VEIL_ORACLE: &str = "[+1]: Each player discards a card.\n\
+     [\u{2212}2]: Target player sacrifices a creature.\n\
+     [\u{2212}6]: Separate all permanents target player controls into two piles. That player \
+     sacrifices all permanents in the pile of their choice.";
+
+/// A synthetic walker with a recurring draw trigger, a plus line and a minus
+/// removal line.
+const DRAWING_REMOVAL_WALKER_ORACLE: &str =
+    "At the beginning of each opponent's draw step, you draw a card.\n\
+     [+1]: You gain 2 life.\n\
+     [\u{2212}3]: Destroy target creature.";
+
+/// A synthetic walker with a recurring draw trigger and only plus lines.
+const PLUS_ONLY_WALKER_ORACLE: &str =
+    "At the beginning of each opponent's draw step, you draw a card.\n\
+     [+1]: Create a 1/1 blue Illusion creature token.\n\
+     [+2]: You gain 3 life.";
+
+/// A walker on P0's battlefield at `loyalty` (25 Islands in library, one draw
+/// 3.0), P1 with a 4/4 when `opposing_four_four`: its leaf credit in cards and
+/// its `intrinsic_value`.
+fn walker_prices_at(oracle: &str, loyalty: u32, opposing_four_four: bool) -> (f64, f64) {
+    let mut scenario = table(25);
+    if opposing_four_four {
+        scenario.add_vanilla(P1, 4, 4);
+    }
+    let walker = scenario
+        .add_planeswalker_from_oracle(P0, "Probe Walker", "Probe", loyalty, oracle)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+            generic: 1,
+        })
+        .id();
+    let state = at_turn(scenario.build().state().clone(), LATE_TURN);
+    let obj = &state.objects[&walker];
+    assert_eq!(obj.loyalty, Some(loyalty), "the walker is at {loyalty}");
+    (
+        crate::card_value::permanent_card_credit(&state, obj),
+        crate::card_value::intrinsic_value(&state, walker),
+    )
+}
+
+/// CR 606.4 + CR 606.6: Liliana of the Veil at 3 pays her [-2] edict (10.0
+/// against an opposing 4/4) and is left at 1, a walker still on the board, so
+/// the line is the edict plus that 1: 1 + 11.0 / 3.0 = 4.67 cards (it was a
+/// bare edict, 4.33), and her pips 1.5 + 11.0 = 12.5 intrinsic.
+#[test]
+fn liliana_of_the_veil_at_three_is_her_edict_plus_the_loyalty_it_leaves() {
+    let (credit, intrinsic) = walker_prices_at(LILIANA_OF_THE_VEIL_ORACLE, 3, true);
+    assert!(
+        (credit - (1.0 + 11.0 / 3.0)).abs() < 1e-9,
+        "card + [-2] edict 10.0 + 1 left, in draws; got {credit:.4}"
+    );
+    assert!(
+        (intrinsic - 12.5).abs() < 1e-9,
+        "pips 1.5 + [-2] edict 10.0 + 1 left; got {intrinsic:.4}"
+    );
+}
+
+/// CR 704.5i: a minus line that takes the walker to exactly 0 leaves nothing
+/// and kills her, so neither a loyalty remainder nor her draw trigger (3.0) is
+/// credited beside it. At 3 against a 4/4 the [-3] kill (10.0) beats her
+/// loyalty and trigger (3 + 3.0): 1 + 10.0 / 3.0 = 4.33 cards (it was 5.33,
+/// the trigger added on top), intrinsic 1.5 + 10.0 = 11.5.
+#[test]
+fn a_minus_line_to_exactly_zero_earns_no_remainder_and_no_trigger() {
+    let (credit, intrinsic) = walker_prices_at(DRAWING_REMOVAL_WALKER_ORACLE, 3, true);
+    assert!(
+        (credit - (1.0 + 10.0 / 3.0)).abs() < 1e-9,
+        "card + [-3] kill 10.0 + 0 left, no trigger, in draws; got {credit:.4}"
+    );
+    assert!(
+        (intrinsic - 11.5).abs() < 1e-9,
+        "pips 1.5 + [-3] kill 10.0 + 0 left, no trigger; got {intrinsic:.4}"
+    );
+}
+
+/// Guard: a walker with only plus lines keeps max(loyalty, line) plus its
+/// trigger. At 7: max(7, [+1] 2.5) + 3.0 = 10.0, 1 + 10.0 / 3.0 = 4.33 cards;
+/// at 1: max(1, 2.5) + 3.0 = 5.5, 2.83 cards.
+#[test]
+fn a_plus_only_walker_keeps_the_larger_of_loyalty_and_line_plus_its_trigger() {
+    let (credit, intrinsic) = walker_prices_at(PLUS_ONLY_WALKER_ORACLE, 7, false);
+    assert!(
+        (credit - (1.0 + 10.0 / 3.0)).abs() < 1e-9,
+        "card + max(7, 2.5) + draw 3.0, in draws; got {credit:.4}"
+    );
+    assert!(
+        (intrinsic - 11.5).abs() < 1e-9,
+        "pips 1.5 + max(7, 2.5) + draw 3.0; got {intrinsic:.4}"
+    );
+    let (credit, intrinsic) = walker_prices_at(PLUS_ONLY_WALKER_ORACLE, 1, false);
+    assert!(
+        (credit - (1.0 + 5.5 / 3.0)).abs() < 1e-9,
+        "card + max(1, 2.5) + draw 3.0, in draws; got {credit:.4}"
+    );
+    assert!(
+        (intrinsic - 7.0).abs() < 1e-9,
+        "pips 1.5 + max(1, 2.5) + draw 3.0; got {intrinsic:.4}"
     );
 }
 
