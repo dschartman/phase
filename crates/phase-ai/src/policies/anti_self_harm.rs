@@ -3797,22 +3797,40 @@ mod tests {
         }
     }
 
-    /// The AI (P0) on its own precombat main with priority and five untapped
-    /// basics (two Islands, two Swamps, a Plains), enough for every card below
-    /// at its printed cost. The opponent has two Plains and, when asked, an
-    /// untapped vanilla 3/3: no other creature or artifact.
+    /// The AI (P0) on its own precombat main with priority, seven untapped
+    /// basics (three Islands, three Swamps, a Plains), enough for every card
+    /// below at its printed cost, and 25 cards in library. The opponent has two
+    /// Plains, a 25-card library and, when asked, an untapped vanilla 3/3: no
+    /// other creature or artifact.
     fn precast_table(opposing_creature: bool) -> engine::game::scenario::GameScenario {
+        precast_table_with_library(opposing_creature, 25)
+    }
+
+    /// [`precast_table`] with `library` Islands in the AI's library (no deck-out
+    /// pressure at 25).
+    fn precast_table_with_library(
+        opposing_creature: bool,
+        library: usize,
+    ) -> engine::game::scenario::GameScenario {
         use engine::game::scenario::{GameScenario, P0, P1};
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
         for color in [
             ManaColor::Blue,
             ManaColor::Blue,
+            ManaColor::Blue,
+            ManaColor::Black,
             ManaColor::Black,
             ManaColor::Black,
             ManaColor::White,
         ] {
             scenario.add_basic_land(P0, color);
+        }
+        for _ in 0..library {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
         }
         scenario.add_basic_land(P1, ManaColor::White);
         scenario.add_basic_land(P1, ManaColor::White);
@@ -4042,6 +4060,246 @@ mod tests {
             "Last Gasp with no opposing creature must still be penalized at least one wasted \
              cast; got {score}"
         );
+    }
+
+    // --- round 2: modal and else chains of an ETB; the recurring self-draw ---
+
+    const YURIKO_ORACLE: &str = "Flash\n\
+         When Yuriko enters, choose one \u{2014}\n\
+         \u{2022} Target creature gets -X/-0 until end of turn, where X is the number of cards in \
+         your graveyard.\n\
+         \u{2022} Surveil 2. (Look at the top two cards of your library, then put any number of \
+         them into your graveyard and the rest on top of your library in any order.)";
+
+    const ARCHIVE_ARBITER_ORACLE: &str = "Flying\n\
+         When this creature enters, choose one \u{2014}\n\
+         \u{2022} Destroy target noncreature, nonland permanent.\n\
+         \u{2022} You gain 4 life.";
+
+    const DIVINING_DUELIST_ORACLE: &str = "Flash\n\
+         When this creature enters, choose one \u{2014}\n\
+         \u{2022} Tap target creature.\n\
+         \u{2022} Untap target creature.\n\
+         \u{2022} Draw a card, then discard a card.";
+
+    const PHYREXIAN_ARENA_ORACLE: &str =
+        "At the beginning of your upkeep, you draw a card and lose 1 life.";
+
+    fn creature_in_hand_from_oracle(
+        table: &mut engine::game::scenario::GameScenario,
+        name: &str,
+        keywords: &[&str],
+        oracle: &str,
+        power_toughness: (i32, i32),
+        cost: ManaCost,
+    ) -> ObjectId {
+        let mut builder =
+            table.add_creature_to_hand(PlayerId(0), name, power_toughness.0, power_toughness.1);
+        builder
+            .from_oracle_text_with_keywords(keywords, oracle)
+            .with_mana_cost(cost)
+            .id()
+    }
+
+    fn assert_etb_is_modal(state: &GameState, id: ObjectId) {
+        assert!(
+            state.objects[&id]
+                .trigger_definitions
+                .iter_unchecked()
+                .any(|entry| entry
+                    .definition()
+                    .execute
+                    .as_ref()
+                    .is_some_and(|execute| !execute.mode_abilities.is_empty())),
+            "the fixture must carry a modal ETB (targets under mode_abilities)"
+        );
+    }
+
+    /// CR 700.2b + CR 603.3c: a modal triggered ability whose every mode needs
+    /// a target with none legal is removed from the stack, so the ETB is
+    /// wasted. The walk must read the modes, not only the root and its
+    /// `sub_ability` chain (the root of a modal ETB is a targetless
+    /// `GenericEffect`).
+    #[test]
+    fn modal_etb_with_every_mode_targeted_and_none_legal_is_penalized() {
+        let mut table = precast_table(false);
+        let id = creature_in_hand_from_oracle(
+            &mut table,
+            "Relic Breaker",
+            &[],
+            "When this creature enters, choose one \u{2014}\n\
+             \u{2022} Destroy target artifact an opponent controls.\n\
+             \u{2022} Destroy target enchantment an opponent controls.",
+            (2, 2),
+            mana(&[ManaCostShard::Black], 2),
+        );
+        let state = table.build().state().clone();
+        assert_etb_is_modal(&state, id);
+
+        let score = pre_cast_score(&state, id);
+        assert_eq!(
+            score,
+            wasted_cast_penalty(),
+            "every mode of the ETB targets an opposing artifact or enchantment and there is none"
+        );
+    }
+
+    /// Guard (CR 700.2b): Surveil 2 is always choosable, so Yuriko's ETB is
+    /// never wasted, with or without a creature for the -X/-0.
+    #[test]
+    fn yuriko_modal_etb_with_a_targetless_mode_carries_no_whiff() {
+        let mut table = precast_table(false);
+        let mut builder =
+            table.add_creature_to_hand(PlayerId(0), "Yuriko, Hope from the Shadows", 1, 1);
+        let id = builder
+            .from_oracle_text_with_keywords(&["Flash", "Surveil"], YURIKO_ORACLE)
+            .as_legendary()
+            .with_mana_cost(mana(&[ManaCostShard::Blue], 0))
+            .id();
+        let state = table.build().state().clone();
+        assert_etb_is_modal(&state, id);
+
+        assert_eq!(pre_cast_score(&state, id), 0.0);
+    }
+
+    /// Guard (CR 700.2b): "You gain 4 life" is always choosable.
+    #[test]
+    fn archive_arbiter_modal_etb_with_a_targetless_mode_carries_no_whiff() {
+        let mut table = precast_table(false);
+        let mut builder = table.add_creature_to_hand(PlayerId(0), "Archive Arbiter", 4, 4);
+        let id = builder
+            .from_oracle_text_with_keywords(&["Flying"], ARCHIVE_ARBITER_ORACLE)
+            .as_artifact_creature()
+            .with_mana_cost(mana(&[], 6))
+            .id();
+        let state = table.build().state().clone();
+        assert_etb_is_modal(&state, id);
+
+        assert_eq!(pre_cast_score(&state, id), 0.0);
+    }
+
+    /// Guard (CR 700.2b): "Draw a card, then discard a card" is always
+    /// choosable.
+    #[test]
+    fn divining_duelist_modal_etb_with_a_targetless_mode_carries_no_whiff() {
+        let mut table = precast_table(false);
+        let id = creature_in_hand_from_oracle(
+            &mut table,
+            "Divining Duelist",
+            &["Flash"],
+            DIVINING_DUELIST_ORACLE,
+            (3, 2),
+            mana(&[ManaCostShard::Blue], 2),
+        );
+        let state = table.build().state().clone();
+        assert_etb_is_modal(&state, id);
+
+        assert_eq!(pre_cast_score(&state, id), 0.0);
+    }
+
+    /// Pinned: "create a Germ, then attach this to it" names the token the
+    /// trigger itself creates (a context reference, CR 115.10a), not a target,
+    /// so an empty board is no whiff.
+    #[test]
+    fn equipment_etb_that_attaches_to_its_own_token_carries_no_whiff() {
+        let mut table = precast_table(false);
+        let mut builder = table.add_spell_to_hand(PlayerId(0), "Germ Harness", false);
+        builder.as_artifact();
+        builder.with_subtypes(vec!["Equipment"]);
+        let id = builder
+            .from_oracle_text(
+                "When this Equipment enters, create a 0/0 black Phyrexian Germ creature token, \
+                 then attach this Equipment to it.\nEquipped creature gets +1/+1.",
+            )
+            .with_mana_cost(mana(&[], 2))
+            .id();
+        let state = table.build().state().clone();
+        assert!(!state.objects[&id].trigger_definitions.is_empty());
+
+        assert_eq!(pre_cast_score(&state, id), 0.0);
+    }
+
+    /// Pinned as today's reading, and an open rules question: the engine
+    /// parses "When you do, destroy target creature an opponent controls" as
+    /// a `sub_ability` of the ETB, so the walk reads its target as declared
+    /// by the ETB and charges the wasted cast. Under CR 603.12 that target
+    /// belongs to a reflexive trigger created during resolution, not to the
+    /// ETB as it goes on the stack (CR 603.3d). The value is lost all the
+    /// same with no opposing creature, so -8 matches the ETB-removal guard.
+    #[test]
+    fn reflexive_when_you_do_target_reads_as_etb_declared_pending_cr_603_12() {
+        let mut table = precast_table(false);
+        table.add_vanilla(PlayerId(0), 1, 1);
+        let id = creature_in_hand_from_oracle(
+            &mut table,
+            "Reflexive Butcher",
+            &[],
+            "When this creature enters, you may sacrifice another creature. When you do, destroy \
+             target creature an opponent controls.",
+            (3, 3),
+            mana(&[ManaCostShard::Black], 2),
+        );
+        let state = table.build().state().clone();
+
+        assert_eq!(pre_cast_score(&state, id), wasted_cast_penalty());
+    }
+
+    fn the_theorist_with_library(library: usize) -> (GameState, ObjectId) {
+        let mut table = precast_table_with_library(false, library);
+        let theorist = the_theorist_on(&mut table);
+        (table.build().state().clone(), theorist)
+    }
+
+    /// CR 121.4 + CR 704.5b: The Theorist's "at the beginning of each
+    /// opponent's draw step, you draw a card" is mandatory. With an empty
+    /// library the opponent's next draw step makes the AI draw from it, and
+    /// it loses before its own next turn (seed 1037 T37, uwb).
+    #[test]
+    fn the_theorist_cast_with_an_empty_library_is_a_wasted_cast() {
+        let (state, theorist) = the_theorist_with_library(0);
+        let score = pre_cast_score(&state, theorist);
+        assert_eq!(
+            score,
+            wasted_cast_penalty(),
+            "casting The Theorist onto an empty library decks the AI on the opponent's draw step"
+        );
+    }
+
+    /// Eleven cards at two draws a round is five and a half rounds: the cast
+    /// halves the turns left before the AI decks (seed 1018 T23 cast at 11,
+    /// decked T31). A scaled penalty, smaller than a wasted cast.
+    #[test]
+    fn the_theorist_cast_onto_an_eleven_card_library_is_penalized() {
+        let (state, theorist) = the_theorist_with_library(11);
+        let score = pre_cast_score(&state, theorist);
+        assert!(
+            score < 0.0 && score > wasted_cast_penalty(),
+            "an 11-card library carries a scaled deck-out penalty; got {score}"
+        );
+    }
+
+    /// Guard: 25 cards is twelve rounds of two draws (seed 1008 T14).
+    #[test]
+    fn the_theorist_cast_onto_a_twenty_five_card_library_carries_no_deck_out_penalty() {
+        let (state, theorist) = the_theorist_with_library(25);
+        assert_eq!(pre_cast_score(&state, theorist), 0.0);
+    }
+
+    /// The class, not the card: Phyrexian Arena's upkeep draw comes before the
+    /// AI's own next draw step (CR 503.1 + CR 504.1), so an empty library
+    /// decks it at its next upkeep.
+    #[test]
+    fn upkeep_self_draw_enchantment_with_an_empty_library_is_a_wasted_cast() {
+        let mut table = precast_table_with_library(false, 0);
+        let mut builder = table.add_spell_to_hand(PlayerId(0), "Phyrexian Arena", false);
+        builder.as_enchantment();
+        let id = builder
+            .from_oracle_text(PHYREXIAN_ARENA_ORACLE)
+            .with_mana_cost(mana(&[ManaCostShard::Black, ManaCostShard::Black], 1))
+            .id();
+        let state = table.build().state().clone();
+
+        assert_eq!(pre_cast_score(&state, id), wasted_cast_penalty());
     }
 
     #[test]
