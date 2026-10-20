@@ -18516,4 +18516,121 @@ one on the bottom of your library.";
         );
         assert_eq!(tracked_trace, untracked_trace);
     }
+
+    /// Judge row L4 on 60ae8209b, scored by the search with the target prune
+    /// disabled (spec-ai-leaf-eot-pt Done-when 1). Last Gasp (-3/-3 until end
+    /// of turn) at its target prompt in the AI's precombat main, nothing open
+    /// for P1, an opposing 3/4 (survives at 0/1 until cleanup, CR 514.2) and a
+    /// 1/1 (dies, CR 704.5f). The root beam admits every candidate the gate
+    /// allows plus the one `TargetSurvivesKillOffered` prunes, and is scored
+    /// by the production iterative deepening at the target-selection tactical
+    /// weight: the kill SHALL score above the survivor.
+    #[test]
+    fn l4_ungated_search_scores_the_kill_above_the_survivor() {
+        const GASP: &str = "Target creature gets -3/-3 until end of turn.";
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..20 {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        scenario.add_basic_land(P0, ManaColor::Black);
+        scenario.add_basic_land(P0, ManaColor::Black);
+        let gasp = scenario
+            .add_spell_to_hand(P0, "Gasp", true)
+            .from_oracle_text(GASP)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 1,
+            })
+            .id();
+        let big = scenario.add_creature(P1, "Big Arbiter", 3, 4).id();
+        let small = scenario.add_creature(P1, "Small Illusion", 1, 1).id();
+        let mut state = scenario.build().state().clone();
+        let cast = build_decision_context(&state)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .find(|action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == gasp))
+            .expect("reach-guard: Gasp's cast is issued");
+        engine::game::engine::apply_as_current(&mut state, cast).expect("cast Gasp");
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TargetSelection { .. }),
+            "reach-guard: Gasp's target prompt, got {:?}",
+            state.waiting_for
+        );
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native).into_measurement(42);
+        let session = AiSession::arc_from_game(&state);
+        let policies = PolicyRegistry::shared();
+        let context = build_ai_context_with_session(&state, P0, &config, Arc::clone(&session));
+        let mut services = PlannerServices::with_deadline(P0, &config, policies, context, None);
+        let ctx = build_decision_context(&state);
+        let prepared = prepare_payment_candidates(&state, ctx.candidates.clone());
+        let prepared = services.validate_prepared_candidates(&state, prepared);
+        let issued: Vec<CandidateAction> = prepared.iter().map(|p| p.candidate.clone()).collect();
+        let decisions = crate::tactical_gate::gate_decisions(
+            &state,
+            &ctx,
+            &issued,
+            P0,
+            &config,
+            &services.context,
+        );
+        let mut pruned = 0;
+        let mut gated: Vec<crate::tactical_gate::GatedCandidate> = prepared
+            .iter()
+            .zip(decisions)
+            .filter_map(|(p, decision)| {
+                let penalty = match decision {
+                    crate::tactical_gate::GateDecision::Allow => 0.0,
+                    crate::tactical_gate::GateDecision::AllowWithPenalty(penalty) => penalty,
+                    crate::tactical_gate::GateDecision::Reject(
+                        crate::tactical_gate::RejectReason::TargetSurvivesKillOffered,
+                    ) => {
+                        pruned += 1;
+                        0.0
+                    }
+                    crate::tactical_gate::GateDecision::Reject(_) => return None,
+                };
+                Some(crate::tactical_gate::GatedCandidate {
+                    source_index: p.source_index,
+                    candidate: p.candidate.clone(),
+                    penalty,
+                })
+            })
+            .collect();
+        assert_eq!(
+            pruned, 1,
+            "reach-guard: the gate prunes the survivor at head"
+        );
+        gated.sort_by(|left, right| left.candidate.action.cmp_stable(&right.candidate.action));
+        let ranked = rank_root_payment_candidates(
+            &state,
+            &ctx,
+            &prepared,
+            &gated,
+            &[],
+            &services,
+            config.search.root_branching(),
+        );
+        let scored = run_iterative_deepening(&state, ranked, 0.7, &config, &mut services);
+        let score_of = |id: ObjectId| {
+            scored
+                .iter()
+                .find(|(action, _)| {
+                    matches!(action, GameAction::ChooseTarget { target: Some(TargetRef::Object(t)) } if *t == id)
+                })
+                .map(|(_, score)| *score)
+                .unwrap_or_else(|| panic!("reach-guard: {id:?} scored in {scored:?}"))
+        };
+        let (survivor, kill) = (score_of(big), score_of(small));
+        eprintln!("L4 ungated: survivor {survivor:.3} kill {kill:.3} all {scored:?}");
+        assert!(
+            kill > survivor,
+            "the -3/-3 on the 3/4 that survives ({survivor:.3}) outscored killing the 1/1 ({kill:.3})"
+        );
+    }
 }
