@@ -448,9 +448,10 @@ pub(crate) fn worth_drawing(state: &GameState, obj_id: ObjectId, plan: Option<Pl
 ///   read from the engine's parse of its abilities ([`noncreature_payoff`]):
 ///   removal by the creature it answers, card draw by the cards it nets, a
 ///   creature token by its body, a planeswalker by its loyalty or the best
-///   line it pays for. Before this, every such card was the pips alone, so
-///   The Theorist sat at 2.0 and Last Gasp at 1.0 under a basic land's 3.0,
-///   and every keep-order seam gave removal and card draw away first
+///   line it pays for, and what a minus line leaves of her. Before this,
+///   every such card was the pips alone, so The Theorist sat at 2.0 and Last
+///   Gasp at 1.0 under a basic land's 3.0, and every keep-order seam gave
+///   removal and card draw away first
 ///   (`fork-checks/ef45b56b6/JUDGE.md`, `fork-checks/9f72018f4/OPEN.md`).
 ///
 /// It is the one ordering every consumer reads: the keep order ([`keep_key`],
@@ -518,7 +519,8 @@ fn value_with(state: &GameState, obj_id: ObjectId, draws: DrawPricing) -> f64 {
 /// - **Planeswalker**: the larger of its loyalty (CR 306.5b: it enters with
 ///   its printed loyalty) and the best loyalty ability that loyalty can pay
 ///   for (CR 606.3: one activation a turn; CR 606.6: a negative cost needs
-///   that many counters), [`planeswalker_payoff`].
+///   that many counters), a minus line with the loyalty it leaves and her
+///   triggers only if she survives it (CR 704.5i), [`planeswalker_payoff`].
 ///
 /// Each effect is priced by [`effect_payoff`]; anything else it does is 0,
 /// which is the old pricing.
@@ -541,7 +543,12 @@ fn noncreature_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -
         };
     }
 
-    payoff += trigger_payoff(state, obj, draws, Triggers::All);
+    payoff += planeswalker_payoff(
+        state,
+        obj,
+        draws,
+        trigger_payoff(state, obj, draws, Triggers::All),
+    );
 
     if aura_polarity(obj) == EffectPolarity::Harmful {
         if let Some(Keyword::Enchant(filter)) = obj
@@ -555,7 +562,7 @@ fn noncreature_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -
         }
     }
 
-    payoff + planeswalker_payoff(state, obj, draws)
+    payoff
 }
 
 /// Which of a permanent's triggered abilities [`trigger_payoff`] prices.
@@ -586,37 +593,60 @@ fn is_own_etb(trigger: &engine::types::ability::TriggerDefinition) -> bool {
         && trigger.destination == Some(Zone::Battlefield)
 }
 
-/// A planeswalker by its loyalty and the one line that loyalty buys: the larger
-/// of its loyalty (CR 306.5b: it enters with its printed loyalty; CR 306.5c:
-/// on the battlefield, its loyalty counters) and its best loyalty ability that
-/// loyalty can pay for (CR 606.6: a negative cost needs that many counters).
-/// 0 for anything else.
+/// A permanent's triggers, `triggers` (priced by [`trigger_payoff`]), and for
+/// a planeswalker the one line its loyalty buys, priced together because a
+/// line that spends her loyalty to 0 also ends her triggers. Anything that is
+/// not a planeswalker is its `triggers` as given.
+///
+/// A planeswalker is the largest of:
+/// - her loyalty (CR 306.5b: she enters with her printed loyalty; CR 306.5c:
+///   on the battlefield, her loyalty counters) or a plus or zero loyalty
+///   ability, whichever is larger, plus her triggers;
+/// - a minus loyalty ability her loyalty can pay for (CR 606.6: a negative
+///   cost needs that many counters), plus the loyalty left after paying it
+///   (CR 606.4: the cost removes that many counters), plus her triggers only
+///   when that remainder is above 0. At 0 she is put into her owner's
+///   graveyard (CR 704.5i), so a line that takes her there leaves no
+///   loyalty and fires no trigger again.
 ///
 /// Not the loyalty plus every payable ability. CR 606.3 allows one loyalty
-/// activation a turn, and CR 606.4: a cost is loyalty counters put on or
-/// removed, so the loyalty is the budget that pays for the line, not value on
-/// top of it. Summed, The Theorist at 6 loyalty read 6 + [+1] 2.5 + [-6] 9.0
-/// for every ability at once, and at 1 loyalty her loyalty on top of the
-/// [+1] it pays for (`fork-checks/5e66b2a30/JUDGE.md` rows 3 and 6). Her
-/// triggers are priced once each beside this, by [`trigger_payoff`]. How she
-/// spends her loyalty down to her exit (CR 704.5i) is not priced.
+/// activation a turn, and the loyalty is the budget that pays for the line,
+/// not value on top of it; only what a minus line leaves is still hers.
+/// Summed, The Theorist at 6 loyalty read 6 + [+1] 2.5 + [-6] 9.0 for every
+/// ability at once (`fork-checks/5e66b2a30/JUDGE.md` rows 3 and 6); with her
+/// draw trigger credited beside an ultimate that kills her, she read one card
+/// high at 6 and the same as at 7 (`fork-checks/7f538589f/JUDGE.md` row 3).
+/// A repeatable minus line gets its future through the remainder, not a
+/// multiplier. How she spends her loyalty turn by turn is not priced.
 ///
-/// The one rule [`intrinsic_value`] (through [`noncreature_payoff`]) and the
-/// search's leaf credit ([`permanent_card_credit`]) both read.
-fn planeswalker_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
+/// The one rule [`intrinsic_value`] (through [`noncreature_payoff`], every
+/// trigger) and the search's leaf credit ([`permanent_card_credit`], the
+/// triggers still to fire) both read.
+fn planeswalker_payoff(
+    state: &GameState,
+    obj: &GameObject,
+    draws: DrawPricing,
+    triggers: f64,
+) -> f64 {
     if !obj.card_types.core_types.contains(&CoreType::Planeswalker) {
-        return 0.0;
+        return triggers;
     }
-    let loyalty = obj.loyalty.unwrap_or(0);
-    let best_line = obj
-        .abilities
+    let loyalty = obj.loyalty.unwrap_or(0) as i32;
+    obj.abilities
         .iter()
-        .filter(|ability| {
-            matches!(ability.cost, Some(AbilityCost::Loyalty { amount }) if amount >= -(loyalty as i32))
+        .filter_map(|ability| match ability.cost {
+            Some(AbilityCost::Loyalty { amount }) if amount >= -loyalty => {
+                let line = definition_payoff(state, obj, ability, draws);
+                Some(if amount < 0 {
+                    let left = loyalty + amount;
+                    line + f64::from(left) + if left > 0 { triggers } else { 0.0 }
+                } else {
+                    line + triggers
+                })
+            }
+            _ => None,
         })
-        .map(|ability| definition_payoff(state, obj, ability, draws))
-        .fold(0.0, f64::max);
-    f64::from(loyalty).max(best_line)
+        .fold(f64::from(loyalty) + triggers, f64::max)
 }
 
 /// What a spell still on the stack is worth to the search's leaf, in cards
@@ -653,8 +683,9 @@ pub(crate) fn stack_spell_card_credit(state: &GameState, obj: &GameObject) -> f6
 /// - A permanent represented by a card is that card, 1.0, plus what it can
 ///   still do in expected draws ([`draw_unit`], the unit [`intrinsic_value`]
 ///   prices a drawn card in): the larger of a planeswalker's loyalty and the
-///   best loyalty ability its loyalty pays for ([`planeswalker_payoff`]), and
-///   the triggers it has yet to fire, as [`intrinsic_value`] reads them. So a
+///   best loyalty ability its loyalty pays for, a minus line with the loyalty
+///   it leaves, and the triggers it has yet to fire unless that line takes her
+///   to 0 ([`planeswalker_payoff`], as [`intrinsic_value`] reads it). So a
 ///   cast never scores below the card it was, and The Theorist at 4 loyalty
 ///   is her card plus her loyalty (over her [+1]'s token) and her draw.
 /// - CR 121.4 + CR 704.5b: when its recurring mandatory draws leave the
@@ -688,8 +719,12 @@ pub(crate) fn permanent_card_credit(state: &GameState, obj: &GameObject) -> f64 
         Some(exposure) if exposure.is_short() => DrawPricing::Unpriced,
         _ => DrawPricing::LibraryMean,
     };
-    let payoff = planeswalker_payoff(state, obj, draws)
-        + trigger_payoff(state, obj, draws, Triggers::StillToFire);
+    let payoff = planeswalker_payoff(
+        state,
+        obj,
+        draws,
+        trigger_payoff(state, obj, draws, Triggers::StillToFire),
+    );
     if payoff <= 0.0 {
         return 1.0;
     }
