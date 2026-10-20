@@ -14193,4 +14193,69 @@ mod tests {
             );
         }
     }
+
+    // --- judge rows (8a233b046), constructed -------------------------------
+
+    /// JK1: a variable X drain. X is unknown before the cast: no win.
+    #[test]
+    fn jk1_an_x_drain_is_no_win() {
+        let (verdict, _after) =
+            jg_drain_verdict_and_outcome(2, "Draw a card. Each opponent loses X life.", |s| {
+                s.with_life(P1, 2);
+            });
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
+    }
+
+    /// JK2: "deals 2 damage to each player" with the opponent at 2: the AI
+    /// at exactly 2 dies too (the engine ends the game as a draw), at 3 it
+    /// wins.
+    #[test]
+    fn jk2_damage_to_each_player_is_a_win_only_while_the_ai_survives() {
+        let oracle = "Draw a card. Draw Spell deals 2 damage to each player.";
+        let (at2, after2) = jg_drain_verdict_and_outcome(2, oracle, |s| {
+            s.with_life(P0, 2);
+            s.with_life(P1, 2);
+        });
+        let (at3, after3) = jg_drain_verdict_and_outcome(2, oracle, |s| {
+            s.with_life(P0, 3);
+            s.with_life(P1, 2);
+        });
+        assert_eq!(after2.waiting_for, WaitingFor::GameOver { winner: None });
+        assert_eq!(
+            after3.waiting_for,
+            WaitingFor::GameOver { winner: Some(P0) }
+        );
+        assert_eq!(at2, Some(RejectReason::DecksOutBeforeOwnDraw));
+        assert_eq!(at3, None);
+    }
+
+    /// JK3: two opponents, both at 2, "each opponent loses 2 life": a win.
+    #[test]
+    fn jk3_a_drain_killing_every_opponent_is_a_win() {
+        let (verdict, after) =
+            jg_drain_verdict_and_outcome(3, "Draw a card. Each opponent loses 2 life.", |s| {
+                s.with_life(P1, 2);
+                s.with_life(PlayerId(2), 2);
+            });
+        assert_eq!(after.waiting_for, WaitingFor::GameOver { winner: Some(P0) });
+        assert_eq!(verdict, None);
+    }
+
+    /// JK4: a conditional drain whose condition is false (no artifact): the
+    /// drain does not happen (the engine leaves P1 at 2 and the AI at
+    /// library 0), so no win.
+    #[test]
+    fn jk4_a_conditional_drain_is_no_win() {
+        let (verdict, after) = jg_drain_verdict_and_outcome(
+            2,
+            "Draw a card. If you control an artifact, each opponent loses 2 life.",
+            |s| {
+                s.with_life(P1, 2);
+            },
+        );
+        assert!(!matches!(after.waiting_for, WaitingFor::GameOver { .. }));
+        assert_eq!(after.players[1].life, 2);
+        assert_eq!(after.players[0].library.len(), 0);
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
+    }
 }
