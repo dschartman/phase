@@ -278,7 +278,7 @@ struct CliOptions {
     game_timeout: Option<Duration>,
     duel_p0: Option<String>,
     duel_p1: Option<String>,
-    /// `--temperature` / `--determinize`: single-mode overrides on the
+    /// `--temperature` / `--determinize` / `--root-width`: single-mode overrides on the
     /// difficulty preset's selection and hidden-information settings.
     search_overrides: SearchOverrides,
 }
@@ -308,6 +308,9 @@ impl SearchOverrides {
         if let Some(samples) = self.determinization_samples {
             config.search.determinization_samples = samples;
         }
+        if let Some(width) = self.root_max_branching {
+            config.search.root_max_branching = Some(width);
+        }
         config
     }
 
@@ -321,6 +324,9 @@ impl SearchOverrides {
         }
         if let Some(k) = self.determinization_samples {
             parts.push(format!("determinization: {k} worlds"));
+        }
+        if let Some(width) = self.root_max_branching {
+            parts.push(format!("root width: {width}"));
         }
         parts.iter().map(|part| format!(", {part}")).collect()
     }
@@ -551,6 +557,14 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                     "a number of determinized worlds (0 = perfect information)",
                 )?);
             }
+            "--root-width" => {
+                const EXPECTED: &str = "a root beam width >= 1";
+                let width: u32 = parse_value(&mut args, "--root-width", EXPECTED)?;
+                if width == 0 {
+                    return Err(format!("--root-width expects {EXPECTED}, got '0'"));
+                }
+                cli.search_overrides.root_max_branching = Some(width);
+            }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("Unknown option: {unknown}"));
             }
@@ -569,7 +583,7 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     // silently run the shipped tier while the command line claims otherwise.
     if cli.search_overrides != SearchOverrides::default() && cli.mode != Mode::Single {
         return Err(
-            "--temperature and --determinize apply only to single mode (with or without --batch)"
+            "--temperature, --determinize and --root-width apply only to single mode (with or without --batch)"
                 .to_string(),
         );
     }
@@ -1945,6 +1959,7 @@ fn print_usage() {
     eprintln!("  --p0-deck PATH     Decklist file for P0 (with --p1-deck, instead of --matchup)");
     eprintln!("  --temperature T    Single mode: selection temperature override (0 = argmax)");
     eprintln!("  --determinize K    Single mode: average K determinized hidden-info worlds");
+    eprintln!("  --root-width W     Single mode: root-only search beam width (interior keeps the preset's)");
     eprintln!("  --p1-deck PATH     Decklist file for P1. Lines: '<count> <card name>',");
     eprintln!("                     '//' or '#' comments, Deck/Sideboard headers. Any deck");
     eprintln!("                     size; every name must resolve in card-data.json.");
