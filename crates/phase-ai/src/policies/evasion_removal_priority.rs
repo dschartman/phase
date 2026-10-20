@@ -671,9 +671,19 @@ mod tests {
              killable 2/2={killable_delta}, unkillable 7/7={unkillable_delta}"
         );
 
+        // The complete Very Hard scorer ranks the 2/2 above the 7/7. Since the
+        // tactical gate prunes a damage target that survives while a killable
+        // sibling is offered (`TargetSurvivesKillOffered`), the 7/7 is not
+        // scored at all; if it is, it must rank below the 2/2.
         let scores = crate::search::score_candidates(state, P0, &config);
+        let killable_score = full_score_for_target(&scores, killable);
         assert!(
-            full_score_for_target(&scores, killable) > full_score_for_target(&scores, unkillable),
+            scores.iter().all(|(action, score)| !matches!(
+                action,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(id)),
+                } if *id == unkillable && *score >= killable_score
+            )),
             "the complete Very Hard scorer must carry the lethality preference through to the \
              final target ranking"
         );

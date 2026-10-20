@@ -74,7 +74,9 @@ use crate::policies::context::{
 use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, object_impact, targets_creatures_only, EffectPolarity,
 };
-use crate::policies::removal_lethality::toughness_reduction_is_lethal;
+use crate::policies::removal_lethality::{
+    outcome_is_lethal, pending_damage_to_object, toughness_reduction_is_lethal, PendingDamage,
+};
 use crate::policies::self_cost::fewest_mandatory_self_draws;
 use crate::policies::stack_awareness::{has_pending_removal, will_target_die_from_stack};
 use crate::policies::strategy_helpers::can_pay_ward_cost;
@@ -151,6 +153,10 @@ pub enum RejectReason {
     /// A one-shot cast or activation whose mandatory draws are more than the
     /// AI's library holds (CR 121.4 + CR 704.5b).
     DrawsPastLibrary,
+    /// `target_survives_while_a_kill_is_offered`: the target choice of a
+    /// committed fixed -X/-X or damage outside combat leaves its opposing
+    /// creature alive while the prompt offers one the effect kills.
+    TargetSurvivesKillOffered,
 }
 
 impl RejectReason {
@@ -175,6 +181,7 @@ impl RejectReason {
             RejectReason::ConvokeStrandsPip => "convoke_strands_pip",
             RejectReason::CancelCast => "cancel_cast",
             RejectReason::DrawsPastLibrary => "draws_past_library",
+            RejectReason::TargetSurvivesKillOffered => "target_survives_kill_offered",
         }
     }
 }
@@ -362,6 +369,9 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
         } => {
             if let Some(rejection) = reject_futile_target(ctx, target) {
                 return rejection;
+            }
+            if target_survives_while_a_kill_is_offered(ctx, target) {
+                return GateDecision::Reject(RejectReason::TargetSurvivesKillOffered);
             }
             let penalty = target_choice_penalty(ctx, target);
             if penalty < 0.0 {
@@ -2508,6 +2518,17 @@ fn negative_pump_kills_a_legal_opposing_creature(
     ctx: &PolicyContext<'_>,
     effects: &[&Effect],
 ) -> bool {
+    negative_pump_kills_a_legal_opposing_creature_among(ctx, effects, |_| true)
+}
+
+/// [`negative_pump_kills_a_legal_opposing_creature`] over the legal opposing
+/// creatures `is_candidate` admits: the one kill test, read at the cast over
+/// every target and at the target prompt over one target or its siblings.
+fn negative_pump_kills_a_legal_opposing_creature_among(
+    ctx: &PolicyContext<'_>,
+    effects: &[&Effect],
+    is_candidate: impl Fn(ObjectId) -> bool,
+) -> bool {
     let Some(source) = ctx.source_object() else {
         return true;
     };
@@ -2527,7 +2548,8 @@ fn negative_pump_kills_a_legal_opposing_creature(
             return true;
         };
         ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
-            !will_target_die_from_stack(ctx.state, id)
+            is_candidate(id)
+                && !will_target_die_from_stack(ctx.state, id)
                 && ctx
                     .state
                     .objects
@@ -2535,6 +2557,130 @@ fn negative_pump_kills_a_legal_opposing_creature(
                     .is_some_and(|object| toughness_reduction_is_lethal(object, reduction))
         })
     })
+}
+
+/// CR 601.2c + CR 115.1: at the AI's own target prompt for a spell or
+/// activation it has committed to, whose whole effect is a fixed -X/-X
+/// (`pure_fixed_pump_bonus` with a negative toughness) or damage, with one
+/// target slot and no division: the choice of an opposing creature the
+/// effect leaves alive is pruned while the prompt offers another opposing
+/// creature it kills. CR 704.5f + CR 704.5g + CR 514.2: outside combat a
+/// shrink or damage that does not kill is gone at cleanup, so the card buys
+/// nothing on that target. The pruning has the shape of
+/// `spell_mode_choice_is_futile`: a choice is pruned only while an issued
+/// sibling passes, so a prompt with no killable target is unchanged and the
+/// committed spell always keeps a continuation.
+///
+/// The kill test is the cast gate's: for a shrink
+/// `negative_pump_kills_a_legal_opposing_creature_among` (current toughness
+/// and marked damage, a creature already dying to the stack is no kill); for
+/// damage the removal-lethality model (`pending_damage_to_object` +
+/// `outcome_is_lethal`: wither, infect, deathtouch, indestructible), which
+/// the cast-time whiff check reads. A sibling counts only when the engine's
+/// targeting legality admits it (`find_legal_targets`: hexproof, shroud,
+/// protection). Stands down (CR 510.1a) while an opposing creature attacks or
+/// blocks before combat damage, as the cast gate does; on a target the AI
+/// controls or that is not a creature; on any rider, since the payload must
+/// be pure (a deliberate self-target rider, `is_deliberate_self_target_rider`,
+/// a bounce or flicker of the target, is never a `Pump` or `DealDamage`); and
+/// when the source, the filter or the damage cannot be read (fail open).
+fn target_survives_while_a_kill_is_offered(ctx: &PolicyContext<'_>, target: &TargetRef) -> bool {
+    let TargetRef::Object(target_id) = target else {
+        return false;
+    };
+    let WaitingFor::TargetSelection {
+        pending_cast,
+        target_slots,
+        ..
+    } = &ctx.decision.waiting_for
+    else {
+        return false;
+    };
+    if pending_cast.ability.controller != ctx.ai_player
+        || target_slots.len() != 1
+        || pending_cast.distribute.is_some()
+        || opposing_creature_in_combat_before_damage(ctx.state, ctx.ai_player)
+    {
+        return false;
+    }
+    let effects = ctx.effects();
+    let is_opposing_creature = ctx.state.objects.get(target_id).is_some_and(|object| {
+        is_opponent(ctx.state, ctx.ai_player, object.controller)
+            && object.card_types.core_types.contains(&CoreType::Creature)
+    });
+    if !is_opposing_creature {
+        return false;
+    }
+    let is_sibling = |id: ObjectId| {
+        id != *target_id
+            && ctx.decision.candidates.iter().any(|candidate| {
+                matches!(
+                    &candidate.action,
+                    GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(other)),
+                    } if *other == id
+                )
+            })
+    };
+    match pure_fixed_pump_bonus(&effects) {
+        Some((_, toughness)) if toughness < 0 => {
+            !negative_pump_kills_a_legal_opposing_creature_among(ctx, &effects, |id| {
+                id == *target_id
+            }) && negative_pump_kills_a_legal_opposing_creature_among(ctx, &effects, is_sibling)
+        }
+        Some(_) => false,
+        None => {
+            let all_damage = !effects.is_empty()
+                && effects
+                    .iter()
+                    .all(|effect| matches!(effect, Effect::DealDamage { .. }));
+            all_damage
+                && damage_kills_a_legal_opposing_creature_among(ctx, &effects, |id| {
+                    id == *target_id
+                }) == Some(false)
+                && damage_kills_a_legal_opposing_creature_among(ctx, &effects, is_sibling)
+                    == Some(true)
+        }
+    }
+}
+
+/// CR 120.3 + CR 704.5g: does the damage among `effects` kill a legal
+/// opposing creature `is_candidate` admits, read with the removal-lethality
+/// model (`pending_damage_to_object` + `outcome_is_lethal`)? A creature
+/// already dying to the stack is no kill. `None` when it cannot be told: no
+/// source, a damage effect whose filter cannot be read, or an admitted
+/// creature whose damage is not modelled while targets are chosen (CR 120.3,
+/// a source bound to a target).
+fn damage_kills_a_legal_opposing_creature_among(
+    ctx: &PolicyContext<'_>,
+    effects: &[&Effect],
+    is_candidate: impl Fn(ObjectId) -> bool,
+) -> Option<bool> {
+    let source = ctx.source_object()?;
+    let damage_to = |id: ObjectId| {
+        if !is_candidate(id) || will_target_die_from_stack(ctx.state, id) {
+            return None;
+        }
+        let object = ctx.state.objects.get(&id)?;
+        Some(match pending_damage_to_object(ctx, id, object) {
+            PendingDamage::Dealt(outcome) => Some(outcome_is_lethal(object, &outcome)),
+            PendingDamage::Unresolved => None,
+            PendingDamage::None => Some(false),
+        })
+    };
+    let mut unknown = false;
+    for effect in effects {
+        let filter = extract_target_filter(effect)?;
+        if ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
+            damage_to(id) == Some(Some(true))
+        }) {
+            return Some(true);
+        }
+        unknown |= ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
+            damage_to(id) == Some(None)
+        });
+    }
+    (!unknown).then_some(false)
 }
 
 fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {
@@ -14954,7 +15100,7 @@ mod tests {
         assert!(
             crate::cast_facts::collect_definition_effects(&state.objects[&spell].abilities[0])
                 .iter()
-                .any(|effect| is_deliberate_self_target_rider(effect)),
+                .any(is_deliberate_self_target_rider),
             "reach-guard: the bounce rider parses as a self-target rider"
         );
         cast_issued(&mut state, spell);
