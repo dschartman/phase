@@ -803,12 +803,17 @@ fn assess_cast_effects(
             source.card_types.core_types.contains(&CoreType::Instant)
                 || source.card_types.core_types.contains(&CoreType::Sorcery)
         });
-        if source_is_spell && toughness_bonus < 0 {
+        if toughness_bonus < 0
+            && (source_is_spell || activation_buys_a_shrink_with_a_card(ctx, effects))
+        {
             // CR 704.5f + CR 704.5g: a -X/-X spell is creature removal, not a
             // combat trick, and it has already passed the removal path above
             // (`is_redundant_creature_only_removal`: a live opposing target
             // that is not already dying). Outside combat it is only removal,
             // so it must kill a legal opposing creature to be worth a card.
+            // CR 602.2: an activation that discards or sacrifices for a
+            // shrink on an opposing creature spends a card the same way
+            // (Proft, Sinister Mastermind's "{B}, Discard this card: -3/-1").
             // CR 510.1a: while an opposing creature is attacking or blocking
             // before damage, shrinking it can stop or win damage without
             // killing it. That stays with policy scoring: the pump-window
@@ -2562,6 +2567,54 @@ fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {
     Some((power_bonus, toughness_bonus))
 }
 
+/// Whether some component of `ability`'s cost (`AbilityCost::categories`,
+/// which flattens a composite cost) is a category `is_category` accepts.
+fn ability_cost_has(
+    ability: &AbilityDefinition,
+    is_category: impl Fn(&CostCategory) -> bool,
+) -> bool {
+    ability
+        .cost
+        .as_ref()
+        .is_some_and(|cost| cost.categories().iter().any(is_category))
+}
+
+/// CR 602.2 + CR 701.21a: the candidate activates an ability whose cost
+/// discards or sacrifices, and every effect is harm aimed only at creatures
+/// (the creature-only harm `is_redundant_creature_only_removal` reads): a
+/// shrink on an opposing creature bought with a card or a permanent, which
+/// `assess_cast_effects` holds to the -X/-X spell's kill test. A pump on the
+/// source itself (Ravenous Bloodseeker's "Discard a card: +2/-2") names no
+/// creature-only target and stays out: its discard is the payoff. A loyalty
+/// cost stays out too (a planeswalker's +1 shrink is paid for by the loyalty
+/// it gains), as does a mana-only cost, which keeps the activated-pump
+/// branch's pump-window reading.
+fn activation_buys_a_shrink_with_a_card(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+    let GameAction::ActivateAbility {
+        source_id,
+        ability_index,
+    } = &ctx.candidate.action
+    else {
+        return false;
+    };
+    let Some(ability) = ctx
+        .state
+        .objects
+        .get(source_id)
+        .and_then(|source| source.abilities.get(*ability_index))
+    else {
+        return false;
+    };
+    ability_cost_has(ability, |category| {
+        matches!(
+            category,
+            CostCategory::SacrificesPermanent | CostCategory::Discards
+        )
+    }) && effects.iter().all(|effect| {
+        matches!(effect_polarity(effect), EffectPolarity::Harmful) && targets_creatures_only(effect)
+    })
+}
+
 /// The activated ability behind an in-class temporary-pump candidate, or
 /// `None` when the candidate is not one. Returns the ability's source object
 /// id (the permanent whose ability is being activated).
@@ -2576,7 +2629,9 @@ fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {
 /// - sacrifice / loyalty / discard costs: the activation's payoff is the cost
 ///   itself (a sacrifice outlet, a planeswalker's loyalty economy, a discard
 ///   enabler), priced by `free_outlet_activation` / `self_cost_value`, so the
-///   pump window is the wrong lens.
+///   pump window is the wrong lens. A discard or sacrifice paid for a shrink
+///   on an opposing creature is read by the -X/-X kill test instead
+///   (`activation_buys_a_shrink_with_a_card`).
 /// - `AsSorcery`: there is no later, stronger window to save the ability for.
 ///
 /// PayLife stays in class — Desolation Prowler is the reported card, and its
@@ -2598,15 +2653,11 @@ fn activated_ueot_pump_source(ctx: &PolicyContext<'_>) -> Option<ObjectId> {
     if !ability_is_temporary_combat_modifier(ability) {
         return None;
     }
-    let cost_is_its_own_payoff = ability.cost.as_ref().is_some_and(|cost| {
-        cost.categories().iter().any(|category| {
-            matches!(
-                category,
-                CostCategory::SacrificesPermanent
-                    | CostCategory::PaysLoyalty
-                    | CostCategory::Discards
-            )
-        })
+    let cost_is_its_own_payoff = ability_cost_has(ability, |category| {
+        matches!(
+            category,
+            CostCategory::SacrificesPermanent | CostCategory::PaysLoyalty | CostCategory::Discards
+        )
     });
     if cost_is_its_own_payoff
         || ability
