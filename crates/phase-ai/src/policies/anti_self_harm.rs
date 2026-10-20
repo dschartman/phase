@@ -874,27 +874,35 @@ pub(crate) fn recurring_self_draw_exposure(
     if schedule.per_round == 0 {
         return None;
     }
-    // CR 121.2 + CR 121.2a: the one-card instruction and its individual draw,
-    // the two events `start_draw_sequence` proposes. With no instruction-stage
-    // definition in play the instruction consult finds no candidate and
-    // survives, which is the engine's own skip.
-    let survives = |stage| {
+    draw_survives_replacement(state, controller, 1).then(|| SelfDrawExposure {
+        library: state.players[controller.0 as usize].library.len() as u32,
+        schedule,
+    })
+}
+
+/// Whether an instruction to draw `count` cards survives the replacement
+/// pipeline at both of the stages the draw sequence proposes it (CR 121.2a:
+/// the instruction, then its individual draw), the replacement legs of
+/// `can_draw_at_least_one` without its library leg (that helper is false on
+/// an empty library, the case the deck-out checks judge; CR 614.11: a draw
+/// replacement applies even then). A draw a mandatory replacement removes is
+/// no draw (CR 614.6). With no instruction-stage definition in play the
+/// instruction consult finds no candidate and survives, which is the engine's
+/// own skip. Shared by the recurring deck-out reading and the gate's one-shot
+/// check (`tactical_gate`, `DrawsPastLibrary`).
+pub(crate) fn draw_survives_replacement(state: &GameState, player: PlayerId, count: u32) -> bool {
+    let survives = |count, stage| {
         engine::game::replacement::proposed_draw_survives_replacement(
             state,
             &ProposedEvent::Draw {
-                player_id: controller,
-                count: 1,
+                player_id: player,
+                count,
                 stage,
                 applied: std::collections::HashSet::new(),
             },
         )
     };
-    let draw_survives =
-        survives(DrawEventStage::Instruction) && survives(DrawEventStage::Individual);
-    draw_survives.then(|| SelfDrawExposure {
-        library: state.players[controller.0 as usize].library.len() as u32,
-        schedule,
-    })
+    survives(count, DrawEventStage::Instruction) && survives(1, DrawEventStage::Individual)
 }
 
 /// The mandatory draws a permanent's phase triggers give its controller:
