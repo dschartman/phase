@@ -309,7 +309,7 @@ fn ai_features(ctx: &PolicyContext<'_>) -> DeckFeatures {
 
 /// The AI's own plan, which the keep order a discard cost follows reads, as
 /// `policies::payment_selection` reads it at the `PayCost` prompt.
-fn discarding_plan(ctx: &PolicyContext<'_>) -> Option<PlanState> {
+pub(crate) fn discarding_plan(ctx: &PolicyContext<'_>) -> Option<PlanState> {
     ctx.context
         .session
         .plan

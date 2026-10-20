@@ -346,11 +346,20 @@ pub(crate) fn given_up_value(
 ) -> f64 {
     given_up_cards(state, pool, count, plan)
         .into_iter()
-        .map(|id| match keep_tier(state, id, plan) {
-            KeepTier::Surplus => 0.0,
-            KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
-        })
+        .map(|id| held_value(state, id, plan))
         .sum()
+}
+
+/// The value of holding one card, on the [`intrinsic_value`] scale: its own
+/// value, except a [`KeepTier::Surplus`] mana source, which adds nothing the
+/// plan wants (CR 305.2, one land a turn). The single per-card price behind
+/// [`given_up_value`], [`expected_draw_value`] and [`expected_loot_gain`], so
+/// what a discard gives up and what a draw brings are on one scale.
+fn held_value(state: &GameState, id: ObjectId, plan: Option<PlanState>) -> f64 {
+    match keep_tier(state, id, plan) {
+        KeepTier::Surplus => 0.0,
+        KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
+    }
 }
 
 /// The first `count` cards of `pool` in [`cmp_keep`] order: the cards a
@@ -385,14 +394,58 @@ pub(crate) fn expected_draw_value(
     if library.is_empty() {
         return None;
     }
-    let total: f64 = library
+    let total: f64 = library.iter().map(|&id| held_value(state, id, plan)).sum();
+    Some((total / library.len() as f64).max(EXPECTED_DRAW_FLOOR))
+}
+
+/// CR 121.1 + CR 701.9a: the card quality a loot of `count` ("draw `count`
+/// cards, then discard `count` cards") exchanges for `player`, on the
+/// [`intrinsic_value`] scale, with `pool` the hand the discard chooses from
+/// (the cards the loot itself draws join it).
+///
+/// The discard comes after the draw, so the player can always discard a card
+/// it just drew and end with the hand it had: a loot never loses card
+/// quality. Each of the first `count` cards the keep order gives up from
+/// `pool` ([`given_up_cards`], the cards [`given_up_value`] prices) is set
+/// against one draw: the pair exchanges the draw's value over the given-up
+/// card's, or nothing when the draw is worse, averaged over the library (a
+/// draw is an expected card, [`expected_draw_value`]'s reading: the library's
+/// order is hidden). A draw with no card left in `pool` to set it against
+/// exchanges nothing: the draw is the card discarded. So a dead card in hand
+/// against an average library gains about one expected draw, and a hand of
+/// keepers against a library of cards under [`KEEP_VALUE_FLOOR`] gains
+/// nothing. For `count` above one the pairing is the first-order reading: a
+/// later draw could also displace an earlier one, which it does not price.
+///
+/// `None` when the library holds fewer than `count` cards: the draw runs past
+/// it (CR 704.5b), which the search reads as the loss, not as card quality.
+pub(crate) fn expected_loot_gain(
+    state: &GameState,
+    player: PlayerId,
+    pool: &[ObjectId],
+    count: usize,
+    plan: Option<PlanState>,
+) -> Option<f64> {
+    let library = &state.players.get(player.0 as usize)?.library;
+    if library.len() < count || library.is_empty() {
+        return None;
+    }
+    let draws: Vec<f64> = library
         .iter()
-        .map(|&id| match keep_tier(state, id, plan) {
-            KeepTier::Surplus => 0.0,
-            KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
+        .map(|&id| held_value(state, id, plan))
+        .collect();
+    let gain = given_up_cards(state, pool, count, plan)
+        .into_iter()
+        .map(|id| {
+            let given_up = held_value(state, id, plan);
+            draws
+                .iter()
+                .map(|draw| (draw - given_up).max(0.0))
+                .sum::<f64>()
+                / draws.len() as f64
         })
         .sum();
-    Some((total / library.len() as f64).max(EXPECTED_DRAW_FLOOR))
+    Some(gain)
 }
 
 /// The least an expected draw is worth, on the [`intrinsic_value`] scale.
