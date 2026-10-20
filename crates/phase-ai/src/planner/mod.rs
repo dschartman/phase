@@ -710,6 +710,23 @@ const SUCCESSOR_STATE_CAPACITY: usize = 16;
 /// all, so 256 is headroom rather than a tuned value.
 const SUCCESSOR_EDGE_CAPACITY: usize = 256;
 
+/// Ceiling on the priority passes `PlannerServices::resolve_own_triggers_at`
+/// makes per entry. Reached only by an own trigger whose resolution makes
+/// another (a mandatory loop, CR 104.4b).
+const MAX_OWN_TRIGGER_PASSES: u32 = 20;
+
+/// Ceiling on the opponent windows over the AI's own trigger whose pass is
+/// searched at no depth along one path (`PlannerServices::free_windows_on_path`);
+/// past it a window is passed like the AI's own priority, as the passes were
+/// before windows were searched. One window per own trigger resolved in the
+/// line, so four covers a spell with four of the AI's triggers over it. Each
+/// window adds a node with its own subtree at the same depth, and a mandatory
+/// loop with an opponent able to respond would otherwise chain them without
+/// end in the rollout, which charges no node budget (measurement mode sets no
+/// deadline): with that loop the search takes about 4 s in a debug build at
+/// four, 15 s at twenty.
+const MAX_FREE_OPPONENT_WINDOWS: u32 = 4;
+
 /// Identity of one position inside a single decision's search.
 ///
 /// Issued only by [`PlannerServices`]. An id denotes exactly one `GameState`
@@ -806,6 +823,32 @@ enum QuiesceStep {
     Advanced(Option<SearchNodeId>),
     /// The action failed to apply; quiescence stops here.
     Failed,
+}
+
+/// Where [`PlannerServices::resolve_own_triggers_at`] stopped passing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnTriggerStop {
+    /// No AI trigger on top with a player to pass for it: the position is
+    /// searched as any other.
+    Settled,
+    /// An opponent holds priority over the AI's own trigger on top (CR
+    /// 117.3d) with an instant-speed action issued (CR 117.1a). The position
+    /// is the opponent's node at the same depth; its pass resolves the
+    /// trigger (CR 117.4) and is searched at that depth too, so the window
+    /// costs the line nothing, while a response is a ply like any other.
+    OpponentWindow,
+}
+
+impl OwnTriggerStop {
+    /// Plies remaining below this position after `action`: the opponent's
+    /// pass in an [`OwnTriggerStop::OpponentWindow`] keeps `depth`, every
+    /// other action spends one.
+    fn child_depth(self, action: &GameAction, depth: u32) -> u32 {
+        match self {
+            Self::OpponentWindow if matches!(action, GameAction::PassPriority) => depth,
+            Self::OpponentWindow | Self::Settled => depth - 1,
+        }
+    }
 }
 
 /// Whether `player` controls any object on the stack (CR 405.1).
@@ -910,6 +953,12 @@ pub struct PlannerServices<'a> {
     /// evidence that repeated work was actually skipped, used by the memo
     /// regression tests.
     pub memo_witness: SearchMemoWitness,
+    /// Opponent windows over the AI's own trigger passed at no depth on the
+    /// path being searched (raised around each such child, lowered after).
+    /// At `MAX_FREE_OPPONENT_WINDOWS` a further window is passed like the
+    /// AI's own priority, so a same-depth chain ends even where nothing else
+    /// bounds it.
+    free_windows_on_path: u32,
 }
 
 impl<'a> PlannerServices<'a> {
@@ -998,6 +1047,7 @@ impl<'a> PlannerServices<'a> {
             successor_edge_capacity: SUCCESSOR_EDGE_CAPACITY,
             node_contexts: HashMap::new(),
             memo_witness: SearchMemoWitness::default(),
+            free_windows_on_path: 0,
         }
     }
 
@@ -1256,23 +1306,38 @@ impl<'a> PlannerServices<'a> {
         apply_candidate(state, candidate)
     }
 
+    /// [`PlannerServices::sample_backfilled_edges`] without the actions.
+    #[cfg(test)]
+    fn sample_backfilled_continuations(
+        &mut self,
+        node: Option<SearchNodeId>,
+        state: &GameState,
+        priors: Vec<PolicyPrior>,
+        sample_count: usize,
+    ) -> Vec<(f64, Option<SearchNodeId>, Arc<GameState>)> {
+        self.sample_backfilled_edges(node, state, priors, sample_count)
+            .into_iter()
+            .map(|(prior, _, child, sim)| (prior, child, sim))
+            .collect()
+    }
+
     /// Sample up to `sample_count` legal continuations, prior-ranked with
     /// legality backfill: candidates are sorted by prior (desc), applied in
     /// order, and illegal ones (`apply_candidate` → None) are skipped WITHOUT
     /// consuming a sample slot, so a high-prior illegal candidate does not
     /// starve the sample. Returns each surviving continuation paired with the
-    /// prior that produced it and with the identity of the position it reached
-    /// (`None` when untracked). `&mut self` because each continuation goes
-    /// through the successor memo under `node`, which must identify `state`
-    /// when given; a prior's carried payment successor is moved out and never
-    /// memoized.
-    fn sample_backfilled_continuations(
+    /// prior that produced it, its action, and the identity of the position
+    /// it reached (`None` when untracked). `&mut self` because each
+    /// continuation goes through the successor memo under `node`, which must
+    /// identify `state` when given; a prior's carried payment successor is
+    /// moved out and never memoized.
+    fn sample_backfilled_edges(
         &mut self,
         node: Option<SearchNodeId>,
         state: &GameState,
         mut priors: Vec<PolicyPrior>,
         sample_count: usize,
-    ) -> Vec<(f64, Option<SearchNodeId>, Arc<GameState>)> {
+    ) -> Vec<(f64, GameAction, Option<SearchNodeId>, Arc<GameState>)> {
         priors.sort_by(|a, b| {
             b.prior
                 .partial_cmp(&a.prior)
@@ -1296,7 +1361,7 @@ impl<'a> PlannerServices<'a> {
             }
             let sim = self.successor_edge(node, state, &prior.candidate, prior.payment_successor);
             if let Some((child, sim)) = sim {
-                out.push((prior.prior, child, sim));
+                out.push((prior.prior, prior.candidate.action, child, sim));
             }
         }
         out
@@ -1689,35 +1754,78 @@ impl<'a> PlannerServices<'a> {
     /// a prowess trigger (CR 702.108a) or any other own trigger takes no ply
     /// that the same line without the trigger spends on reaching combat.
     /// Opponents' triggers, spells and activations stay search nodes; so do
-    /// a trigger's resolution choices (not a priority point). The response
-    /// window over the trigger is not modelled, the optimism of quiescence's
-    /// case 0; responses to the object under it still are.
+    /// a trigger's resolution choices (not a priority point).
     ///
-    /// Returns the identity of the position reached (when tracked) and a
-    /// cursor at it, still borrowing `state` when no step was taken. A failed
-    /// apply falls back to `state` itself.
+    /// The AI's own priority is passed free. An opponent's priority over the
+    /// trigger (CR 117.3d) is passed free only when the opponent can do
+    /// nothing but pass; when it has an instant-speed action issued (CR
+    /// 117.1a: an instant, an activation) the passes stop there with
+    /// [`OwnTriggerStop::OpponentWindow`], and the caller searches that
+    /// position as the opponent's node at the same depth (its pass at the same
+    /// depth, see [`OwnTriggerStop::child_depth`]). A sacrifice or a shrink in
+    /// response to the trigger is then a line the search sees, not one it
+    /// passes over. Past `MAX_FREE_OPPONENT_WINDOWS` windows on the path, a
+    /// window is passed free as well.
+    ///
+    /// Returns the identity of the position reached (when tracked), a cursor
+    /// at it, still borrowing `state` when no step was taken, and where the
+    /// passes stopped. A failed apply falls back to `state` itself.
     fn resolve_own_triggers_at<'s>(
         &mut self,
         node: Option<SearchNodeId>,
         state: &'s GameState,
-    ) -> (Option<SearchNodeId>, QuiesceCursor<'s>) {
-        const MAX_OWN_TRIGGER_PASSES: u32 = 20;
-
+    ) -> (Option<SearchNodeId>, QuiesceCursor<'s>, OwnTriggerStop) {
         let mut reached = node;
         let mut cursor = QuiesceCursor::Borrowed(state);
         for _ in 0..MAX_OWN_TRIGGER_PASSES {
-            if self.deadline.expired()
-                || !matches!(cursor.state().waiting_for, WaitingFor::Priority { .. })
-                || !top_is_own_trigger(cursor.state(), self.ai_player)
-            {
+            if self.deadline.expired() || !top_is_own_trigger(cursor.state(), self.ai_player) {
                 break;
+            }
+            let WaitingFor::Priority { player } = cursor.state().waiting_for else {
+                break;
+            };
+            if player != self.ai_player
+                && self.free_windows_on_path < MAX_FREE_OPPONENT_WINDOWS
+                && self.can_act_at_priority(reached, cursor.state())
+            {
+                return (reached, cursor, OwnTriggerStop::OpponentWindow);
             }
             match self.quiesce_step(reached, &mut cursor, GameAction::PassPriority) {
                 QuiesceStep::Advanced(next) => reached = next,
-                QuiesceStep::Failed => return (node, QuiesceCursor::Borrowed(state)),
+                QuiesceStep::Failed => {
+                    return (
+                        node,
+                        QuiesceCursor::Borrowed(state),
+                        OwnTriggerStop::Settled,
+                    )
+                }
             }
         }
-        (reached, cursor)
+        (reached, cursor, OwnTriggerStop::Settled)
+    }
+
+    /// Whether the player holding priority at `state` has an action other
+    /// than passing among the search's candidates (CR 117.1a). The context is
+    /// the one the search reads at this position, built once and shared.
+    /// `node`, when given, must identify `state`.
+    fn can_act_at_priority(&mut self, node: Option<SearchNodeId>, state: &GameState) -> bool {
+        self.build_decision_context_at(node, state)
+            .candidates
+            .iter()
+            .any(|candidate| !matches!(candidate.action, GameAction::PassPriority))
+    }
+
+    /// Run `search` on a child position, counting it in
+    /// `free_windows_on_path` while it runs when it was reached at no depth
+    /// (the opponent's pass in an [`OwnTriggerStop::OpponentWindow`]).
+    fn searching_child<T>(&mut self, free: bool, search: impl FnOnce(&mut Self) -> T) -> T {
+        if !free {
+            return search(self);
+        }
+        self.free_windows_on_path += 1;
+        let value = search(self);
+        self.free_windows_on_path -= 1;
+        value
     }
 
     /// Evaluate a leaf state with quiescence: if the stack is non-empty and only
@@ -1926,8 +2034,9 @@ impl<'a> PlannerServices<'a> {
         if depth == 0 || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             return self.quiesced_leaf_eval_at(node, state);
         }
-        // The AI's own triggers on top resolve at this depth.
-        let (node, own_resolved) = self.resolve_own_triggers_at(node, state);
+        // The AI's own triggers on top resolve at this depth; an opponent
+        // window over one is sampled here, its pass at this depth.
+        let (node, own_resolved, stop) = self.resolve_own_triggers_at(node, state);
         let state = own_resolved.state();
         if matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             return self.quiesced_leaf_eval_at(node, state);
@@ -1941,7 +2050,7 @@ impl<'a> PlannerServices<'a> {
         let rollout_player = state.waiting_for.acting_player().unwrap_or(self.ai_player);
         let sample_count = self.config.search.rollout_samples.max(1) as usize;
         let continuations =
-            self.sample_backfilled_continuations(node, state, evaluation.priors, sample_count);
+            self.sample_backfilled_edges(node, state, evaluation.priors, sample_count);
         if continuations.is_empty() {
             return self.quiesced_leaf_eval_at(node, state);
         }
@@ -1955,8 +2064,11 @@ impl<'a> PlannerServices<'a> {
         let is_maximizing = rollout_player == self.ai_player;
         continuations
             .into_iter()
-            .map(|(prior, child, sim)| {
-                self.rollout_estimate_at(child, &sim, depth - 1) + (prior * 0.05)
+            .map(|(prior, action, child, sim)| {
+                let child_depth = stop.child_depth(&action, depth);
+                self.searching_child(child_depth == depth, |services| {
+                    services.rollout_estimate_at(child, &sim, child_depth)
+                }) + (prior * 0.05)
             })
             .reduce(|best, value| {
                 if is_maximizing {
@@ -2027,8 +2139,9 @@ impl BeamContinuationPlanner {
         if depth == 0 {
             return services.rollout_estimate_at(node, state, self.rollout_depth);
         }
-        // The AI's own triggers on top resolve at this depth.
-        let (node, own_resolved) = services.resolve_own_triggers_at(node, state);
+        // The AI's own triggers on top resolve at this depth; an opponent
+        // window over one is this node, its pass searched at this depth.
+        let (node, own_resolved, stop) = services.resolve_own_triggers_at(node, state);
         let state = own_resolved.state();
         if budget.exhausted() || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             return services.evaluate_state_quiesced_at(node, state);
@@ -2102,16 +2215,19 @@ impl BeamContinuationPlanner {
             ) else {
                 continue;
             };
-            let value = self.search_value_at(
-                child,
-                &sim,
-                depth - 1,
-                ply + 1,
-                alpha,
-                beta,
-                services,
-                budget,
-            ) + (ranked.score * 0.05);
+            let child_depth = stop.child_depth(&ranked.candidate.action, depth);
+            let value = services.searching_child(child_depth == depth, |services| {
+                self.search_value_at(
+                    child,
+                    &sim,
+                    child_depth,
+                    ply + 1,
+                    alpha,
+                    beta,
+                    services,
+                    budget,
+                )
+            }) + (ranked.score * 0.05);
 
             if is_maximizing {
                 best = best.max(value);
