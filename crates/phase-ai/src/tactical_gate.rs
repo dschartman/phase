@@ -12372,4 +12372,135 @@ mod tests {
             );
         }
     }
+
+    // --- a recurring mandatory self-draw cast that decks the AI -------------
+    //
+    // CR 121.4 + CR 704.5b: a player who draws from an empty library loses at
+    // the next state-based action check. A permanent whose "you draw" phase
+    // trigger is mandatory, cast when the draws it makes before the AI's own
+    // next draw step are at least the library, loses the game: a gate reject,
+    // not a price (seed 1037 T37, uwb cast The Theorist at library 0).
+
+    const DECK_OUT_THEORIST_ORACLE: &str =
+        "At the beginning of each opponent's draw step, you draw a card.\n\
+         [+1]: Create a 1/1 blue Illusion creature token.\n\
+         [\u{2212}2]: For each opponent, return up to one target artifact or creature that player \
+         controls to its owner's hand.\n\
+         [\u{2212}6]: Draw three cards. Then put X +1/+1 counters on each creature you control, \
+         where X is the number of cards in your hand.";
+
+    const DECK_OUT_ARENA_ORACLE: &str =
+        "At the beginning of your upkeep, you draw a card and lose 1 life.";
+
+    /// P0 on its own precombat main with four Islands and three Swamps and
+    /// `library` cards in library; P1 with 25. Returns the state and the
+    /// permanent `add` puts in P0's hand.
+    fn self_draw_table(
+        library: usize,
+        add: impl FnOnce(&mut GameScenario) -> ObjectId,
+    ) -> (GameState, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for color in [
+            engine::types::mana::ManaColor::Blue,
+            engine::types::mana::ManaColor::Blue,
+            engine::types::mana::ManaColor::Blue,
+            engine::types::mana::ManaColor::Blue,
+            engine::types::mana::ManaColor::Black,
+            engine::types::mana::ManaColor::Black,
+            engine::types::mana::ManaColor::Black,
+        ] {
+            scenario.add_basic_land(P0, color);
+        }
+        for _ in 0..library {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let id = add(&mut scenario);
+        (scenario.build().state().clone(), id)
+    }
+
+    fn theorist_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        let mut builder = scenario.add_spell_to_hand(P0, "The Theorist, Jace Beleren", false);
+        builder
+            .from_oracle_text(DECK_OUT_THEORIST_ORACLE)
+            .as_planeswalker_with_loyalty("Jace", 3)
+            .as_legendary()
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                generic: 2,
+            })
+            .id()
+    }
+
+    fn arena_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        let mut builder = scenario.add_spell_to_hand(P0, "Phyrexian Arena", false);
+        builder.as_enchantment();
+        builder
+            .from_oracle_text(DECK_OUT_ARENA_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                generic: 1,
+            })
+            .id()
+    }
+
+    /// Whether the engine offers the cast of `spell`, and whether it survives
+    /// the gate.
+    fn offered_and_kept(state: &GameState, spell: ObjectId) -> (bool, bool) {
+        let is_cast = |action: &GameAction| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == spell);
+        let offered = candidate_actions(state)
+            .iter()
+            .any(|candidate| is_cast(&candidate.action));
+        let kept = gated_actions(state).iter().any(is_cast);
+        (offered, kept)
+    }
+
+    #[test]
+    fn the_theorist_onto_an_empty_library_is_gated_out() {
+        let (state, theorist) = self_draw_table(0, theorist_in_hand);
+        assert_eq!(
+            offered_and_kept(&state, theorist),
+            (true, false),
+            "The Theorist onto an empty library decks the AI at the opponent's draw step"
+        );
+    }
+
+    /// One card, one opponent: her trigger draws it at the opponent's draw
+    /// step, before the AI's own draw step (CR 504.1), which then decks it.
+    #[test]
+    fn the_theorist_onto_one_card_with_one_opponent_is_gated_out() {
+        let (state, theorist) = self_draw_table(1, theorist_in_hand);
+        assert_eq!(offered_and_kept(&state, theorist), (true, false));
+    }
+
+    /// Guard: eleven cards is a short horizon, priced by AntiSelfHarm, not a
+    /// loss the gate can prove.
+    #[test]
+    fn the_theorist_onto_eleven_cards_stays_a_candidate() {
+        let (state, theorist) = self_draw_table(11, theorist_in_hand);
+        assert_eq!(offered_and_kept(&state, theorist), (true, true));
+    }
+
+    #[test]
+    fn the_theorist_onto_twenty_five_cards_stays_a_candidate() {
+        let (state, theorist) = self_draw_table(25, theorist_in_hand);
+        assert_eq!(offered_and_kept(&state, theorist), (true, true));
+    }
+
+    /// The class: Phyrexian Arena's upkeep draw comes before the AI's own next
+    /// draw step (CR 503.1 + CR 504.1).
+    #[test]
+    fn upkeep_self_draw_enchantment_onto_an_empty_library_is_gated_out() {
+        let (state, arena) = self_draw_table(0, arena_in_hand);
+        assert_eq!(offered_and_kept(&state, arena), (true, false));
+    }
+
+    #[test]
+    fn upkeep_self_draw_enchantment_onto_two_cards_stays_a_candidate() {
+        let (state, arena) = self_draw_table(2, arena_in_hand);
+        assert_eq!(offered_and_kept(&state, arena), (true, true));
+    }
 }
