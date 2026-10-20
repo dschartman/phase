@@ -14243,4 +14243,224 @@ mod tests {
         );
         assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
     }
+
+    // --- an activated -X/-X paid for with a card or a permanent must kill something ---
+    //
+    // CR 602.2 + CR 704.5f: an activation whose cost discards or sacrifices
+    // and whose effect is a fixed negative-toughness pump on an opposing
+    // creature is removal bought with a card, read as the -X/-X spell is:
+    // outside combat it must kill a legal opposing creature (seed 1001 T18,
+    // Proft, Sinister Mastermind pitched for -3/-1 on a 4/4 Archive Arbiter in
+    // the opponent's main phase, with the Arbiter's trigger on the stack).
+
+    const PHYREXIAN_DEFILER_ORACLE: &str =
+        "{T}, Sacrifice this creature: Target creature gets -3/-3 until end of turn.";
+    const HAGRA_SHARPSHOOTER_ORACLE: &str = "{4}{B}: Target creature gets -1/-1 until end of turn.";
+    const RAVENOUS_BLOODSEEKER_ORACLE: &str =
+        "Discard a card: This creature gets +2/-2 until end of turn.";
+
+    /// P0 at priority in P1's precombat main with five untapped Swamps, P1
+    /// with one `power`/`toughness` creature (returned
+    /// second) and 25 cards in each library; `add` places the activation's
+    /// source.
+    fn shrink_activation_table(
+        power: i32,
+        toughness: i32,
+        add: impl FnOnce(&mut GameScenario) -> ObjectId,
+    ) -> (GameState, ObjectId, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..5 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P0, "Swamp");
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let opposing = scenario.add_creature(P1, "Opposing", power, toughness).id();
+        let source = add(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        (state.clone(), source, opposing)
+    }
+
+    /// The gate's verdict on the engine-issued activation of `source`'s
+    /// ability 0, or `None` when the engine does not issue it.
+    fn issued_activation_verdict(
+        state: &GameState,
+        source: ObjectId,
+    ) -> Option<Option<RejectReason>> {
+        let issued = candidate_actions(state);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        let context = AiContext::empty(&config.weights);
+        let decisions = gate_decisions(state, &decision, &issued, P0, &config, &context);
+        issued
+            .iter()
+            .position(|candidate| {
+                matches!(
+                    &candidate.action,
+                    GameAction::ActivateAbility { source_id, ability_index: 0 }
+                        if *source_id == source
+                )
+            })
+            .map(|index| decisions[index].reject_reason())
+    }
+
+    fn defiler_on_battlefield(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_creature_from_oracle(P0, "Phyrexian Defiler", 3, 3, PHYREXIAN_DEFILER_ORACLE)
+            .id()
+    }
+
+    /// Seed 1001 T18: Proft's "{B}, Discard this card: Target creature gets
+    /// -3/-1" from hand (CR 113.6j) with the only opposing creature a 4/4,
+    /// outside combat. The -1 kills nothing; the card is thrown away.
+    #[test]
+    fn proft_pitch_shrink_rejected_when_it_kills_nothing_outside_combat() {
+        let (state, proft, _) = shrink_activation_table(4, 4, proft_in_hand);
+        assert_eq!(
+            issued_activation_verdict(&state, proft),
+            Some(Some(RejectReason::ShrinkKillsNothing))
+        );
+    }
+
+    /// Same, with the opponent's own trigger on the stack (the seed 1001 T18
+    /// window: Archive Arbiter's enter trigger). A shrink that kills nothing
+    /// is not changed by an unrelated stack object.
+    #[test]
+    fn proft_pitch_shrink_rejected_with_an_unrelated_trigger_on_the_stack() {
+        let (mut state, proft, opposing) = shrink_activation_table(4, 4, proft_in_hand);
+        state.stack.push_back(StackEntry {
+            id: ObjectId(910),
+            source_id: opposing,
+            controller: P1,
+            kind: StackEntryKind::Spell {
+                ability: Some(Box::new(ResolvedAbility::new(
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 4 },
+                        player: TargetFilter::Controller,
+                    },
+                    Vec::new(),
+                    opposing,
+                    P1,
+                ))),
+                card_id: CardId(910),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+        assert_eq!(
+            issued_activation_verdict(&state, proft),
+            Some(Some(RejectReason::ShrinkKillsNothing))
+        );
+    }
+
+    /// CR 704.5f: against a 2/1 the -1 toughness is lethal, so the pitch is
+    /// removal and stays a candidate.
+    #[test]
+    fn proft_pitch_shrink_kept_when_it_kills_an_opposing_creature() {
+        let (state, proft, _) = shrink_activation_table(2, 1, proft_in_hand);
+        assert_eq!(issued_activation_verdict(&state, proft), Some(None));
+    }
+
+    /// CR 510.1a: while the opposing 4/4 attacks before damage, -3/-1 cuts
+    /// the damage it deals without killing it; that stays with scoring.
+    #[test]
+    fn proft_pitch_shrink_kept_on_an_attacker_before_damage() {
+        let (mut state, proft, opposing) = shrink_activation_table(4, 4, proft_in_hand);
+        set_priority_window(&mut state, Phase::DeclareBlockers, P1);
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(opposing, P0)],
+            ..Default::default()
+        });
+        assert_eq!(issued_activation_verdict(&state, proft), Some(None));
+    }
+
+    /// CR 510.1c: an opposing 4/4 blocking the AI's 3/3 before damage; shrunk
+    /// to 1/3 it dies to the attacker. Kept.
+    #[test]
+    fn proft_pitch_shrink_kept_on_a_blocker_before_damage() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+        let attacker = scenario.add_creature(P0, "Our Bear", 3, 3).id();
+        let opposing = scenario.add_creature(P1, "Opposing", 4, 4).id();
+        let proft = proft_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::DeclareBlockers, P0);
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, P1)],
+            blocker_assignments: [(attacker, vec![opposing])].into_iter().collect(),
+            blocker_to_attacker: [(opposing, vec![attacker])].into_iter().collect(),
+            ..Default::default()
+        });
+        assert_eq!(issued_activation_verdict(state, proft), Some(None));
+    }
+
+    /// The sacrifice cost is in the class: Phyrexian Defiler's "{T},
+    /// Sacrifice this creature: -3/-3" against an opposing 4/4 outside combat
+    /// kills nothing (rejected); against a 3/3 it kills (kept).
+    #[test]
+    fn sacrifice_cost_shrink_reads_the_same_kill_test() {
+        let (state, defiler, _) = shrink_activation_table(4, 4, defiler_on_battlefield);
+        assert_eq!(
+            issued_activation_verdict(&state, defiler),
+            Some(Some(RejectReason::ShrinkKillsNothing))
+        );
+        let (state, defiler, _) = shrink_activation_table(3, 3, defiler_on_battlefield);
+        assert_eq!(issued_activation_verdict(&state, defiler), Some(None));
+    }
+
+    /// Guard: a mana-only activated -1/-1 (Hagra Sharpshooter) keeps the
+    /// activated-pump branch's reading, the pump window, whatever it kills.
+    #[test]
+    fn mana_only_activated_shrink_keeps_the_pump_window_reading() {
+        for (power, toughness) in [(4, 4), (1, 1)] {
+            let (state, sharpshooter, _) = shrink_activation_table(power, toughness, |scenario| {
+                scenario
+                    .add_creature_from_oracle(
+                        P0,
+                        "Hagra Sharpshooter",
+                        2,
+                        2,
+                        HAGRA_SHARPSHOOTER_ORACLE,
+                    )
+                    .id()
+            });
+            assert_parses_as_temporary_pump(&state, sharpshooter);
+            assert_eq!(
+                issued_activation_verdict(&state, sharpshooter),
+                Some(Some(RejectReason::PumpWindow)),
+                "mana-only -1/-1 against a {power}/{toughness}"
+            );
+        }
+    }
+
+    /// Guard: a discard-cost pump on the source itself (Ravenous Bloodseeker,
+    /// +2/-2) is no shrink on an opposing creature; the discard is the
+    /// payoff (an outlet), so it stays a candidate as before.
+    #[test]
+    fn discard_cost_self_pump_is_not_read_as_a_shrink() {
+        let (state, bloodseeker, _) = shrink_activation_table(4, 4, |scenario| {
+            let id = scenario
+                .add_creature_from_oracle(
+                    P0,
+                    "Ravenous Bloodseeker",
+                    1,
+                    3,
+                    RAVENOUS_BLOODSEEKER_ORACLE,
+                )
+                .id();
+            scenario.add_land_to_hand(P0, "Swamp");
+            id
+        });
+        assert_parses_as_temporary_pump(&state, bloodseeker);
+        assert_eq!(issued_activation_verdict(&state, bloodseeker), Some(None));
+    }
 }
