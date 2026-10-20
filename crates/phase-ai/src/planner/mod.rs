@@ -2167,6 +2167,12 @@ mod leaf_credit_tests;
 mod leaf_lasting_pt_tests;
 
 #[cfg(test)]
+mod leaf_eot_judge_rows_tests;
+
+#[cfg(test)]
+mod precombat_pump_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
