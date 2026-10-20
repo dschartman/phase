@@ -95,6 +95,29 @@ pub(crate) struct PreparedCandidate {
     pub payment_successor: Option<GameState>,
 }
 
+/// The candidates an interior search node (beam or rollout) explores. Every
+/// interior node is reached from a root candidate the AI already chose, and
+/// the root weighed not committing to it (the pass and the other root
+/// candidates), so withdrawing a pending cast or activation (CR 601.2,
+/// CR 602.2b: `CancelCast`) is not a line of that candidate: taking it scored
+/// a cost-paying action as the best of its own line and of every
+/// alternative. `CancelCast` is the only such action: `BackToManaPayment` and
+/// `UntapLandForMana` step within a payment, not out of the commitment. When
+/// it is the only candidate (a cost the AI cannot pay) it stays, the engine's
+/// escape, and the line continues from the withdrawn position.
+fn interior_candidates(candidates: &[CandidateAction]) -> Vec<CandidateAction> {
+    let is_cancel =
+        |candidate: &CandidateAction| matches!(candidate.action, GameAction::CancelCast);
+    if candidates.iter().all(is_cancel) {
+        return candidates.to_vec();
+    }
+    candidates
+        .iter()
+        .filter(|candidate| !is_cancel(candidate))
+        .cloned()
+        .collect()
+}
+
 /// Fail closed for affiliated payment states before ranking or width limits.
 ///
 /// The accepted successor is retained so a planning edge does not apply its
@@ -1775,7 +1798,7 @@ impl<'a> PlannerServices<'a> {
         // (`apply_candidate` → None), mirroring the beam path. This removes one
         // clone-and-apply-per-candidate probe (`state_clone_for_legality`).
         let ctx = self.build_decision_context_at(node, state);
-        let candidates = prepare_payment_candidates(state, ctx.candidates.clone());
+        let candidates = prepare_payment_candidates(state, interior_candidates(&ctx.candidates));
         let scoring_player = state.waiting_for.acting_player().unwrap_or(self.ai_player);
         let mut priors = self.policy_priors(
             state,
@@ -1967,7 +1990,7 @@ impl BeamContinuationPlanner {
         // path (planner_evaluation → sample_backfilled_continuations) applies the
         // same skip: illegal candidates are dropped when apply_candidate returns
         // None during backfill sampling, not by an upfront clone-per-candidate probe.
-        let candidates = prepare_payment_candidates(state, ctx.candidates.clone());
+        let candidates = prepare_payment_candidates(state, interior_candidates(&ctx.candidates));
         if candidates.is_empty() {
             return services.evaluate_state_quiesced_at(node, state);
         }
