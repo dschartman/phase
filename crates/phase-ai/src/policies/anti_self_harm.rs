@@ -802,7 +802,7 @@ fn recurring_self_draw_deck_out_penalty(ctx: &PolicyContext<'_>) -> f64 {
     let Some(exposure) = self_draw_exposure(ctx) else {
         return 0.0;
     };
-    let rounds = f64::from(exposure.library) / f64::from(1 + exposure.schedule.per_round);
+    let rounds = exposure.rounds();
     if rounds >= DECK_OUT_HORIZON_ROUNDS {
         return 0.0;
     }
@@ -818,38 +818,66 @@ pub(crate) fn cast_self_draw_decks_before_own_draw(ctx: &PolicyContext<'_>) -> b
         .is_some_and(|exposure| exposure.schedule.before_own_draw >= exposure.library)
 }
 
-/// The AI's library against the recurring self-draws a cast adds.
-struct SelfDrawExposure {
+/// A controller's library against the recurring self-draws a permanent gives
+/// it.
+pub(crate) struct SelfDrawExposure {
     library: u32,
     schedule: SelfDrawSchedule,
 }
 
+impl SelfDrawExposure {
+    /// Rounds of draws the library lasts: each round the permanent's draws
+    /// plus the controller's own draw step (CR 504.1).
+    fn rounds(&self) -> f64 {
+        f64::from(self.library) / f64::from(1 + self.schedule.per_round)
+    }
+
+    /// Fewer than [`DECK_OUT_HORIZON_ROUNDS`] rounds left: the horizon under
+    /// which the cast is charged for the deck-out it brings forward, and under
+    /// which the search's leaf credits the permanent's draws at nothing.
+    pub(crate) fn is_short(&self) -> bool {
+        self.rounds() < DECK_OUT_HORIZON_ROUNDS
+    }
+}
+
 /// `None` unless the candidate casts a permanent with a recurring mandatory
-/// "you draw" trigger whose draws would be delivered. Reads the engine's parse
-/// of the triggers, never the card's name. A draw a replacement would remove
-/// (CR 614.6) is no deck-out, so the replacement pipeline is asked whether one
-/// draw survives (`can_draw_at_least_one` is false on an empty library, the
-/// case being judged).
+/// "you draw" trigger whose draws would be delivered.
 fn self_draw_exposure(ctx: &PolicyContext<'_>) -> Option<SelfDrawExposure> {
     let GameAction::CastSpell { .. } = &ctx.candidate.action else {
         return None;
     };
     let source = ctx.source_object()?;
-    let schedule = recurring_self_draw_schedule(ctx.state, source, ctx.ai_player);
+    recurring_self_draw_exposure(ctx.state, source, ctx.ai_player)
+}
+
+/// `None` unless `source` has a recurring mandatory "you draw" trigger whose
+/// draws would be delivered to `controller`. The one reading behind the cast's
+/// deck-out price and gate and the leaf credit of the permanent's draws
+/// (`card_value::permanent_card_credit`). Reads the engine's parse of the
+/// triggers, never the card's name. A draw a replacement would remove
+/// (CR 614.6) is no deck-out, so the replacement pipeline is asked whether one
+/// draw survives (`can_draw_at_least_one` is false on an empty library, the
+/// case being judged).
+pub(crate) fn recurring_self_draw_exposure(
+    state: &GameState,
+    source: &engine::game::game_object::GameObject,
+    controller: PlayerId,
+) -> Option<SelfDrawExposure> {
+    let schedule = recurring_self_draw_schedule(state, source, controller);
     if schedule.per_round == 0 {
         return None;
     }
     let draw_survives = engine::game::replacement::proposed_draw_survives_replacement(
-        ctx.state,
+        state,
         &ProposedEvent::Draw {
-            player_id: ctx.ai_player,
+            player_id: controller,
             count: 1,
             stage: DrawEventStage::Individual,
             applied: std::collections::HashSet::new(),
         },
     );
     draw_survives.then(|| SelfDrawExposure {
-        library: ctx.state.players[ctx.ai_player.0 as usize].library.len() as u32,
+        library: state.players[controller.0 as usize].library.len() as u32,
         schedule,
     })
 }
