@@ -447,8 +447,8 @@ pub(crate) fn worth_drawing(state: &GameState, obj_id: ObjectId, plan: Option<Pl
 /// - a noncreature, nonland card is half a point a pip plus what it does,
 ///   read from the engine's parse of its abilities ([`noncreature_payoff`]):
 ///   removal by the creature it answers, card draw by the cards it nets, a
-///   creature token by its body, a planeswalker by its loyalty and the
-///   abilities it offers. Before this, every such card was the pips alone, so
+///   creature token by its body, a planeswalker by its loyalty or the best
+///   line it pays for. Before this, every such card was the pips alone, so
 ///   The Theorist sat at 2.0 and Last Gasp at 1.0 under a basic land's 3.0,
 ///   and every keep-order seam gave removal and card draw away first
 ///   (`fork-checks/ef45b56b6/JUDGE.md`, `fork-checks/9f72018f4/OPEN.md`).
@@ -515,9 +515,10 @@ fn value_with(state: &GameState, obj_id: ObjectId, draws: DrawPricing) -> f64 {
 ///   resolves (an enters-the-battlefield exile, a card each draw step). An
 ///   Aura harmful to the creature it enchants is removal (CR 303.4a; its
 ///   static abilities apply in layer 6, CR 613.1f).
-/// - **Planeswalker**: its loyalty (CR 306.5b: it enters with its printed
-///   loyalty), plus each loyalty ability it can activate from that loyalty
-///   once (CR 606.3, CR 606.6: a negative cost needs that many counters).
+/// - **Planeswalker**: the larger of its loyalty (CR 306.5b: it enters with
+///   its printed loyalty) and the best loyalty ability that loyalty can pay
+///   for (CR 606.3: one activation a turn; CR 606.6: a negative cost needs
+///   that many counters), [`planeswalker_payoff`].
 ///
 /// Each effect is priced by [`effect_payoff`]; anything else it does is 0,
 /// which is the old pricing.
@@ -585,24 +586,37 @@ fn is_own_etb(trigger: &engine::types::ability::TriggerDefinition) -> bool {
         && trigger.destination == Some(Zone::Battlefield)
 }
 
-/// A planeswalker's loyalty (CR 306.5b: it enters with its printed loyalty;
-/// CR 306.5c: on the battlefield, its loyalty counters), plus each loyalty
-/// ability it can activate from that loyalty once (CR 606.3, CR 606.6: a
-/// negative cost needs that many counters). 0 for anything else.
+/// A planeswalker by its loyalty and the one line that loyalty buys: the larger
+/// of its loyalty (CR 306.5b: it enters with its printed loyalty; CR 306.5c:
+/// on the battlefield, its loyalty counters) and its best loyalty ability that
+/// loyalty can pay for (CR 606.6: a negative cost needs that many counters).
+/// 0 for anything else.
+///
+/// Not the loyalty plus every payable ability. CR 606.3 allows one loyalty
+/// activation a turn, and CR 606.4: a cost is loyalty counters put on or
+/// removed, so the loyalty is the budget that pays for the line, not value on
+/// top of it. Summed, The Theorist at 6 loyalty read 6 + [+1] 2.5 + [-6] 9.0
+/// for every ability at once, and at 1 loyalty her loyalty on top of the
+/// [+1] it pays for (`fork-checks/5e66b2a30/JUDGE.md` rows 3 and 6). Her
+/// triggers are priced once each beside this, by [`trigger_payoff`]. How she
+/// spends her loyalty down to her exit (CR 704.5i) is not priced.
+///
+/// The one rule [`intrinsic_value`] (through [`noncreature_payoff`]) and the
+/// search's leaf credit ([`permanent_card_credit`]) both read.
 fn planeswalker_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
     if !obj.card_types.core_types.contains(&CoreType::Planeswalker) {
         return 0.0;
     }
     let loyalty = obj.loyalty.unwrap_or(0);
-    let abilities: f64 = obj
+    let best_line = obj
         .abilities
         .iter()
         .filter(|ability| {
             matches!(ability.cost, Some(AbilityCost::Loyalty { amount }) if amount >= -(loyalty as i32))
         })
         .map(|ability| definition_payoff(state, obj, ability, draws))
-        .sum();
-    f64::from(loyalty) + abilities
+        .fold(0.0, f64::max);
+    f64::from(loyalty).max(best_line)
 }
 
 /// What a spell still on the stack is worth to the search's leaf, in cards
@@ -638,11 +652,11 @@ pub(crate) fn stack_spell_card_credit(state: &GameState, obj: &GameObject) -> f6
 ///
 /// - A permanent represented by a card is that card, 1.0, plus what it can
 ///   still do in expected draws ([`draw_unit`], the unit [`intrinsic_value`]
-///   prices a drawn card in): a planeswalker's loyalty and the loyalty
-///   abilities its loyalty pays for, and the triggers it has yet to fire, as
-///   [`intrinsic_value`] reads them. So a cast never scores below the card it
-///   was, and The Theorist at 4 loyalty is her card plus her loyalty, her
-///   [+1]'s token and her draw.
+///   prices a drawn card in): the larger of a planeswalker's loyalty and the
+///   best loyalty ability its loyalty pays for ([`planeswalker_payoff`]), and
+///   the triggers it has yet to fire, as [`intrinsic_value`] reads them. So a
+///   cast never scores below the card it was, and The Theorist at 4 loyalty
+///   is her card plus her loyalty (over her [+1]'s token) and her draw.
 /// - CR 121.4 + CR 704.5b: when its recurring mandatory draws leave the
 ///   controller fewer than six rounds of library
 ///   (`anti_self_harm::recurring_self_draw_exposure`, the reading behind the

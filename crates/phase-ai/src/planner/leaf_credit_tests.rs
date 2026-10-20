@@ -192,7 +192,7 @@ fn with_services<R>(f: impl FnOnce(&mut PlannerServices<'_>) -> R) -> R {
 // --- The Theorist: a resolved planeswalker is worth at least its card --------
 
 /// CR 306.5b + CR 306.5c + CR 606.3: on the battlefield The Theorist is her
-/// loyalty and the loyalty abilities it can pay for; in hand she is one card.
+/// loyalty or the best loyalty ability it can pay for; in hand she is one card.
 /// At 4 loyalty the battlefield state must score at least the hand state for
 /// her controller, at every archetype's served weights.
 #[test]
