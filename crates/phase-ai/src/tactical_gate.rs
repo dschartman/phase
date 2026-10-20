@@ -337,14 +337,19 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
     match &ctx.candidate.action {
         GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => assess_pre_cast(ctx),
         // CR 601.2: the other cast actions cast a spell too (from a prompt or
-        // a permission); its own resolution's draws are read the same way.
-        // The other pre-cast checks read `CastSpell` only.
+        // a permission); both deck-out readings (the recurring draws of the
+        // permanent it becomes, its own resolution's draws) are read the same
+        // way. The other pre-cast checks read `CastSpell` only.
         GameAction::CastSpellForFree { .. }
         | GameAction::CastSpellAsMiracle { .. }
         | GameAction::CastSpellAsMadness { .. }
         | GameAction::CastSpellAsSneak { .. }
         | GameAction::CastSpellAsWebSlinging { .. } => {
-            one_shot_self_draw_reject(ctx).map_or(GateDecision::Allow, GateDecision::Reject)
+            if cast_self_draw_decks_before_own_draw(ctx) {
+                GateDecision::Reject(RejectReason::DecksOutBeforeOwnDraw)
+            } else {
+                one_shot_self_draw_reject(ctx).map_or(GateDecision::Allow, GateDecision::Reject)
+            }
         }
         GameAction::SelectModes { indices } if spell_mode_choice_is_futile(ctx, indices) => {
             GateDecision::Reject(RejectReason::FutileModeChoice)
@@ -555,11 +560,10 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
 /// is at 0 with its own next draw step ahead (CR 504.1), which draws from the
 /// empty library, the recurring check's `before_own_draw >= library` reading
 /// and reason (`DecksOutBeforeOwnDraw`). The one way out read here is a cast
-/// that wins first: an untargeted part of the same resolution lethal to an
-/// opponent (`untargeted_part_is_lethal_to_an_opponent`, CR 119.3 +
-/// CR 704.5a) ends the game at the state-based check after it resolves. A
-/// draw past the library with a lethal drain is no win (CR 104.4a: both lose
-/// at once).
+/// that wins first: the same resolution's untargeted drain brings every
+/// opponent still in the game to 0 or less and leaves the AI above 0
+/// (`untargeted_drain_wins_the_game`). A draw past the library with a lethal
+/// drain is no win (CR 104.4a: both lose at once).
 ///
 /// A spell cast from its owner's library leaves it first (CR 601.2a). A modal
 /// spell is not read (its mode is a later choice). Not read, as in the
@@ -578,7 +582,7 @@ fn one_shot_self_draw_reject(ctx: &PolicyContext<'_>) -> Option<RejectReason> {
             )
         }
         _ => {
-            let source = cast_action_source(ctx)?;
+            let source = ctx.cast_source_object()?;
             if source.modal.is_some() {
                 return None;
             }
@@ -606,29 +610,69 @@ fn one_shot_self_draw_reject(ctx: &PolicyContext<'_>) -> Option<RejectReason> {
     if draws > library {
         return Some(RejectReason::DrawsPastLibrary);
     }
-    (!untargeted_part_is_lethal_to_an_opponent(ctx, source.id, &spell_links(&abilities)))
+    (!untargeted_drain_wins_the_game(ctx, source.id, &spell_links(&abilities)))
         .then_some(RejectReason::DecksOutBeforeOwnDraw)
 }
 
-/// CR 601.2: the object a cast-family action casts: `CastSpell` through the
-/// policy context's own lookup, the other cast actions (`payment_mode_mut`'s
-/// set) through the object the action names. `None` for any other action.
-fn cast_action_source<'a>(
-    ctx: &PolicyContext<'a>,
-) -> Option<&'a engine::game::game_object::GameObject> {
-    match &ctx.candidate.action {
-        GameAction::CastSpell { .. } => ctx.source_object(),
-        GameAction::CastSpellForFree { .. }
-        | GameAction::CastSpellAsMiracle { .. }
-        | GameAction::CastSpellAsMadness { .. }
-        | GameAction::CastSpellAsSneak { .. }
-        | GameAction::CastSpellAsWebSlinging { .. } => ctx
-            .candidate
-            .action
-            .source_object()
-            .and_then(|id| ctx.state.objects.get(&id)),
-        _ => None,
+/// CR 119.3 + CR 704.5a + CR 104.2a: whether the untargeted drains among
+/// `nodes` ("each opponent loses N life", "deals N damage to each player")
+/// win the game when they resolve: summed per player, they bring every
+/// opponent still in the game to 0 or less and leave the AI above 0. A drain
+/// that also brings the AI to 0 or less is a draw at best (CR 104.4a). Fails
+/// closed: an amount it cannot resolve, or a drain whose player set is other
+/// than each opponent or each player, reads as no win. Damage prevention is
+/// not read. Unlike `untargeted_part_is_lethal_to_an_opponent` (any one
+/// opponent dies, failing open), which the own-target rule keeps using.
+fn untargeted_drain_wins_the_game(
+    ctx: &PolicyContext<'_>,
+    source_id: ObjectId,
+    nodes: &[&AbilityDefinition],
+) -> bool {
+    let mut to_opponents = 0;
+    let mut to_ai = 0;
+    for node in nodes {
+        let (amount, players) = match (node.effect.as_ref(), &node.player_scope) {
+            (
+                Effect::DamageEachPlayer {
+                    amount,
+                    player_filter,
+                },
+                _,
+            ) => (amount, player_filter),
+            (
+                Effect::LoseLife {
+                    amount,
+                    target: None,
+                },
+                Some(scope),
+            ) => (amount, scope),
+            _ => continue,
+        };
+        let Some(loss) =
+            try_resolve_quantity_in_source_context(ctx.state, amount, ctx.ai_player, source_id)
+        else {
+            return false;
+        };
+        match players {
+            PlayerFilter::Opponent => to_opponents += loss,
+            PlayerFilter::All => {
+                to_opponents += loss;
+                to_ai += loss;
+            }
+            _ => return false,
+        }
     }
+    let live_opponents: Vec<_> = opponents(ctx.state, ctx.ai_player)
+        .into_iter()
+        .map(|opponent| &ctx.state.players[opponent.0 as usize])
+        .filter(|player| !player.is_eliminated)
+        .collect();
+    to_opponents > 0
+        && !live_opponents.is_empty()
+        && live_opponents
+            .iter()
+            .all(|player| player.life <= to_opponents)
+        && ctx.state.players[ctx.ai_player.0 as usize].life > to_ai
 }
 
 /// The effects the gate's effect-level checks read for a cast or an

@@ -163,6 +163,26 @@ impl<'a> PolicyContext<'a> {
         }
     }
 
+    /// CR 601.2: the object a cast-family action casts: `CastSpell` through
+    /// [`Self::source_object`], the other cast actions (`CastSpellForFree`,
+    /// `AsMiracle`, `AsMadness`, `AsSneak`, `AsWebSlinging`) through the
+    /// object the action names. `None` for any other action.
+    pub fn cast_source_object(&self) -> Option<&'a GameObject> {
+        match &self.candidate.action {
+            GameAction::CastSpell { .. } => self.source_object(),
+            GameAction::CastSpellForFree { .. }
+            | GameAction::CastSpellAsMiracle { .. }
+            | GameAction::CastSpellAsMadness { .. }
+            | GameAction::CastSpellAsSneak { .. }
+            | GameAction::CastSpellAsWebSlinging { .. } => self
+                .candidate
+                .action
+                .source_object()
+                .and_then(|id| self.state.objects.get(&id)),
+            _ => None,
+        }
+    }
+
     pub fn effects(&self) -> Vec<&'a Effect> {
         // If we're casting/activating, get effects from the source object
         match &self.candidate.action {
