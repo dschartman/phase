@@ -119,6 +119,7 @@ impl FeatureRow {
             neutralized_presence,
             neutralized_power,
             neutralized_toughness,
+            library_floor,
         } = evaluate_features(state, player).ok()?;
         let differential = crate::card_advantage::differential(state, player);
         let synergy = session
@@ -132,17 +133,17 @@ impl FeatureRow {
             .unwrap_or_default();
         let zone_quality = crate::zone_eval::zone_bonus(state, player, archetype);
 
-        // `card_credit` is priced at the hand-size weight and the
-        // `neutralized_*` credits at the board weights, so each folds into the
-        // column whose weight multiplies it: the harvested vector still
-        // reconstructs the served leaf, and the trainer fits those weights on
-        // what the leaf actually reads.
+        // `card_credit` and `library_floor` are priced at the hand-size weight
+        // and the `neutralized_*` credits at the board weights, so each folds
+        // into the column whose weight multiplies it: the harvested vector
+        // still reconstructs the served leaf, and the trainer fits those
+        // weights on what the leaf actually reads.
         Some(FeatureRow {
             life,
             board_presence: board_presence + neutralized_presence,
             board_power: board_power + neutralized_power,
             board_toughness: board_toughness + neutralized_toughness,
-            hand_size: hand_size + card_credit,
+            hand_size: hand_size + card_credit + library_floor,
             aggression,
             card_advantage: card_advantage_breakdown + differential,
             zone_quality,
