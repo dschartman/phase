@@ -80,9 +80,95 @@ use crate::search::ability_is_temporary_combat_modifier;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
-    Reject,
+    Reject(RejectReason),
     Allow,
     AllowWithPenalty(f64),
+}
+
+impl GateDecision {
+    /// The check that rejected the candidate, or `None` when it is kept.
+    pub fn reject_reason(self) -> Option<RejectReason> {
+        match self {
+            GateDecision::Reject(reason) => Some(reason),
+            GateDecision::Allow | GateDecision::AllowWithPenalty(_) => None,
+        }
+    }
+
+    pub fn is_reject(self) -> bool {
+        self.reject_reason().is_some()
+    }
+}
+
+/// Which gate check rejected a candidate. Diagnostic only: the gate drops a
+/// rejected candidate whatever the reason, so no caller branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// `zero_direct_spell_is_safe_to_reject`: the cast's whole direct effect
+    /// is a known zero.
+    ZeroDirectEffect,
+    /// `cast_self_draw_decks_before_own_draw`: a recurring mandatory self-draw
+    /// empties the library before the AI's own next draw step.
+    DecksOutBeforeOwnDraw,
+    /// `targeted_exchange_verdict`: a targeted self-damage or fight exchange
+    /// proven bad on every bound target path.
+    TargetedExchange,
+    /// An activation whose source-type condition fails (CR 608.2c).
+    SourceConditionFails,
+    /// A precombat main-phase spell while a lethal attack is available.
+    LethalAttackFirst,
+    /// A plain counter (or counter mode) whose every legal target is the AI's
+    /// own spell, or that has none.
+    CounterReachesNothingForeign,
+    /// `assess_counter_announcement`: the announced counter's issued domain
+    /// reaches only the AI's own spells.
+    CounterAnnouncement,
+    /// `is_redundant_creature_only_removal`: creature-only harm with no live
+    /// opposing creature target.
+    RedundantCreatureOnlyRemoval,
+    /// `harmful_target_reaches_only_own_permanents`.
+    HarmOnlyOwnPermanents,
+    /// A -X/-X spell outside combat that kills no legal opposing creature.
+    ShrinkKillsNothing,
+    /// `should_reject_pump_window`: a pump with no live window to use it.
+    PumpWindow,
+    /// `spell_mode_choice_is_futile`: a mode choice that aims harm only at the
+    /// AI's own permanents while another issued choice does not.
+    FutileModeChoice,
+    /// A plain counter's target choice of the AI's own spell.
+    CounterOwnSpellTarget,
+    /// Destroy, or damage without a shrink, aimed at an indestructible target.
+    IndestructibleTarget,
+    /// A warded target whose ward cost the AI cannot pay.
+    UnpayableWard,
+    /// A Colorless convoke-family tap that would strand a colored pip.
+    ConvokeStrandsPip,
+    /// `CancelCast` is never a strategic choice.
+    CancelCast,
+}
+
+impl RejectReason {
+    /// A short, space-free name for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejectReason::ZeroDirectEffect => "zero_direct_effect",
+            RejectReason::DecksOutBeforeOwnDraw => "decks_out_before_own_draw",
+            RejectReason::TargetedExchange => "targeted_exchange",
+            RejectReason::SourceConditionFails => "source_condition_fails",
+            RejectReason::LethalAttackFirst => "lethal_attack_first",
+            RejectReason::CounterReachesNothingForeign => "counter_reaches_nothing_foreign",
+            RejectReason::CounterAnnouncement => "counter_announcement",
+            RejectReason::RedundantCreatureOnlyRemoval => "redundant_creature_only_removal",
+            RejectReason::HarmOnlyOwnPermanents => "harm_only_own_permanents",
+            RejectReason::ShrinkKillsNothing => "shrink_kills_nothing",
+            RejectReason::PumpWindow => "pump_window",
+            RejectReason::FutileModeChoice => "futile_mode_choice",
+            RejectReason::CounterOwnSpellTarget => "counter_own_spell_target",
+            RejectReason::IndestructibleTarget => "indestructible_target",
+            RejectReason::UnpayableWard => "unpayable_ward",
+            RejectReason::ConvokeStrandsPip => "convoke_strands_pip",
+            RejectReason::CancelCast => "cancel_cast",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -185,21 +271,8 @@ pub(crate) fn gate_prepared_candidates(
         .filter_map(|prepared| {
             let source_index = prepared.source_index;
             let candidate = prepared.candidate;
-            let decision_result = {
-                let policy_ctx = PolicyContext {
-                    state,
-                    decision,
-                    candidate: &candidate,
-                    ai_player,
-                    config,
-                    context,
-                    cast_facts: None,
-                    search_depth: crate::policies::context::SearchDepth::Root,
-                };
-                assess_candidate(&policy_ctx)
-            };
-            match decision_result {
-                GateDecision::Reject => None,
+            match assess_in_context(state, decision, &candidate, ai_player, config, context) {
+                GateDecision::Reject(_) => None,
                 GateDecision::Allow => Some(GatedCandidate {
                     source_index,
                     candidate,
@@ -215,11 +288,48 @@ pub(crate) fn gate_prepared_candidates(
         .collect()
 }
 
+/// The gate's verdict on each of `candidates`, in order, with the reason for
+/// every reject: the same assessment `gate_candidates` filters by. For
+/// diagnostics (a driver printing why a candidate was removed).
+pub fn gate_decisions(
+    state: &GameState,
+    decision: &AiDecisionContext,
+    candidates: &[CandidateAction],
+    ai_player: PlayerId,
+    config: &AiConfig,
+    context: &AiContext,
+) -> Vec<GateDecision> {
+    candidates
+        .iter()
+        .map(|candidate| assess_in_context(state, decision, candidate, ai_player, config, context))
+        .collect()
+}
+
+fn assess_in_context(
+    state: &GameState,
+    decision: &AiDecisionContext,
+    candidate: &CandidateAction,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    context: &AiContext,
+) -> GateDecision {
+    assess_candidate(&PolicyContext {
+        state,
+        decision,
+        candidate,
+        ai_player,
+        config,
+        context,
+        cast_facts: None,
+        search_depth: crate::policies::context::SearchDepth::Root,
+    })
+}
+
 fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
     match &ctx.candidate.action {
         GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => assess_pre_cast(ctx),
         GameAction::SelectModes { indices } if spell_mode_choice_is_futile(ctx, indices) => {
-            GateDecision::Reject
+            GateDecision::Reject(RejectReason::FutileModeChoice)
         }
         GameAction::ChooseX { .. } | GameAction::SelectModes { .. } => {
             assess_counter_announcement(ctx).unwrap_or(GateDecision::Allow)
@@ -258,7 +368,7 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
                     *object_id,
                 )
             {
-                GateDecision::Reject
+                GateDecision::Reject(RejectReason::ConvokeStrandsPip)
             } else {
                 GateDecision::Allow
             }
@@ -288,14 +398,14 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
         // pick one. The genuine-escape cases fall through to
         // `search::fallback_action`, which emits CancelCast when the scored
         // pool is empty.
-        GameAction::CancelCast => GateDecision::Reject,
+        GameAction::CancelCast => GateDecision::Reject(RejectReason::CancelCast),
         _ => GateDecision::Allow,
     }
 }
 
 fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     if zero_direct_spell_is_safe_to_reject(ctx) {
-        return GateDecision::Reject;
+        return GateDecision::Reject(RejectReason::ZeroDirectEffect);
     }
 
     // CR 121.4 + CR 704.5b: a permanent whose recurring mandatory "you draw"
@@ -303,7 +413,7 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // game when cast. Read before the effect checks: such a permanent may
     // carry no spell or activated effect at all (Phyrexian Arena).
     if cast_self_draw_decks_before_own_draw(ctx) {
-        return GateDecision::Reject;
+        return GateDecision::Reject(RejectReason::DecksOutBeforeOwnDraw);
     }
 
     // CR 601.2c + CR 608.2c: Target-sourced self-damage and fight exchanges are
@@ -315,7 +425,7 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
             TargetedExchangeVerdict::Reject
         )
     {
-        return GateDecision::Reject;
+        return GateDecision::Reject(RejectReason::TargetedExchange);
     }
 
     // CR 608.2c: Reject abilities whose source-type condition is known to fail.
@@ -337,7 +447,7 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
                         filter,
                         &engine::game::filter::FilterContext::from_source(ctx.state, *source_id),
                     ) {
-                        return GateDecision::Reject;
+                        return GateDecision::Reject(RejectReason::SourceConditionFails);
                     }
                 }
             }
@@ -354,8 +464,10 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     ) && is_lethal_attack_available(ctx.state, ctx.ai_player)
     {
         // Carve-out: direct-damage spells that can target players may themselves be
-        // lethal or supplement the attack — allow with a mild penalty.
-        let effects = ctx.effects();
+        // lethal or supplement the attack — allow with a mild penalty. A cast
+        // reads what the spell does (`candidate_effects`), so a creature whose
+        // only damage is an activated ability gets no carve-out.
+        let effects = candidate_effects(ctx);
         let is_direct_damage = effects.iter().any(|e| {
             matches!(
                 e,
@@ -368,13 +480,14 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         if is_direct_damage {
             return GateDecision::AllowWithPenalty(-5.0);
         }
-        return GateDecision::Reject;
+        return GateDecision::Reject(RejectReason::LethalAttackFirst);
     }
 
-    if counter_reaches_nothing_foreign(ctx)
-        || assess_counter_announcement(ctx) == Some(GateDecision::Reject)
-    {
-        return GateDecision::Reject;
+    if counter_reaches_nothing_foreign(ctx) {
+        return GateDecision::Reject(RejectReason::CounterReachesNothingForeign);
+    }
+    if let Some(rejection @ GateDecision::Reject(_)) = assess_counter_announcement(ctx) {
+        return rejection;
     }
 
     // CR 601.2b + CR 700.2a: a modal spell's modes are chosen as it is cast,
@@ -385,7 +498,7 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     if let Some(modes) = modal_spell_mode_effects(ctx) {
         return best_mode_decision(modes.iter().map(|(definition, effects)| {
             if counter_mode_reaches_nothing_foreign(ctx, definition, effects) {
-                GateDecision::Reject
+                GateDecision::Reject(RejectReason::CounterReachesNothingForeign)
             } else {
                 assess_cast_effects(ctx, effects, &[*definition])
             }
@@ -401,7 +514,28 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    assess_cast_effects(ctx, &ctx.effects(), &spell_abilities)
+    assess_cast_effects(ctx, &candidate_effects(ctx), &spell_abilities)
+}
+
+/// The effects the gate's effect-level checks read for a cast or an
+/// activation. CR 601.2 + CR 113.3a: a cast is judged by what the spell does,
+/// its spell-kind abilities (every mode at once for a modal spell, the
+/// flattened reading). CR 608.3 + CR 602.2: a permanent spell resolves into a
+/// permanent, and that permanent's activated abilities are later, separate
+/// choices, so a creature is never judged at its cast by whether its activated
+/// ability has a target now (Proft, Sinister Mastermind; Royal Assassin). The
+/// reading `anti_self_harm` adopted for its cast checks. An activation reads
+/// its own ability (`PolicyContext::effects`, root mode only), unchanged.
+fn candidate_effects<'a>(ctx: &PolicyContext<'a>) -> Vec<&'a Effect> {
+    match &ctx.candidate.action {
+        GameAction::CastSpell { .. } => ctx
+            .source_object()
+            .into_iter()
+            .flat_map(modal_spell_mode_ability_refs)
+            .flat_map(crate::cast_facts::collect_definition_effects)
+            .collect(),
+        _ => ctx.effects(),
+    }
 }
 
 /// CR 700.2a + CR 601.2b: at the mode choice of a spell the AI is casting, a
@@ -512,25 +646,29 @@ fn modal_spell_mode_effects<'a>(ctx: &PolicyContext<'a>) -> Option<Vec<ModeReadi
 }
 
 /// The cast is kept when any mode is: the most permissive verdict wins
-/// (`Allow` over the mildest `AllowWithPenalty` over `Reject`).
+/// (`Allow` over the mildest `AllowWithPenalty` over `Reject`). When every mode
+/// is rejected, the first mode's reason is reported. No modes proves nothing
+/// and keeps the cast (the caller never passes none: `modal_spell_mode_effects`
+/// requires at least one).
 fn best_mode_decision(decisions: impl Iterator<Item = GateDecision>) -> GateDecision {
-    decisions.fold(GateDecision::Reject, |best, decision| {
-        match (best, decision) {
+    decisions
+        .reduce(|best, decision| match (best, decision) {
             (GateDecision::Allow, _) | (_, GateDecision::Allow) => GateDecision::Allow,
             (GateDecision::AllowWithPenalty(a), GateDecision::AllowWithPenalty(b)) => {
                 GateDecision::AllowWithPenalty(a.max(b))
             }
-            (GateDecision::AllowWithPenalty(p), GateDecision::Reject)
-            | (GateDecision::Reject, GateDecision::AllowWithPenalty(p)) => {
+            (GateDecision::AllowWithPenalty(p), GateDecision::Reject(_))
+            | (GateDecision::Reject(_), GateDecision::AllowWithPenalty(p)) => {
                 GateDecision::AllowWithPenalty(p)
             }
-            (GateDecision::Reject, GateDecision::Reject) => GateDecision::Reject,
-        }
-    })
+            (GateDecision::Reject(first), GateDecision::Reject(_)) => GateDecision::Reject(first),
+        })
+        .unwrap_or(GateDecision::Allow)
 }
 
 /// Effect-level futility checks for one cast or activation reading: the whole
-/// effect list of a non-modal candidate, or one mode of a modal spell.
+/// effect list of a non-modal candidate (`candidate_effects`: a cast's spell
+/// abilities, an activation's own ability), or one mode of a modal spell.
 /// `spell_abilities` are the spell-kind abilities that reading resolves (the
 /// mode's own ability for a modal spell, every spell ability of a non-modal
 /// one, none for an activation); the own-permanent rule reads only those, so a
@@ -555,10 +693,10 @@ fn assess_cast_effects(
     // activation has no spell reading, so only the creature-only check applies.
     if !own_target_rule_stands_down(ctx, spell_abilities) {
         if is_redundant_creature_only_removal(ctx, effects) {
-            return GateDecision::Reject;
+            return GateDecision::Reject(RejectReason::RedundantCreatureOnlyRemoval);
         }
         if harmful_target_reaches_only_own_permanents(ctx, spell_abilities) {
-            return GateDecision::Reject;
+            return GateDecision::Reject(RejectReason::HarmOnlyOwnPermanents);
         }
     }
 
@@ -581,12 +719,12 @@ fn assess_cast_effects(
             if !opposing_creature_in_combat_before_damage(ctx.state, ctx.ai_player)
                 && !negative_pump_kills_a_legal_opposing_creature(ctx, effects)
             {
-                return GateDecision::Reject;
+                return GateDecision::Reject(RejectReason::ShrinkKillsNothing);
             }
         } else if source_is_spell {
             let facts = TacticalFacts::derive(ctx.state, ctx.ai_player);
             if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
-                return GateDecision::Reject;
+                return GateDecision::Reject(RejectReason::PumpWindow);
             }
             if facts.pass_preserves_stronger_window && !facts.live_stack_response {
                 return GateDecision::AllowWithPenalty(-1.0);
@@ -611,7 +749,7 @@ fn assess_cast_effects(
                 && self_pump_on_unblocked_attacker(ctx.state, ctx.ai_player, source_id, effects);
             if !mana_sink_into_open_board {
                 if should_reject_pump_window(ctx, &facts, power_bonus, toughness_bonus) {
-                    return GateDecision::Reject;
+                    return GateDecision::Reject(RejectReason::PumpWindow);
                 }
                 if facts.pass_preserves_stronger_window && !facts.live_stack_response {
                     return GateDecision::AllowWithPenalty(-1.0);
@@ -1390,7 +1528,7 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     // Lapse) stays a judgment call.
     if is_pure_counter_payload(&effects) && is_own_stack_spell(ctx.state, ctx.ai_player, *object_id)
     {
-        return Some(GateDecision::Reject);
+        return Some(GateDecision::Reject(RejectReason::CounterOwnSpellTarget));
     }
 
     let object = ctx.state.objects.get(object_id)?;
@@ -1399,7 +1537,7 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     // indestructible permanent.
     let is_destroy = effects.iter().any(|e| matches!(e, Effect::Destroy { .. }));
     if is_destroy && object.has_keyword(&Keyword::Indestructible) {
-        return Some(GateDecision::Reject);
+        return Some(GateDecision::Reject(RejectReason::IndestructibleTarget));
     }
 
     // CR 702.12b: an indestructible creature ignores the lethal-damage SBA
@@ -1411,7 +1549,7 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
         && deals_damage(&effects)
         && !has_toughness_shrink(&effects)
     {
-        return Some(GateDecision::Reject);
+        return Some(GateDecision::Reject(RejectReason::IndestructibleTarget));
     }
 
     // CR 702.21a: targeting a warded permanent triggers ward; if the AI can't
@@ -1420,7 +1558,7 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     for keyword in &object.keywords {
         if let Keyword::Ward(ward) = keyword {
             if !can_pay_ward_cost(ctx, ward, object) {
-                return Some(GateDecision::Reject);
+                return Some(GateDecision::Reject(RejectReason::UnpayableWard));
             }
             break;
         }
@@ -1666,7 +1804,7 @@ fn assess_counter_announcement(ctx: &PolicyContext<'_>) -> Option<GateDecision> 
     let owner = ctx.candidate.metadata.semantic_owner?;
     let successor = replay_counter_announcement(ctx.state, ctx.candidate, owner)?;
     let verdict = counter_announcement_domain(ctx.state, &successor, root, owner, ctx.ai_player);
-    if verdict != Some(GateDecision::Reject)
+    if !verdict.is_some_and(GateDecision::is_reject)
         || matches!(
             ctx.candidate.action,
             GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. }
@@ -1688,10 +1826,10 @@ fn assess_counter_announcement(ctx: &PolicyContext<'_>) -> Option<GateDecision> 
         let Some(next) = replay_counter_announcement(ctx.state, &sibling, owner) else {
             continue;
         };
-        if counter_announcement_domain(ctx.state, &next, root, owner, ctx.ai_player)
-            != Some(GateDecision::Reject)
+        if !counter_announcement_domain(ctx.state, &next, root, owner, ctx.ai_player)
+            .is_some_and(GateDecision::is_reject)
         {
-            return Some(GateDecision::Reject);
+            return Some(GateDecision::Reject(RejectReason::CounterAnnouncement));
         }
     }
     None
@@ -1733,11 +1871,12 @@ fn counter_announcement_domain(
                 Some(GateDecision::Allow | GateDecision::AllowWithPenalty(_)) => {
                     return Some(GateDecision::Allow)
                 }
-                Some(GateDecision::Reject) => {}
+                Some(GateDecision::Reject(_)) => {}
                 None => indeterminate = true,
             }
         }
-        return (completed && !indeterminate).then_some(GateDecision::Reject);
+        return (completed && !indeterminate)
+            .then_some(GateDecision::Reject(RejectReason::CounterAnnouncement));
     }
 
     if let Some(pending) = state
@@ -1859,7 +1998,7 @@ fn concrete_counter_verdict(
                 matches!(target,
             TargetRef::Object(id) if is_own_stack_spell(state, ai, *id))
             }) {
-                GateDecision::Reject
+                GateDecision::Reject(RejectReason::CounterAnnouncement)
             } else {
                 GateDecision::Allow
             },
@@ -1894,7 +2033,7 @@ fn concrete_counter_verdict(
         TargetRef::Object(id) if is_own_stack_spell(state, ai, *id))
         })
     }) {
-        Some(GateDecision::Reject)
+        Some(GateDecision::Reject(RejectReason::CounterAnnouncement))
     } else if pending.target_constraints.is_empty() {
         Some(GateDecision::Allow)
     } else {
@@ -7926,7 +8065,10 @@ mod tests {
             search_depth: crate::policies::context::SearchDepth::Root,
         };
 
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::PumpWindow)
+        );
     }
 
     #[test]
@@ -7982,7 +8124,7 @@ mod tests {
             search_depth: crate::policies::context::SearchDepth::Root,
         };
 
-        assert_ne!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(assess_candidate(&ctx).reject_reason(), None);
     }
 
     #[test]
@@ -8131,7 +8273,10 @@ mod tests {
             search_depth: crate::policies::context::SearchDepth::Root,
         };
 
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::CancelCast)
+        );
     }
 
     /// Build a `ChooseTarget` decision for a damage spell aimed at `creature`.
@@ -8201,7 +8346,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::IndestructibleTarget)
+        );
     }
 
     /// A normal creature targeted by damage is NOT gate-rejected — non-lethal
@@ -8225,7 +8373,7 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_ne!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(assess_candidate(&ctx).reject_reason(), None);
     }
 
     // ---- CR 701.6a: a counter aimed only at the AI's own spells ----
@@ -8320,7 +8468,10 @@ mod tests {
         push_stack_spell(state, P0, "Counterspell", CoreType::Instant);
         set_priority_window(state, Phase::PreCombatMain, P1);
 
-        assert_eq!(gate_cast(state, pierce), GateDecision::Reject);
+        assert_eq!(
+            gate_cast(state, pierce).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
     }
 
     /// Build the field-report board on the production path: Spell Pierce
@@ -8436,14 +8587,15 @@ mod tests {
 
         assert!(!is_own_stack_spell(state, P0, divination));
         assert_counter_in_pools(state, pierce, None, GateDecision::Allow);
-        assert_ne!(
+        assert_eq!(
             counter_target_verdict(
                 state,
                 plain_counter(None),
                 vec![TargetRef::Object(divination)],
                 divination
-            ),
-            GateDecision::Reject,
+            )
+            .reject_reason(),
+            None,
             "countering the spell an opponent now controls is a useful target"
         );
     }
@@ -8488,7 +8640,12 @@ mod tests {
         let state = runner.state();
 
         assert!(is_own_stack_spell(state, P0, opt));
-        let root = assert_counter_in_pools(state, pierce, None, GateDecision::Reject);
+        let root = assert_counter_in_pools(
+            state,
+            pierce,
+            None,
+            GateDecision::Reject(RejectReason::CounterReachesNothingForeign),
+        );
         assert_counter_never_chosen(state, &root.action);
         assert_eq!(
             counter_target_verdict(
@@ -8496,8 +8653,9 @@ mod tests {
                 plain_counter(None),
                 vec![TargetRef::Object(opt)],
                 opt
-            ),
-            GateDecision::Reject,
+            )
+            .reject_reason(),
+            Some(RejectReason::CounterOwnSpellTarget),
             "the spell the AI now controls is its own counter target"
         );
     }
@@ -8549,6 +8707,7 @@ mod tests {
     }
 
     /// Assert availability using actual engine candidates, then both AI pools.
+    #[track_caller]
     fn assert_counter_in_pools(
         state: &GameState,
         source: ObjectId,
@@ -8584,7 +8743,22 @@ mod tests {
             &config,
             &AiContext::empty(&config.weights),
         );
-        let retained = expected != GateDecision::Reject;
+        let retained = !expected.is_reject();
+        if let Some(reason) = expected.reject_reason() {
+            assert_eq!(
+                gate_decisions(
+                    state,
+                    &decision,
+                    std::slice::from_ref(&root),
+                    P0,
+                    &config,
+                    &AiContext::empty(&config.weights),
+                )[0]
+                .reject_reason(),
+                Some(reason),
+                "the issued root must be rejected by the expected check"
+            );
+        }
         assert_eq!(
             gated
                 .iter()
@@ -8846,7 +9020,12 @@ mod tests {
         let (state, bolt, counter) =
             printed_counter_stack(scenario, P0, pooled_mana(ManaType::Blue, 2));
         assert_unannounced_x_counter(&state.objects[&blast].abilities[0], blast);
-        let root = assert_counter_in_pools(&state, blast, None, GateDecision::Reject);
+        let root = assert_counter_in_pools(
+            &state,
+            blast,
+            None,
+            GateDecision::Reject(RejectReason::CounterAnnouncement),
+        );
         assert_counter_never_chosen(&state, &root.action);
         let mut reference = GameRunner::from_state(state.clone());
         reference.act(root.action.clone()).unwrap();
@@ -9144,7 +9323,7 @@ mod tests {
             let expected = if payable_one {
                 GateDecision::Allow
             } else {
-                GateDecision::Reject
+                GateDecision::Reject(RejectReason::CounterAnnouncement)
             };
             let root = assert_counter_in_pools(&state, source, Some(1), expected);
             if !payable_one {
@@ -9601,7 +9780,10 @@ mod tests {
         let mut empty = scenario.build().state().clone();
         assert_unannounced_x_counter(&empty.objects[&blast].abilities[0], blast);
         assert!(empty.stack.is_empty());
-        assert_eq!(gate_cast(&mut empty, blast), GateDecision::Reject);
+        assert_eq!(
+            gate_cast(&mut empty, blast).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
 
         let mut scenario = GameScenario::new();
         let blast = scenario
@@ -9615,7 +9797,12 @@ mod tests {
         let (state, victim) = counter_response_board(scenario, P0);
         assert_unannounced_x_counter(&state.objects[&blast].abilities[0], blast);
         assert!(is_own_stack_spell(&state, P0, victim));
-        assert_counter_in_pools(&state, blast, None, GateDecision::Reject);
+        assert_counter_in_pools(
+            &state,
+            blast,
+            None,
+            GateDecision::Reject(RejectReason::CounterReachesNothingForeign),
+        );
     }
 
     #[test]
@@ -9756,7 +9943,7 @@ mod tests {
                 if foreign_noncreature {
                     GateDecision::Allow
                 } else {
-                    GateDecision::Reject
+                    GateDecision::Reject(RejectReason::CounterReachesNothingForeign)
                 },
             );
         }
@@ -9846,7 +10033,7 @@ mod tests {
                     if x_kind == AbilityKind::Spell || foreign_noncreature {
                         GateDecision::Allow
                     } else {
-                        GateDecision::Reject
+                        GateDecision::Reject(RejectReason::CounterReachesNothingForeign)
                     },
                 );
             }
@@ -9871,7 +10058,16 @@ mod tests {
             assert!(modes.iter().all(|mode| is_pure_counter_payload(
                 &collect_definition_effects_with(mode, ModeWalk::All)
             )));
-            let root = assert_counter_in_pools(&state, counter, None, GateDecision::Reject);
+            let root = assert_counter_in_pools(
+                &state,
+                counter,
+                None,
+                GateDecision::Reject(if controller == P1 {
+                    RejectReason::CounterAnnouncement
+                } else {
+                    RejectReason::CounterReachesNothingForeign
+                }),
+            );
             assert_counter_never_chosen(&state, &root.action);
             push_stack_spell(&mut state, P1, "Foreign Instant Witness", CoreType::Instant);
             let root = assert_counter_in_pools(&state, counter, None, GateDecision::Allow);
@@ -10032,7 +10228,7 @@ mod tests {
         push_stack_spell(state, P0, "Counterspell", CoreType::Instant);
         set_priority_window(state, Phase::PreCombatMain, P1);
 
-        assert_ne!(gate_cast(state, pierce), GateDecision::Reject);
+        assert_eq!(gate_cast(state, pierce).reject_reason(), None);
     }
 
     const GLEN_ELENDRA_ORACLE: &str =
@@ -10052,7 +10248,10 @@ mod tests {
         push_stack_spell(state, P0, "Counterspell", CoreType::Instant);
         set_priority_window(state, Phase::PreCombatMain, P1);
 
-        assert_eq!(gate_activation(state, archmage), GateDecision::Reject);
+        assert_eq!(
+            gate_activation(state, archmage).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
     }
 
     /// Non-vacuity for the activation: an opponent noncreature spell is a real
@@ -10069,7 +10268,7 @@ mod tests {
         push_stack_spell(state, P0, "Counterspell", CoreType::Instant);
         set_priority_window(state, Phase::PreCombatMain, P1);
 
-        assert_ne!(gate_activation(state, archmage), GateDecision::Reject);
+        assert_eq!(gate_activation(state, archmage).reject_reason(), None);
     }
 
     /// Verdict on choosing `target` for a pending counter `effect` whose legal
@@ -10138,12 +10337,12 @@ mod tests {
         let legal = vec![TargetRef::Object(theirs), TargetRef::Object(mine)];
 
         assert_eq!(
-            counter_target_verdict(state, plain_counter(None), legal.clone(), mine),
-            GateDecision::Reject
+            counter_target_verdict(state, plain_counter(None), legal.clone(), mine).reject_reason(),
+            Some(RejectReason::CounterOwnSpellTarget)
         );
-        assert_ne!(
-            counter_target_verdict(state, plain_counter(None), legal, theirs),
-            GateDecision::Reject
+        assert_eq!(
+            counter_target_verdict(state, plain_counter(None), legal, theirs).reject_reason(),
+            None
         );
     }
 
@@ -10161,14 +10360,15 @@ mod tests {
             },
         ));
 
-        assert_ne!(
+        assert_eq!(
             counter_target_verdict(
                 state,
                 lapse,
                 vec![TargetRef::Object(theirs), TargetRef::Object(mine)],
                 mine,
-            ),
-            GateDecision::Reject
+            )
+            .reject_reason(),
+            None
         );
     }
 
@@ -10198,14 +10398,15 @@ mod tests {
             },
         });
 
-        assert_ne!(
+        assert_eq!(
             counter_target_verdict(
                 state,
                 plain_counter(None),
                 vec![TargetRef::Object(theirs), TargetRef::Object(ability)],
                 ability,
-            ),
-            GateDecision::Reject
+            )
+            .reject_reason(),
+            None
         );
     }
 
@@ -10234,7 +10435,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
 
     /// A payable ward does not gate the target out — it's only priced (in the
@@ -10261,7 +10465,7 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_ne!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(assess_candidate(&ctx).reject_reason(), None);
     }
 
     /// CR 702.21a + CR 119.4: Phyrexian Fleshgorger's Ward uses its current
@@ -10300,10 +10504,16 @@ mod tests {
             assess_candidate(&ctx)
         };
 
-        assert_eq!(gate_for(6, 7), GateDecision::Reject);
-        assert_eq!(gate_for(7, 7), GateDecision::Reject);
-        assert_ne!(gate_for(8, 7), GateDecision::Reject);
-        assert_ne!(gate_for(4, 3), GateDecision::Reject);
+        assert_eq!(
+            gate_for(6, 7).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
+        assert_eq!(
+            gate_for(7, 7).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
+        assert_eq!(gate_for(8, 7).reject_reason(), None);
+        assert_eq!(gate_for(4, 3).reject_reason(), None);
     }
 
     /// CR 702.21a + CR 104.3d: a Ward payment that would push the AI to ten
@@ -10335,7 +10545,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
 
     /// A poison Ward payment that stays below the ten-poison threshold does
@@ -10366,7 +10579,7 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_ne!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(assess_candidate(&ctx).reject_reason(), None);
     }
 
     /// CR 702.21a + CR 104.3d: two individually-nonlethal poison sub-costs in
@@ -10408,7 +10621,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
 
     /// CR 702.21a: the ward-affordability gate applies to any targetable
@@ -10441,7 +10657,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
 
     /// CR 104.3d + CR 614.1a: a doubler on the poison counters the AI itself
@@ -10492,7 +10711,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
 
     /// CR 702.21a: a "players can't get counters" replacement (Solemnity) means
@@ -10534,7 +10756,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
 
     /// CR 702.21a: a `Compound` Ward's sub-costs are conjoined — ALL must be
@@ -10580,7 +10805,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::UnpayableWard)
+        );
     }
     /// Build an Improvise `ManaPayment` decision context: a `TapForConvoke`
     /// Colorless candidate for `object_id`, plus whatever sibling candidates
@@ -10676,7 +10904,10 @@ mod tests {
         let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
         let context = AiContext::empty(&config.weights);
         let ctx = convoke_candidate_ctx(&state, &decision, &config, &context);
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::ConvokeStrandsPip)
+        );
     }
 
     /// The sibling native-ability tap for the same permanent must stay
@@ -10868,7 +11099,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&colorless_ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&colorless_ctx).reject_reason(),
+            Some(RejectReason::ConvokeStrandsPip)
+        );
 
         let colored_ctx = PolicyContext {
             state,
@@ -11022,7 +11256,10 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         };
-        assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+        assert_eq!(
+            assess_candidate(&ctx).reject_reason(),
+            Some(RejectReason::ConvokeStrandsPip)
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -11103,7 +11340,10 @@ mod tests {
         set_priority_window(state, Phase::End, P1);
 
         assert_parses_as_temporary_pump(state, prowler);
-        assert_eq!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(
+            gate_activation(state, prowler).reject_reason(),
+            Some(RejectReason::PumpWindow)
+        );
     }
 
     #[test]
@@ -11117,7 +11357,10 @@ mod tests {
         set_priority_window(state, Phase::PostCombatMain, P0);
 
         assert_parses_as_temporary_pump(state, prowler);
-        assert_eq!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(
+            gate_activation(state, prowler).reject_reason(),
+            Some(RejectReason::PumpWindow)
+        );
     }
 
     /// After blockers are declared, a 2/2 blocked by a 3/3 dies and kills
@@ -11141,7 +11384,7 @@ mod tests {
         });
 
         assert_parses_as_temporary_pump(state, prowler);
-        assert_ne!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(gate_activation(state, prowler).reject_reason(), None);
     }
 
     /// The mirror of the case above, and the proof that the new branch is a
@@ -11166,7 +11409,10 @@ mod tests {
         });
 
         assert_parses_as_temporary_pump(state, prowler);
-        assert_eq!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(
+            gate_activation(state, prowler).reject_reason(),
+            Some(RejectReason::PumpWindow)
+        );
     }
 
     /// A pump whose definition carries no `UntilEndOfTurn` duration outlives
@@ -11183,7 +11429,7 @@ mod tests {
         let object = state.objects.get_mut(&prowler).unwrap();
         Arc::make_mut(&mut object.abilities)[0].duration = None;
 
-        assert_ne!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(gate_activation(state, prowler).reject_reason(), None);
     }
 
     /// The reactive exception carried over from the spell path: with a 3-damage
@@ -11220,7 +11466,7 @@ mod tests {
         });
 
         assert_parses_as_temporary_pump(state, prowler);
-        assert_ne!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(gate_activation(state, prowler).reject_reason(), None);
     }
 
     /// Sacrifice-outlet shape (Nantuko Husk): the sacrifice IS the payoff, and
@@ -11237,7 +11483,7 @@ mod tests {
         set_priority_window(state, Phase::End, P1);
 
         assert_parses_as_temporary_pump(state, husk);
-        assert_ne!(gate_activation(state, husk), GateDecision::Reject);
+        assert_eq!(gate_activation(state, husk).reject_reason(), None);
     }
 
     /// A sorcery-speed-only pump has no later, stronger window to be saved
@@ -11259,7 +11505,7 @@ mod tests {
             .push(ActivationRestriction::AsSorcery);
 
         assert_parses_as_temporary_pump(state, prowler);
-        assert_ne!(gate_activation(state, prowler), GateDecision::Reject);
+        assert_eq!(gate_activation(state, prowler).reject_reason(), None);
     }
 
     /// CR 509.1h: with no blocker declared for it the Dragon is an unblocked
@@ -11283,7 +11529,7 @@ mod tests {
         });
 
         assert_parses_as_temporary_pump(state, dragon);
-        assert_ne!(gate_activation(state, dragon), GateDecision::Reject);
+        assert_eq!(gate_activation(state, dragon).reject_reason(), None);
     }
 
     /// CR 510.3: the active player gets priority again after combat damage is
@@ -11307,7 +11553,10 @@ mod tests {
         });
 
         assert_parses_as_temporary_pump(state, dragon);
-        assert_eq!(gate_activation(state, dragon), GateDecision::Reject);
+        assert_eq!(
+            gate_activation(state, dragon).reject_reason(),
+            Some(RejectReason::PumpWindow)
+        );
     }
 
     // --- Modal spells gated per mode; negative-toughness pumps as removal ---
@@ -11423,11 +11672,11 @@ mod tests {
         set_priority_window(state, Phase::PreCombatMain, P0);
 
         assert_modal_with_modes(state, charm, 3);
-        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, charm).reject_reason(), None);
 
         // CR 601.2b: the same holds in an upkeep window on the AI's own turn.
         set_priority_window(state, Phase::Upkeep, P0);
-        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, charm).reject_reason(), None);
     }
 
     /// Same shape with only the AI's own spell on the stack: still no opposing
@@ -11445,7 +11694,7 @@ mod tests {
         push_own_spell(state);
 
         assert_modal_with_modes(state, charm, 3);
-        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, charm).reject_reason(), None);
     }
 
     /// A modal spell whose non-counter mode needs no target (mill and draw)
@@ -11462,7 +11711,7 @@ mod tests {
         set_priority_window(state, Phase::PreCombatMain, P0);
 
         assert_modal_with_modes(state, charm, 3);
-        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, charm).reject_reason(), None);
     }
 
     /// Icy Reception shape: counter mode plus a -5/-0. At the opponent's
@@ -11484,7 +11733,7 @@ mod tests {
         });
 
         assert_modal_with_modes(state, icy, 2);
-        assert_ne!(gate_spell_cast(state, icy), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, icy).reject_reason(), None);
     }
 
     /// Icy Reception in its own postcombat main with nothing on the stack: the
@@ -11502,7 +11751,10 @@ mod tests {
         set_priority_window(state, Phase::PostCombatMain, P0);
 
         assert_modal_with_modes(state, icy, 2);
-        assert_eq!(gate_spell_cast(state, icy), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, icy).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
     }
 
     /// CR 701.6a + CR 115.1: the counter mode is judged by what it can reach.
@@ -11523,7 +11775,10 @@ mod tests {
         push_own_ability(state);
 
         assert_modal_with_modes(state, icy, 2);
-        assert_eq!(gate_spell_cast(state, icy), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, icy).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
     }
 
     /// CR 701.6a: a spell whose every mode counters has nothing to do while no
@@ -11543,12 +11798,24 @@ mod tests {
         set_priority_window(state, Phase::PreCombatMain, P0);
 
         assert_modal_with_modes(state, modal, 2);
-        assert_eq!(gate_spell_cast(state, modal), GateDecision::Reject);
-        assert_eq!(gate_spell_cast(state, plain), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, modal).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
+        assert_eq!(
+            gate_spell_cast(state, plain).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
 
         push_own_spell(state);
-        assert_eq!(gate_spell_cast(state, modal), GateDecision::Reject);
-        assert_eq!(gate_spell_cast(state, plain), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, modal).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
+        assert_eq!(
+            gate_spell_cast(state, plain).reject_reason(),
+            Some(RejectReason::CounterReachesNothingForeign)
+        );
     }
 
     /// CR 704.5f: a -3/-3 on a 2/2 puts its toughness at or below zero and the
@@ -11573,9 +11840,9 @@ mod tests {
             (Phase::End, P1),
         ] {
             set_priority_window(state, phase, active);
-            assert_ne!(
-                gate_spell_cast(state, gasp),
-                GateDecision::Reject,
+            assert_eq!(
+                gate_spell_cast(state, gasp).reject_reason(),
+                None,
                 "Last Gasp with a live opposing creature target was gated in {phase:?}"
             );
         }
@@ -11594,7 +11861,10 @@ mod tests {
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
 
-        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, gasp).reject_reason(),
+            Some(RejectReason::RedundantCreatureOnlyRemoval)
+        );
     }
 
     /// The removal path keeps the stack-aware redundancy too: the only opposing
@@ -11629,7 +11899,10 @@ mod tests {
             },
         });
 
-        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, gasp).reject_reason(),
+            Some(RejectReason::RedundantCreatureOnlyRemoval)
+        );
     }
 
     /// A positive pump outside a combat window is still rejected (own
@@ -11655,7 +11928,10 @@ mod tests {
             (Phase::End, P1),
         ] {
             set_priority_window(state, phase, active);
-            assert_eq!(gate_spell_cast(state, growth), GateDecision::Reject);
+            assert_eq!(
+                gate_spell_cast(state, growth).reject_reason(),
+                Some(RejectReason::PumpWindow)
+            );
         }
     }
 
@@ -11685,8 +11961,8 @@ mod tests {
         ] {
             set_priority_window(state, phase, active);
             assert_eq!(
-                gate_spell_cast(state, gasp),
-                GateDecision::Reject,
+                gate_spell_cast(state, gasp).reject_reason(),
+                Some(RejectReason::ShrinkKillsNothing),
                 "Last Gasp that kills nothing was a candidate in {phase:?}"
             );
         }
@@ -11708,16 +11984,16 @@ mod tests {
         set_priority_window(state, Phase::PreCombatMain, P0);
 
         state.objects.get_mut(&traxos).unwrap().damage_marked = 2;
-        assert_ne!(
-            gate_spell_cast(state, gasp),
-            GateDecision::Reject,
+        assert_eq!(
+            gate_spell_cast(state, gasp).reject_reason(),
+            None,
             "-3/-3 on a 1/5 with 2 damage is lethal (CR 704.5g)"
         );
 
         state.objects.get_mut(&traxos).unwrap().damage_marked = 1;
         assert_eq!(
-            gate_spell_cast(state, gasp),
-            GateDecision::Reject,
+            gate_spell_cast(state, gasp).reject_reason(),
+            Some(RejectReason::ShrinkKillsNothing),
             "-3/-3 on a 1/5 with 1 damage leaves it alive"
         );
 
@@ -11725,8 +12001,8 @@ mod tests {
         traxos_object.damage_marked = 2;
         traxos_object.keywords.push(Keyword::Indestructible);
         assert_eq!(
-            gate_spell_cast(state, gasp),
-            GateDecision::Reject,
+            gate_spell_cast(state, gasp).reject_reason(),
+            Some(RejectReason::ShrinkKillsNothing),
             "indestructible ignores the lethal-damage SBA (CR 702.12b)"
         );
     }
@@ -11754,7 +12030,10 @@ mod tests {
             (Some(2), Some(4)),
             "fixture: the anthem should make the printed 2/2 a 4/4"
         );
-        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, gasp).reject_reason(),
+            Some(RejectReason::ShrinkKillsNothing)
+        );
     }
 
     /// Inside combat the shrink can swing damage without killing anything, so
@@ -11779,9 +12058,9 @@ mod tests {
                 attackers: vec![AttackerInfo::attacking_player(attacker, P0)],
                 ..Default::default()
             });
-            assert_ne!(
-                gate_spell_cast(state, gasp),
-                GateDecision::Reject,
+            assert_eq!(
+                gate_spell_cast(state, gasp).reject_reason(),
+                None,
                 "a shrink that stops lethal damage was rejected in {phase:?}"
             );
         }
@@ -11801,9 +12080,9 @@ mod tests {
             blocker_to_attacker: [(traxos, vec![ours])].into_iter().collect(),
             ..Default::default()
         });
-        assert_ne!(
-            gate_spell_cast(state, gasp),
-            GateDecision::Reject,
+        assert_eq!(
+            gate_spell_cast(state, gasp).reject_reason(),
+            None,
             "a shrink that lets our attacker kill its blocker was rejected"
         );
     }
@@ -11929,8 +12208,8 @@ mod tests {
         ] {
             set_priority_window(state, phase, active);
             assert_eq!(
-                gate_spell_cast(state, absence),
-                GateDecision::Reject,
+                gate_spell_cast(state, absence).reject_reason(),
+                Some(RejectReason::HarmOnlyOwnPermanents),
                 "Extended Absence with only own targets was a candidate in {phase:?}"
             );
         }
@@ -11950,7 +12229,7 @@ mod tests {
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
         assert_extended_absence_shape(state, absence);
-        assert_ne!(gate_spell_cast(state, absence), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, absence).reject_reason(), None);
 
         let mut scenario = GameScenario::new();
         scenario.add_creature(P0, "Divining Duelist", 2, 2);
@@ -11961,7 +12240,7 @@ mod tests {
         let mut runner = scenario.build();
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
-        assert_ne!(gate_spell_cast(state, absence), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, absence).reject_reason(), None);
     }
 
     /// CR 120.3a + CR 704.5a: the untargeted 1 damage to each opponent wins the
@@ -11980,14 +12259,17 @@ mod tests {
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
         assert_extended_absence_shape(state, absence);
-        assert_ne!(
-            gate_spell_cast(state, absence),
-            GateDecision::Reject,
+        assert_eq!(
+            gate_spell_cast(state, absence).reject_reason(),
+            None,
             "lethal drain was gated"
         );
 
         state.players[P1.0 as usize].life = 2;
-        assert_eq!(gate_spell_cast(state, absence), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, absence).reject_reason(),
+            Some(RejectReason::HarmOnlyOwnPermanents)
+        );
     }
 
     /// CR 613.4b: base power and toughness 0/0 on the AI's own creature puts it
@@ -12008,8 +12290,8 @@ mod tests {
         for (phase, active) in [(Phase::PreCombatMain, P0), (Phase::Upkeep, P0)] {
             set_priority_window(state, phase, active);
             assert_eq!(
-                gate_spell_cast(state, zero),
-                GateDecision::Reject,
+                gate_spell_cast(state, zero).reject_reason(),
+                Some(RejectReason::HarmOnlyOwnPermanents),
                 "Multiply by Zero with only own targets was a candidate in {phase:?}"
             );
         }
@@ -12027,7 +12309,7 @@ mod tests {
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
         assert_multiply_by_zero_shape(state, zero);
-        assert_ne!(gate_spell_cast(state, zero), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, zero).reject_reason(), None);
     }
 
     /// CR 700.2a + CR 601.2b: Theorix Charm with only the AI's own creature on
@@ -12047,7 +12329,7 @@ mod tests {
         set_priority_window(state, Phase::PreCombatMain, P0);
         fund_blue_black(state);
         assert_modal_with_modes(state, charm, 3);
-        assert_ne!(gate_spell_cast(state, charm), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, charm).reject_reason(), None);
 
         let announced = announce_to_mode_choice(state, charm);
         let issued: Vec<GameAction> = candidate_actions(announced.state())
@@ -12104,7 +12386,10 @@ mod tests {
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
         assert_modal_with_modes(state, spell, 2);
-        assert_eq!(gate_spell_cast(state, spell), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, spell).reject_reason(),
+            Some(RejectReason::HarmOnlyOwnPermanents)
+        );
 
         let announced = announce_to_mode_choice(state, spell);
         let kept = gated_actions(announced.state());
@@ -12138,9 +12423,9 @@ mod tests {
             let mut runner = scenario.build();
             let state = runner.state_mut();
             set_priority_window(state, Phase::PreCombatMain, P0);
-            assert_ne!(
-                gate_spell_cast(state, spell),
-                GateDecision::Reject,
+            assert_eq!(
+                gate_spell_cast(state, spell).reject_reason(),
+                None,
                 "{name} with only own targets was gated"
             );
         }
@@ -12159,9 +12444,9 @@ mod tests {
         let mut runner = scenario.build();
         let state = runner.state_mut();
         set_priority_window(state, Phase::PreCombatMain, P0);
-        assert_ne!(
-            gate_spell_cast(state, warden),
-            GateDecision::Reject,
+        assert_eq!(
+            gate_spell_cast(state, warden).reject_reason(),
+            None,
             "a creature spell was judged by its activated ability"
         );
     }
@@ -12209,7 +12494,7 @@ mod tests {
             attackers: vec![AttackerInfo::attacking_player(attacker, P0)],
             ..Default::default()
         });
-        assert_ne!(gate_spell_cast(state, unsummon), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, unsummon).reject_reason(), None);
     }
 
     /// CR 120.3a + CR 704.5a: creature-only removal whose untargeted part is
@@ -12235,13 +12520,16 @@ mod tests {
                 spell_effect_kinds(state, spell).contains(&EffectKind::DamageEachPlayer),
                 "fixture: {name} parses with a drain to each opponent"
             );
-            assert_ne!(
-                gate_spell_cast(state, spell),
-                GateDecision::Reject,
+            assert_eq!(
+                gate_spell_cast(state, spell).reject_reason(),
+                None,
                 "{name} with a lethal drain was gated"
             );
             state.players[P1.0 as usize].life = 2;
-            assert_eq!(gate_spell_cast(state, spell), GateDecision::Reject);
+            assert_eq!(
+                gate_spell_cast(state, spell).reject_reason(),
+                Some(RejectReason::RedundantCreatureOnlyRemoval)
+            );
         }
     }
 
@@ -12263,9 +12551,12 @@ mod tests {
             spell_effect_kinds(state, spell).contains(&EffectKind::LoseLife),
             "fixture: parses with a life loss"
         );
-        assert_ne!(gate_spell_cast(state, spell), GateDecision::Reject);
+        assert_eq!(gate_spell_cast(state, spell).reject_reason(), None);
         state.players[P1.0 as usize].life = 4;
-        assert_eq!(gate_spell_cast(state, spell), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, spell).reject_reason(),
+            Some(RejectReason::HarmOnlyOwnPermanents)
+        );
     }
 
     /// CR 601.2b + CR 700.2a: once the spell is announced there is no later
@@ -12375,9 +12666,9 @@ mod tests {
             let mut runner = scenario.build();
             let state = runner.state_mut();
             set_priority_window(state, Phase::PreCombatMain, P0);
-            assert_ne!(
-                gate_spell_cast(state, spell),
-                GateDecision::Reject,
+            assert_eq!(
+                gate_spell_cast(state, spell).reject_reason(),
+                None,
                 "{name} was gated"
             );
         }
@@ -12476,6 +12767,45 @@ mod tests {
             (true, false),
             "The Theorist onto an empty library decks the AI at the opponent's draw step"
         );
+    }
+
+    /// The reject names its check: `gate_decisions` reports the deck-out for
+    /// The Theorist's cast, and keeps exactly the candidates `gate_candidates`
+    /// keeps over the same issued pool.
+    #[test]
+    fn the_theorist_onto_an_empty_library_is_rejected_as_a_deck_out() {
+        let (state, theorist) = self_draw_table(0, theorist_in_hand);
+        let issued = candidate_actions(&state);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        let context = AiContext::empty(&config.weights);
+        let decisions = gate_decisions(&state, &decision, &issued, P0, &config, &context);
+        let theorist_cast = issued
+            .iter()
+            .position(|candidate| matches!(&candidate.action, GameAction::CastSpell { object_id, .. } if *object_id == theorist))
+            .expect("reach-guard: the engine issues her cast");
+        assert_eq!(
+            decisions[theorist_cast].reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+        assert_eq!(
+            RejectReason::DecksOutBeforeOwnDraw.as_str(),
+            "decks_out_before_own_draw"
+        );
+        let kept: Vec<usize> = gate_candidates(&state, &decision, issued, P0, &config, &context)
+            .into_iter()
+            .map(|gated| gated.source_index)
+            .collect();
+        let not_rejected: Vec<usize> = decisions
+            .iter()
+            .enumerate()
+            .filter(|(_, decision)| !decision.is_reject())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(kept, not_rejected);
     }
 
     /// One card, one opponent: her trigger draws it at the opponent's draw
@@ -12777,7 +13107,10 @@ mod tests {
             search_depth: crate::policies::context::SearchDepth::Root,
         };
         assert!(is_redundant_creature_only_removal(&ctx, &ctx.effects()));
-        assert_eq!(gate_spell_cast(state, gasp), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(state, gasp).reject_reason(),
+            Some(RejectReason::RedundantCreatureOnlyRemoval)
+        );
     }
 
     /// P0 on its own precombat main with an untapped 3/3 that can attack, P1
@@ -12833,7 +13166,10 @@ mod tests {
             )),
             "fixture: Pyromancer carries the activated ping"
         );
-        assert_eq!(gate_spell_cast(&state, pyromancer), GateDecision::Reject);
+        assert_eq!(
+            gate_spell_cast(&state, pyromancer).reject_reason(),
+            Some(RejectReason::LethalAttackFirst)
+        );
     }
 
     /// Guard: Shock's damage is its spell ability, so before a lethal attack it
