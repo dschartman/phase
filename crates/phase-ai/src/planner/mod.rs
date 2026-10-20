@@ -2363,6 +2363,9 @@ mod own_trigger_window_tests;
 mod ordering_value_tests;
 
 #[cfg(test)]
+mod mode_choice_value_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
