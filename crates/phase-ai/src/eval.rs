@@ -280,7 +280,10 @@ pub struct EvalFeatures {
     /// `card_advantage_breakdown`. Priced at the **hand-size weight**, so a
     /// self-mill or a draw into a short library costs what the cards are
     /// worth in hand. Not a 17Lands column: `FeatureRow::extract` folds it into
-    /// the harvested `hand_size`, the weight it multiplies.
+    /// the harvested `hand_size`, the weight it multiplies. Its bottom is not
+    /// linear: an own library of 0 (the draw surviving replacement) is the
+    /// loss, a terminal [`evaluate_features`] returns, so it is never
+    /// harvested; the opponent's 0 stays four cards here.
     pub library_floor: f64,
 }
 
@@ -506,6 +509,16 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             .all(|&opp| state.players[opp.0 as usize].life <= 0);
     if all_opponents_dead {
         return Err(WIN_SCORE);
+    }
+    // CR 504.1 + CR 121.4 + CR 704.5b: a position that is not over has the
+    // player's own draw step ahead, and that draw from an empty library loses,
+    // so an empty library is the loss (the bottom of `library_floor`), unless
+    // a draw replacement that applies on an empty library (CR 614.11) would
+    // remove the draw. Not read: a skipped draw step or a draw prohibition.
+    if p.library.is_empty()
+        && crate::policies::anti_self_harm::draw_survives_replacement(state, player, 1)
+    {
+        return Err(LOSS_SCORE);
     }
 
     let mut features = EvalFeatures::default();
