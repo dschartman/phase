@@ -559,11 +559,12 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
 /// library (`DrawsPastLibrary`). Exactly the library (at least one): the AI
 /// is at 0 with its own next draw step ahead (CR 504.1), which draws from the
 /// empty library, the recurring check's `before_own_draw >= library` reading
-/// and reason (`DecksOutBeforeOwnDraw`). The one way out read here is a cast
-/// that wins first: the same resolution's untargeted drain brings every
-/// opponent still in the game to 0 or less and leaves the AI above 0
-/// (`untargeted_drain_wins_the_game`). A draw past the library with a lethal
-/// drain is no win (CR 104.4a: both lose at once).
+/// and reason (`DecksOutBeforeOwnDraw`). No win-first exception is read: a
+/// draw to 0 whose own resolution wins (a drain killing every opponent) is
+/// rejected too, a win the AI gives up by design until an engine-side win
+/// preview exists (lead ruling 2026-10-20; a phase-ai walk of the drain chain
+/// failed three judge rounds). A draw past the library with a lethal drain is
+/// no win either (CR 104.4a: both lose at once).
 ///
 /// A spell cast from its owner's library leaves it first (CR 601.2a). A modal
 /// spell is not read (its mode is a later choice). Not read, as in the
@@ -607,86 +608,11 @@ fn one_shot_self_draw_reject(ctx: &PolicyContext<'_>) -> Option<RejectReason> {
     if draws < library || !draw_survives_replacement(ctx.state, ctx.ai_player, draws as u32) {
         return None;
     }
-    if draws > library {
-        return Some(RejectReason::DrawsPastLibrary);
-    }
-    (!untargeted_drain_wins_the_game(ctx, source.id, &abilities))
-        .then_some(RejectReason::DecksOutBeforeOwnDraw)
-}
-
-/// CR 119.3 + CR 704.5a + CR 104.2a: whether the untargeted drains of
-/// `abilities` ("each opponent loses N life", "deals N damage to each
-/// player") win the game when they resolve: summed per player, they bring
-/// every opponent still in the game to 0 or less and leave the AI above 0. A
-/// drain that also brings the AI to 0 or less is a draw at best (CR 104.4a).
-/// Only the main chain (each ability and its `sub_ability` links) is read; an
-/// `else_ability` leg is not. Fails closed, reading as no win: a drain that
-/// carries a condition (CR 608.2c: it may not happen) or is optional (may, an
-/// optional player, an unless payment), an amount it cannot resolve, or a
-/// player set other than each opponent or each player. Damage prevention is
-/// not read. Unlike `untargeted_part_is_lethal_to_an_opponent` (any one
-/// opponent dies, failing open), which the own-target rule keeps using.
-fn untargeted_drain_wins_the_game(
-    ctx: &PolicyContext<'_>,
-    source_id: ObjectId,
-    abilities: &[&AbilityDefinition],
-) -> bool {
-    let mut to_opponents = 0;
-    let mut to_ai = 0;
-    let chain = abilities.iter().flat_map(|ability| {
-        std::iter::successors(Some(*ability), |node| node.sub_ability.as_deref())
-    });
-    for node in chain {
-        let (amount, players) = match (node.effect.as_ref(), &node.player_scope) {
-            (
-                Effect::DamageEachPlayer {
-                    amount,
-                    player_filter,
-                },
-                _,
-            ) => (amount, player_filter),
-            (
-                Effect::LoseLife {
-                    amount,
-                    target: None,
-                },
-                Some(scope),
-            ) => (amount, scope),
-            _ => continue,
-        };
-        let delivered = node.condition.is_none()
-            && !node.optional
-            && node.optional_player.is_none()
-            && node.optional_for.is_none()
-            && node.unless_pay.is_none();
-        if !delivered {
-            return false;
-        }
-        let Some(loss) =
-            try_resolve_quantity_in_source_context(ctx.state, amount, ctx.ai_player, source_id)
-        else {
-            return false;
-        };
-        match players {
-            PlayerFilter::Opponent => to_opponents += loss,
-            PlayerFilter::All => {
-                to_opponents += loss;
-                to_ai += loss;
-            }
-            _ => return false,
-        }
-    }
-    let live_opponents: Vec<_> = opponents(ctx.state, ctx.ai_player)
-        .into_iter()
-        .map(|opponent| &ctx.state.players[opponent.0 as usize])
-        .filter(|player| !player.is_eliminated)
-        .collect();
-    to_opponents > 0
-        && !live_opponents.is_empty()
-        && live_opponents
-            .iter()
-            .all(|player| player.life <= to_opponents)
-        && ctx.state.players[ctx.ai_player.0 as usize].life > to_ai
+    Some(if draws > library {
+        RejectReason::DrawsPastLibrary
+    } else {
+        RejectReason::DecksOutBeforeOwnDraw
+    })
 }
 
 /// The effects the gate's effect-level checks read for a cast or an
