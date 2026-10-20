@@ -248,6 +248,76 @@ fn a_planeswalkers_leaf_credit_rises_with_its_loyalty() {
     );
 }
 
+// --- The Theorist: loyalty is the budget that pays for one line ------------
+
+/// The two readings of a resolved Theorist at `loyalty` (25 Islands in
+/// library, so one expected draw is an Island's 3.0): her leaf credit in
+/// cards (`permanent_card_credit`) and her `intrinsic_value`.
+fn the_theorist_prices_at(loyalty: u32) -> (f64, f64) {
+    let (state, theorist) = the_theorist_resolved_at(25, loyalty);
+    let obj = &state.objects[&theorist];
+    (
+        crate::card_value::permanent_card_credit(&state, obj),
+        crate::card_value::intrinsic_value(&state, theorist),
+    )
+}
+
+/// CR 606.3: a planeswalker's loyalty abilities are activated one a turn, and
+/// CR 606.4 + CR 606.6: a negative cost is paid out of its loyalty. Her loyalty is what
+/// pays for the line she takes, not value on top of it. At 1 loyalty only her
+/// [+1] (a 1/1 Illusion, 2.5) is payable: her leaf credit is her card, the
+/// larger of her loyalty (1) and that line, and her recurring draw once
+/// (3.0), so 1 + (2.5 + 3.0) / 3.0 = 2.83 cards, under two cards above her
+/// card (it was 3.17: her loyalty added on top of the line it pays for).
+#[test]
+fn the_theorists_leaf_credit_at_one_loyalty_is_her_card_plus_her_one_payable_line() {
+    let (credit, _) = the_theorist_prices_at(1);
+    assert!(
+        credit - 1.0 < 2.0,
+        "at 1 loyalty her leaf credit must sit under two cards above her card, got {credit:.4}"
+    );
+    assert!(
+        (credit - (1.0 + 5.5 / 3.0)).abs() < 1e-9,
+        "card + max(loyalty 1, [+1] 2.5) + draw 3.0, in draws; got {credit:.4}"
+    );
+}
+
+/// The same rule in `intrinsic_value`: her pips (2.0) plus the larger of her
+/// loyalty (1) and her [+1] (2.5), plus her draw (3.0): 7.5 (it was 8.5).
+#[test]
+fn the_theorists_intrinsic_value_at_one_loyalty_is_her_one_payable_line() {
+    let (_, intrinsic) = the_theorist_prices_at(1);
+    assert!(
+        (intrinsic - 7.5).abs() < 1e-9,
+        "pips 2.0 + max(loyalty 1, [+1] 2.5) + draw 3.0; got {intrinsic:.4}"
+    );
+}
+
+/// At 6 loyalty every ability is payable ([+1] 2.5, [-2] 0 on an empty
+/// opposing board, [-6] draw three 9.0), but she activates one a turn
+/// (CR 606.3): her best line, the [-6], against her loyalty 6, so
+/// 1 + (9.0 + 3.0) / 3.0 = 5.0 cards, not every payable ability summed on top
+/// of her loyalty (7.83).
+#[test]
+fn the_theorists_leaf_credit_at_six_loyalty_is_her_best_line_not_the_sum() {
+    let (credit, _) = the_theorist_prices_at(6);
+    assert!(
+        (credit - 5.0).abs() < 1e-9,
+        "card + max(loyalty 6, [-6] 9.0) + draw 3.0, in draws; got {credit:.4}"
+    );
+}
+
+/// `intrinsic_value` at 6 loyalty: 2.0 + max(6, 9.0) + 3.0 = 14.0, not the
+/// sum's 22.5.
+#[test]
+fn the_theorists_intrinsic_value_at_six_loyalty_is_her_best_line_not_the_sum() {
+    let (_, intrinsic) = the_theorist_prices_at(6);
+    assert!(
+        (intrinsic - 14.0).abs() < 1e-9,
+        "pips 2.0 + max(loyalty 6, [-6] 9.0) + draw 3.0; got {intrinsic:.4}"
+    );
+}
+
 // --- The Theorist's draw on a short library -------------------------------
 
 /// The Theorist with her recurring draw trigger removed: the credit of
