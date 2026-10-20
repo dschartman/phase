@@ -109,7 +109,9 @@ pub enum RejectReason {
     /// is a known zero.
     ZeroDirectEffect,
     /// `cast_self_draw_decks_before_own_draw`: a recurring mandatory self-draw
-    /// empties the library before the AI's own next draw step.
+    /// empties the library before the AI's own next draw step; or
+    /// `one_shot_self_draw_reject`: a one-shot cast or activation whose
+    /// mandatory draws are exactly the AI's library (at least one).
     DecksOutBeforeOwnDraw,
     /// `targeted_exchange_verdict`: a targeted self-damage or fight exchange
     /// proven bad on every bound target path.
@@ -334,6 +336,16 @@ fn assess_in_context(
 fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
     match &ctx.candidate.action {
         GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => assess_pre_cast(ctx),
+        // CR 601.2: the other cast actions cast a spell too (from a prompt or
+        // a permission); its own resolution's draws are read the same way.
+        // The other pre-cast checks read `CastSpell` only.
+        GameAction::CastSpellForFree { .. }
+        | GameAction::CastSpellAsMiracle { .. }
+        | GameAction::CastSpellAsMadness { .. }
+        | GameAction::CastSpellAsSneak { .. }
+        | GameAction::CastSpellAsWebSlinging { .. } => {
+            one_shot_self_draw_reject(ctx).map_or(GateDecision::Allow, GateDecision::Reject)
+        }
         GameAction::SelectModes { indices } if spell_mode_choice_is_futile(ctx, indices) => {
             GateDecision::Reject(RejectReason::FutileModeChoice)
         }
@@ -423,9 +435,9 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     }
 
     // CR 121.4 + CR 704.5b: a one-shot cast or activation whose own
-    // resolution draws more cards than the AI's library holds loses the game.
-    if resolution_draws_past_library(ctx) {
-        return GateDecision::Reject(RejectReason::DrawsPastLibrary);
+    // resolution draws the AI's library to 0 or past it loses the game.
+    if let Some(reason) = one_shot_self_draw_reject(ctx) {
+        return GateDecision::Reject(reason);
     }
 
     // CR 601.2c + CR 608.2c: Target-sourced self-damage and fight exchanges are
@@ -529,40 +541,94 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     assess_cast_effects(ctx, &candidate_effects(ctx), &spell_abilities)
 }
 
-/// CR 121.4 + CR 704.5b: whether the candidate's own resolution makes the AI
-/// draw from an empty library: the fewest mandatory draws it makes
-/// (`self_cost::fewest_mandatory_self_draws`, a lower bound read for the
-/// zone the spell is cast from, so Twinned Vision flashed back from the
-/// graveyard draws two) are more than the library will hold, and the draw
-/// survives the replacement pipeline (`draw_survives_replacement`, the reading
-/// the recurring check shares). Drawing exactly the library is no loss. A
-/// spell cast from its owner's library leaves it first (CR 601.2a). A modal
+/// CR 121.4 + CR 704.5b: the reject for a candidate whose own resolution
+/// makes the AI's mandatory draws reach its library, read beside the
+/// recurring check (`cast_self_draw_decks_before_own_draw`) and sharing its
+/// replacement reading (`draw_survives_replacement`). The draws are the
+/// fewest mandatory self-draws the resolution delivers
+/// (`self_cost::fewest_mandatory_self_draws`, a lower bound read for the zone
+/// the spell is cast from, so Twinned Vision flashed back from the graveyard
+/// draws two).
+///
+/// More draws than the library: the resolution itself draws from an empty
+/// library (`DrawsPastLibrary`). Exactly the library (at least one): the AI
+/// is at 0 with its own next draw step ahead (CR 504.1), which draws from the
+/// empty library, the recurring check's `before_own_draw >= library` reading
+/// and reason (`DecksOutBeforeOwnDraw`). The one way out read here is a cast
+/// that wins first: an untargeted part of the same resolution lethal to an
+/// opponent (`untargeted_part_is_lethal_to_an_opponent`, CR 119.3 +
+/// CR 704.5a) ends the game at the state-based check after it resolves. A
+/// draw past the library with a lethal drain is no win (CR 104.4a: both lose
+/// at once).
+///
+/// A spell cast from its owner's library leaves it first (CR 601.2a). A modal
 /// spell is not read (its mode is a later choice). Not read, as in the
 /// recurring check: a `CantDraw` static or a per-turn draw limit, and a draw
 /// replacement conditioned on the library being empty (Laboratory Maniac),
-/// which this check over-rejects.
-fn resolution_draws_past_library(ctx: &PolicyContext<'_>) -> bool {
-    let Some(source) = ctx.source_object() else {
-        return false;
-    };
-    let draws = match &ctx.candidate.action {
-        GameAction::CastSpell { .. } if source.modal.is_none() => {
-            fewest_mandatory_self_draws(modal_spell_mode_ability_refs(source), Some(source.zone))
-        }
+/// which this check over-rejects; nor any other way to win or refill the
+/// library before the draw step.
+fn one_shot_self_draw_reject(ctx: &PolicyContext<'_>) -> Option<RejectReason> {
+    let (source, abilities, origin): (_, Vec<&AbilityDefinition>, _) = match &ctx.candidate.action {
         GameAction::ActivateAbility { ability_index, .. } => {
-            fewest_mandatory_self_draws(source.abilities.get(*ability_index), None)
+            let source = ctx.source_object()?;
+            (
+                source,
+                source.abilities.get(*ability_index).into_iter().collect(),
+                None,
+            )
         }
-        _ => return false,
+        _ => {
+            let source = cast_action_source(ctx)?;
+            if source.modal.is_some() {
+                return None;
+            }
+            (
+                source,
+                modal_spell_mode_ability_refs(source).collect(),
+                Some(source.zone),
+            )
+        }
     };
+    let draws = fewest_mandatory_self_draws(abilities.iter().copied(), origin);
+    if draws == 0 {
+        return None;
+    }
     let player = &ctx.state.players[ctx.ai_player.0 as usize];
-    let leaves_library = matches!(ctx.candidate.action, GameAction::CastSpell { .. })
-        && source.zone == Zone::Library
-        && player.library.contains(&source.id);
+    let leaves_library = origin == Some(Zone::Library) && player.library.contains(&source.id);
     let library = player
         .library
         .len()
         .saturating_sub(usize::from(leaves_library));
-    draws as usize > library && draw_survives_replacement(ctx.state, ctx.ai_player, draws)
+    let draws = draws as usize;
+    if draws < library || !draw_survives_replacement(ctx.state, ctx.ai_player, draws as u32) {
+        return None;
+    }
+    if draws > library {
+        return Some(RejectReason::DrawsPastLibrary);
+    }
+    (!untargeted_part_is_lethal_to_an_opponent(ctx, source.id, &spell_links(&abilities)))
+        .then_some(RejectReason::DecksOutBeforeOwnDraw)
+}
+
+/// CR 601.2: the object a cast-family action casts: `CastSpell` through the
+/// policy context's own lookup, the other cast actions (`payment_mode_mut`'s
+/// set) through the object the action names. `None` for any other action.
+fn cast_action_source<'a>(
+    ctx: &PolicyContext<'a>,
+) -> Option<&'a engine::game::game_object::GameObject> {
+    match &ctx.candidate.action {
+        GameAction::CastSpell { .. } => ctx.source_object(),
+        GameAction::CastSpellForFree { .. }
+        | GameAction::CastSpellAsMiracle { .. }
+        | GameAction::CastSpellAsMadness { .. }
+        | GameAction::CastSpellAsSneak { .. }
+        | GameAction::CastSpellAsWebSlinging { .. } => ctx
+            .candidate
+            .action
+            .source_object()
+            .and_then(|id| ctx.state.objects.get(&id)),
+        _ => None,
+    }
 }
 
 /// The effects the gate's effect-level checks read for a cast or an

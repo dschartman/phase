@@ -8545,13 +8545,17 @@ mod tests {
         let mut state = make_state();
         priority_on_opponent_end_step(&mut state);
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
-        create_object(
-            &mut state,
-            CardId(9_000),
-            PlayerId(0),
-            "Replacement".to_string(),
-            Zone::Library,
-        );
+        // Two cards in library: the cycle's draw leaves one for the AI's own
+        // draw step (a draw to 0 is the gate's deck-out reject).
+        for card in [CardId(9_000), CardId(9_100)] {
+            create_object(
+                &mut state,
+                card,
+                PlayerId(0),
+                "Replacement".to_string(),
+                Zone::Library,
+            );
+        }
         let cycler = add_cycler_to_hand(
             &mut state,
             CoreType::Creature,
@@ -8620,13 +8624,17 @@ mod tests {
             add_plain_land(&mut state, Zone::Battlefield);
         }
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
-        create_object(
-            &mut state,
-            CardId(9_001),
-            PlayerId(0),
-            "Replacement".to_string(),
-            Zone::Library,
-        );
+        // Two cards in library: the cycle's draw leaves one for the AI's own
+        // draw step (a draw to 0 is the gate's deck-out reject).
+        for card in [CardId(9_001), CardId(9_101)] {
+            create_object(
+                &mut state,
+                card,
+                PlayerId(0),
+                "Replacement".to_string(),
+                Zone::Library,
+            );
+        }
         let cycler = add_cycler_to_hand(
             &mut state,
             CoreType::Land,
