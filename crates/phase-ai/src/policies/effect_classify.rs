@@ -5025,3 +5025,62 @@ mod filter_domain_tests {
         assert!(!filter_is_creature_only(&filter));
     }
 }
+
+#[cfg(test)]
+mod object_impact_tests {
+    use super::*;
+    use engine::game::scenario::{GameScenario, P0};
+    use engine::types::ability::StaticDefinition;
+    use engine::types::identifiers::ObjectId;
+
+    /// "target creature has base power and toughness P/T until end of turn".
+    fn base_setter(power: i32, toughness: i32) -> Effect {
+        let mut definition = StaticDefinition::new(StaticMode::Continuous);
+        definition.affected = Some(TargetFilter::ParentTarget);
+        definition.modifications = vec![
+            ContinuousModification::SetPower { value: power },
+            ContinuousModification::SetToughness { value: toughness },
+        ];
+        Effect::GenericEffect {
+            static_abilities: vec![definition],
+            duration: None,
+            target: Some(TargetFilter::Any),
+            end_cost: None,
+        }
+    }
+
+    fn impact(effect: &Effect, power: i32, toughness: i32) -> f64 {
+        let mut scenario = GameScenario::new();
+        let id: ObjectId = scenario.add_creature(P0, "Subject", power, toughness).id();
+        let runner = scenario.build();
+        object_impact(runner.state(), Some(P0), None, effect, id)
+    }
+
+    /// CR 613.4b: a base power/toughness setter is read against the target's
+    /// current base: lower is harm, higher is benefit, a raise of one and a
+    /// cut of the other or no change is no signal (0.0, Contextual's impact).
+    #[test]
+    fn base_setter_reads_against_the_targets_base() {
+        assert_eq!(impact(&base_setter(0, 0), 2, 2), -1.0);
+        assert_eq!(impact(&base_setter(4, 4), 2, 2), 1.0);
+        assert_eq!(impact(&base_setter(1, 5), 3, 3), 0.0);
+        assert_eq!(impact(&base_setter(2, 2), 2, 2), 0.0);
+        assert_eq!(impact(&base_setter(0, 2), 2, 2), -1.0);
+    }
+
+    /// An effect with a polarity label keeps its player impact.
+    #[test]
+    fn labelled_effects_keep_their_player_impact() {
+        let destroy = Effect::Destroy {
+            target: TargetFilter::Any,
+            cant_regenerate: false,
+        };
+        assert_eq!(impact(&destroy, 2, 2), -1.0);
+        let grow = Effect::Pump {
+            power: PtValue::Fixed(2),
+            toughness: PtValue::Fixed(2),
+            target: TargetFilter::Any,
+        };
+        assert_eq!(impact(&grow, 2, 2), 1.0);
+    }
+}
