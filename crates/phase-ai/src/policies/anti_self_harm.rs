@@ -19,7 +19,7 @@ use engine::types::ability::DelayedTriggerPlayerBinding;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition,
     Effect, EffectScope, QuantityExpr, ReplacementMode, SubAbilityLink, TapStateChange,
-    TargetFilter, TargetRef,
+    TargetFilter, TargetRef, TriggerConstraint,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
@@ -29,8 +29,10 @@ use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, WardCost};
 use engine::types::phase::Phase;
+use engine::types::proposed_event::{DrawEventStage, ProposedEvent};
 use engine::types::replacements::ReplacementEvent;
 use engine::types::statics::StaticMode;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use crate::card_value::intrinsic_value;
@@ -400,6 +402,7 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
                 .then_some(ctx.penalties().wasted_cast_penalty)
         })
         .unwrap_or(0.0);
+    let deck_out_penalty = recurring_self_draw_deck_out_penalty(ctx);
 
     // A cast is judged by what the spell does when it resolves: its spell-kind
     // abilities ([`action_ability_definitions`]), the same reading as the
@@ -477,7 +480,7 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
     };
 
     if !has_beneficial_creature_target && !has_harmful_creature_only_target && !has_harmful_bounce {
-        return legend_penalty + etb_whiff_penalty + copy_whiff_penalty;
+        return legend_penalty + deck_out_penalty + etb_whiff_penalty + copy_whiff_penalty;
     }
 
     let has_own_creature = ctx.state.battlefield.iter().any(|&id| {
@@ -552,6 +555,8 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
     penalty += copy_whiff_penalty;
 
     penalty += legend_penalty;
+
+    penalty += deck_out_penalty;
 
     // Penalize pump spells during opponent's combat that would require tapping creature
     // mana sources. auto_tap prefers pure lands (tier 0) over non-land dorks (tier 1),
@@ -680,42 +685,261 @@ fn etb_trigger_has_valid_targets(
         _ => return true, // Not a cast action — assume valid
     };
 
-    let mut declares_a_target = false;
-    for trigger in &facts.immediate_etb_triggers {
-        let Some(execute) = &trigger.execute else {
-            continue;
-        };
-        // Walk the trigger's effect chain looking for targeted effects.
-        // CR 702.11/702.16/702.18 + CR 608.2b: targeting legality (and the
-        // correct zone enumeration for the filter) is owned by the engine, so
-        // ask `find_legal_targets` rather than re-deriving candidate zones and
-        // applying a property-only `matches_target_filter` that ignores
-        // Shroud/Hexproof/Protection.
-        let mut node = Some(execute.as_ref());
-        while let Some(def) = node {
-            if let Some(filter) = extract_target_filter(&def.effect) {
-                // CR 115.10a + CR 303.4b + CR 301.5a: "enchanted creature" and
-                // "equipped creature" name the object the source is attached
-                // to, not a target. At cast time nothing is attached yet, so
-                // the filter matches nothing, and that is no whiff: Infinite
-                // Coursework's "tap enchanted creature" taps whatever its
-                // Enchant target became (CR 303.4a; the Aura branch of
-                // `score_pre_cast` checks that target).
-                if filter.contains_source_attachment_host() {
-                    node = def.sub_ability.as_deref();
-                    continue;
-                }
-                declares_a_target |= !filter.is_context_ref();
-                if !find_legal_targets(ctx.state, filter, ctx.ai_player, source_id).is_empty() {
-                    return true;
-                }
-            }
-            node = def.sub_ability.as_deref();
+    facts
+        .immediate_etb_triggers
+        .iter()
+        .filter_map(|trigger| trigger.execute.as_deref())
+        .map(|execute| etb_chain_targets(ctx, execute, source_id))
+        .fold(EtbTargets::Undeclared, EtbTargets::and_then)
+        != EtbTargets::Unmet
+}
+
+/// What an ETB's ability chain declares as targets when it goes on the stack
+/// (CR 115.1d + CR 603.3d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EtbTargets {
+    /// No target: nothing, a context reference, or the attachment host.
+    Undeclared,
+    /// A target with at least one legal choice.
+    Legal,
+    /// Targets, none of which has a legal choice.
+    Unmet,
+}
+
+impl EtbTargets {
+    /// Parts of one chain: a legal target anywhere keeps the trigger worth
+    /// casting for (the walk's standing reading); otherwise a declared target
+    /// with no legal choice wastes it.
+    fn and_then(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Legal, _) | (_, Self::Legal) => Self::Legal,
+            (Self::Unmet, _) | (_, Self::Unmet) => Self::Unmet,
+            _ => Self::Undeclared,
         }
     }
 
-    // CR 115.1d: a trigger that declares no target cannot whiff on one.
-    !declares_a_target
+    /// Alternatives, each its own chain (modes, an else branch). CR 700.2b +
+    /// CR 603.3c: a mode with no legal target can't be chosen, and the ability
+    /// is removed from the stack only when no mode can be; a mode that needs
+    /// no target is always choosable.
+    fn or_else(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Legal, _) | (_, Self::Legal) => Self::Legal,
+            (Self::Undeclared, _) | (_, Self::Undeclared) => Self::Undeclared,
+            _ => Self::Unmet,
+        }
+    }
+}
+
+fn etb_chain_targets(
+    ctx: &PolicyContext<'_>,
+    def: &AbilityDefinition,
+    source_id: ObjectId,
+) -> EtbTargets {
+    // CR 702.11/702.16/702.18 + CR 608.2b: targeting legality (and the
+    // correct zone enumeration for the filter) is owned by the engine, so
+    // ask `find_legal_targets` rather than re-deriving candidate zones and
+    // applying a property-only `matches_target_filter` that ignores
+    // Shroud/Hexproof/Protection.
+    let own = match extract_target_filter(&def.effect) {
+        // CR 115.10a + CR 303.4b + CR 301.5a: "enchanted creature" and
+        // "equipped creature" name the object the source is attached to, not a
+        // target. At cast time nothing is attached yet, so the filter matches
+        // nothing, and that is no whiff: Infinite Coursework's "tap enchanted
+        // creature" taps whatever its Enchant target became (CR 303.4a; the
+        // Aura branch of `score_pre_cast` checks that target).
+        Some(filter) if filter.contains_source_attachment_host() => EtbTargets::Undeclared,
+        Some(filter) => {
+            if !find_legal_targets(ctx.state, filter, ctx.ai_player, source_id).is_empty() {
+                EtbTargets::Legal
+            } else if filter.is_context_ref() {
+                // CR 115.1d: a context reference (the token this trigger
+                // creates, its parent's target) is not a declared target.
+                EtbTargets::Undeclared
+            } else {
+                EtbTargets::Unmet
+            }
+        }
+        None => EtbTargets::Undeclared,
+    };
+    let modes = def
+        .mode_abilities
+        .iter()
+        .map(|mode| etb_chain_targets(ctx, mode, source_id))
+        .reduce(EtbTargets::or_else)
+        .unwrap_or(EtbTargets::Undeclared);
+    let rest = def
+        .sub_ability
+        .as_deref()
+        .map_or(EtbTargets::Undeclared, |sub| {
+            etb_chain_targets(ctx, sub, source_id)
+        });
+    let main = own.and_then(modes).and_then(rest);
+    match def.else_ability.as_deref() {
+        Some(otherwise) => main.or_else(etb_chain_targets(ctx, otherwise, source_id)),
+        None => main,
+    }
+}
+
+/// Rounds of draws under which casting a recurring self-draw permanent is
+/// charged for bringing the AI's deck-out forward.
+const DECK_OUT_HORIZON_ROUNDS: f64 = 6.0;
+
+/// CR 121.4 + CR 704.5b: a player who draws from an empty library loses at the
+/// next state-based action check. A permanent with a recurring, mandatory
+/// "you draw" trigger (The Theorist's "at the beginning of each opponent's
+/// draw step, you draw a card"; Phyrexian Arena's upkeep draw) adds draws the
+/// AI can't decline, so casting it onto a short library brings the loss
+/// forward.
+///
+/// - The library is no bigger than the trigger's draws due before the AI's own
+///   next draw step (CR 504.1): the cast decks the AI, a wasted cast.
+/// - Fewer than [`DECK_OUT_HORIZON_ROUNDS`] rounds of draws left, counting the
+///   AI's own draw each round: a share of the wasted cast that grows as the
+///   rounds fall.
+///
+/// Reads the engine's parse of the triggers, never the card's name. A draw a
+/// replacement would remove (CR 614.6) is no deck-out, so the replacement
+/// pipeline is asked whether one draw survives.
+fn recurring_self_draw_deck_out_penalty(ctx: &PolicyContext<'_>) -> f64 {
+    let GameAction::CastSpell { .. } = &ctx.candidate.action else {
+        return 0.0;
+    };
+    let Some(source) = ctx.source_object() else {
+        return 0.0;
+    };
+    let schedule = recurring_self_draw_schedule(ctx.state, source, ctx.ai_player);
+    if schedule.per_round == 0 {
+        return 0.0;
+    }
+    let draw_survives = engine::game::replacement::proposed_draw_survives_replacement(
+        ctx.state,
+        &ProposedEvent::Draw {
+            player_id: ctx.ai_player,
+            count: 1,
+            stage: DrawEventStage::Individual,
+            applied: std::collections::HashSet::new(),
+        },
+    );
+    if !draw_survives {
+        return 0.0;
+    }
+    let library = ctx.state.players[ctx.ai_player.0 as usize].library.len() as u32;
+    if library <= schedule.before_own_draw {
+        return ctx.penalties().wasted_cast_penalty;
+    }
+    // CR 504.1: the AI's own draw step adds one draw a round.
+    let rounds = f64::from(library) / f64::from(1 + schedule.per_round);
+    if rounds >= DECK_OUT_HORIZON_ROUNDS {
+        return 0.0;
+    }
+    ctx.penalties().wasted_cast_penalty * (1.0 - rounds / DECK_OUT_HORIZON_ROUNDS)
+}
+
+/// The mandatory draws a permanent's phase triggers give its controller:
+/// those due before the controller's own next draw step, and those per full
+/// round of turns.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SelfDrawSchedule {
+    before_own_draw: u32,
+    per_round: u32,
+}
+
+fn recurring_self_draw_schedule(
+    state: &GameState,
+    source: &engine::game::game_object::GameObject,
+    ai: PlayerId,
+) -> SelfDrawSchedule {
+    let opponents_per_round = players::opponents(state, ai).len() as u32;
+    // CR 500.1 + CR 103.1: the opponents' turns that come before the AI's next
+    // turn, in turn order, after the current one.
+    let mut opponent_turns_ahead = 0;
+    let mut seat = players::next_player_in_turn_order(state, state.active_player);
+    for _ in 0..state.seat_order.len() {
+        if seat == ai {
+            break;
+        }
+        if players::is_opponent(state, ai, seat) {
+            opponent_turns_ahead += 1;
+        }
+        seat = players::next_player_in_turn_order(state, seat);
+    }
+    let own_turn = state.active_player == ai;
+
+    let mut schedule = SelfDrawSchedule::default();
+    for entry in source.trigger_definitions.iter_unchecked() {
+        let trigger = entry.definition();
+        // CR 603.2b: "at the beginning of" a step recurs every turn it applies
+        // to. An optional or intervening-if trigger may not draw, so it is not
+        // read as forced.
+        if trigger.mode != TriggerMode::Phase
+            || trigger.optional
+            || trigger.condition.is_some()
+            || !trigger.trigger_zones.contains(&Zone::Battlefield)
+        {
+            continue;
+        }
+        let Some(phase) = trigger.phase else {
+            continue;
+        };
+        let (on_own_turn, on_opponent_turns) = match trigger.constraint {
+            None => (true, true),
+            Some(TriggerConstraint::OnlyDuringYourTurn) => (true, false),
+            Some(TriggerConstraint::OnlyDuringOpponentsTurn) => (false, true),
+            Some(_) => continue,
+        };
+        let Some(execute) = trigger.execute.as_deref() else {
+            continue;
+        };
+        let draws = mandatory_controller_draws(state, execute, ai, source.id);
+        if draws == 0 {
+            continue;
+        }
+        schedule.per_round +=
+            draws * (u32::from(on_own_turn) + u32::from(on_opponent_turns) * opponents_per_round);
+        let this_turn = state.phase < phase
+            && if own_turn {
+                on_own_turn
+            } else {
+                on_opponent_turns
+            };
+        let opponent_firings = if on_opponent_turns {
+            opponent_turns_ahead
+        } else {
+            0
+        };
+        // CR 504.1: the turn-based draw opens the draw step, so only an own-turn
+        // trigger in an earlier step (the upkeep) lands before it.
+        let next_own_turn = on_own_turn && phase < Phase::Draw;
+        schedule.before_own_draw +=
+            draws * (u32::from(this_turn) + opponent_firings + u32::from(next_own_turn));
+    }
+    schedule
+}
+
+/// Cards the controller draws, without a choice, along one trigger's chain.
+fn mandatory_controller_draws(
+    state: &GameState,
+    def: &AbilityDefinition,
+    ai: PlayerId,
+    source_id: ObjectId,
+) -> u32 {
+    let mut draws = 0;
+    let mut node = Some(def);
+    while let Some(def) = node {
+        if def.optional || def.condition.is_some() {
+            break;
+        }
+        if let Effect::Draw {
+            count,
+            target: TargetFilter::Controller,
+        } = &*def.effect
+        {
+            draws += resolve_quantity(state, count, ai, source_id).max(0) as u32;
+        }
+        node = def.sub_ability.as_deref();
+    }
+    draws
 }
 
 fn has_opponent_bounce_target(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
