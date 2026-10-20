@@ -249,7 +249,8 @@ pub struct EvalFeatures {
     /// and of the spells each has on the stack (`card_value::stack_spell_card_credit`,
     /// a spell waiting to resolve is not a card lost): each is the card it was in hand,
     /// plus what it can still do in expected draws (the larger of a
-    /// planeswalker's loyalty and the best loyalty ability it can pay for,
+    /// planeswalker's loyalty and the best loyalty ability it can pay for, a
+    /// minus line with the loyalty it leaves,
     /// `card_value::planeswalker_payoff`). Priced at the **hand-size
     /// weight**, so a cast noncreature permanent is never worth less than the
     /// card it was in hand at any archetype's weights. Not a 17Lands column:
