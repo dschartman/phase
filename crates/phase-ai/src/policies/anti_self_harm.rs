@@ -792,25 +792,52 @@ const DECK_OUT_HORIZON_ROUNDS: f64 = 6.0;
 /// AI can't decline, so casting it onto a short library brings the loss
 /// forward.
 ///
-/// - The library is no bigger than the trigger's draws due before the AI's own
-///   next draw step (CR 504.1): the cast decks the AI, a wasted cast.
-/// - Fewer than [`DECK_OUT_HORIZON_ROUNDS`] rounds of draws left, counting the
-///   AI's own draw each round: a share of the wasted cast that grows as the
-///   rounds fall.
-///
-/// Reads the engine's parse of the triggers, never the card's name. A draw a
-/// replacement would remove (CR 614.6) is no deck-out, so the replacement
-/// pipeline is asked whether one draw survives.
+/// The cast that loses outright (the draws due before the AI's own next draw
+/// step reach the library, [`cast_self_draw_decks_before_own_draw`]) is the
+/// tactical gate's reject. This prices the short horizon: fewer than
+/// [`DECK_OUT_HORIZON_ROUNDS`] rounds of draws left, counting the AI's own draw
+/// each round (CR 504.1), costs a share of the wasted cast that grows as the
+/// rounds fall, the whole of it at an empty library.
 fn recurring_self_draw_deck_out_penalty(ctx: &PolicyContext<'_>) -> f64 {
+    let Some(exposure) = self_draw_exposure(ctx) else {
+        return 0.0;
+    };
+    let rounds = f64::from(exposure.library) / f64::from(1 + exposure.schedule.per_round);
+    if rounds >= DECK_OUT_HORIZON_ROUNDS {
+        return 0.0;
+    }
+    ctx.penalties().wasted_cast_penalty * (1.0 - rounds / DECK_OUT_HORIZON_ROUNDS)
+}
+
+/// CR 121.4 + CR 704.5b: casting this permanent loses the game. Its recurring
+/// mandatory "you draw" triggers make at least as many draws before the AI's
+/// own next draw step as the AI has cards in library, so a draw from an empty
+/// library comes no later than that step. Read by the tactical gate.
+pub(crate) fn cast_self_draw_decks_before_own_draw(ctx: &PolicyContext<'_>) -> bool {
+    self_draw_exposure(ctx)
+        .is_some_and(|exposure| exposure.schedule.before_own_draw >= exposure.library)
+}
+
+/// The AI's library against the recurring self-draws a cast adds.
+struct SelfDrawExposure {
+    library: u32,
+    schedule: SelfDrawSchedule,
+}
+
+/// `None` unless the candidate casts a permanent with a recurring mandatory
+/// "you draw" trigger whose draws would be delivered. Reads the engine's parse
+/// of the triggers, never the card's name. A draw a replacement would remove
+/// (CR 614.6) is no deck-out, so the replacement pipeline is asked whether one
+/// draw survives (`can_draw_at_least_one` is false on an empty library, the
+/// case being judged).
+fn self_draw_exposure(ctx: &PolicyContext<'_>) -> Option<SelfDrawExposure> {
     let GameAction::CastSpell { .. } = &ctx.candidate.action else {
-        return 0.0;
+        return None;
     };
-    let Some(source) = ctx.source_object() else {
-        return 0.0;
-    };
+    let source = ctx.source_object()?;
     let schedule = recurring_self_draw_schedule(ctx.state, source, ctx.ai_player);
     if schedule.per_round == 0 {
-        return 0.0;
+        return None;
     }
     let draw_survives = engine::game::replacement::proposed_draw_survives_replacement(
         ctx.state,
@@ -821,19 +848,10 @@ fn recurring_self_draw_deck_out_penalty(ctx: &PolicyContext<'_>) -> f64 {
             applied: std::collections::HashSet::new(),
         },
     );
-    if !draw_survives {
-        return 0.0;
-    }
-    let library = ctx.state.players[ctx.ai_player.0 as usize].library.len() as u32;
-    if library <= schedule.before_own_draw {
-        return ctx.penalties().wasted_cast_penalty;
-    }
-    // CR 504.1: the AI's own draw step adds one draw a round.
-    let rounds = f64::from(library) / f64::from(1 + schedule.per_round);
-    if rounds >= DECK_OUT_HORIZON_ROUNDS {
-        return 0.0;
-    }
-    ctx.penalties().wasted_cast_penalty * (1.0 - rounds / DECK_OUT_HORIZON_ROUNDS)
+    draw_survives.then(|| SelfDrawExposure {
+        library: ctx.state.players[ctx.ai_player.0 as usize].library.len() as u32,
+        schedule,
+    })
 }
 
 /// The mandatory draws a permanent's phase triggers give its controller:

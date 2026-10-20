@@ -64,7 +64,9 @@ use crate::combat_ai::is_lethal_attack_available;
 use crate::config::AiConfig;
 use crate::context::AiContext;
 use crate::planner::PreparedCandidate;
-use crate::policies::anti_self_harm::is_deliberate_self_target_rider;
+use crate::policies::anti_self_harm::{
+    cast_self_draw_decks_before_own_draw, is_deliberate_self_target_rider,
+};
 use crate::policies::context::{
     collect_ability_effects, collect_resolved_abilities, selected_mode_abilities, PolicyContext,
 };
@@ -293,6 +295,14 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
 
 fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     if zero_direct_spell_is_safe_to_reject(ctx) {
+        return GateDecision::Reject;
+    }
+
+    // CR 121.4 + CR 704.5b: a permanent whose recurring mandatory "you draw"
+    // trigger empties the library before the AI's own next draw step loses the
+    // game when cast. Read before the effect checks: such a permanent may
+    // carry no spell or activated effect at all (Phyrexian Arena).
+    if cast_self_draw_decks_before_own_draw(ctx) {
         return GateDecision::Reject;
     }
 
