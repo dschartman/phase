@@ -610,27 +610,33 @@ fn one_shot_self_draw_reject(ctx: &PolicyContext<'_>) -> Option<RejectReason> {
     if draws > library {
         return Some(RejectReason::DrawsPastLibrary);
     }
-    (!untargeted_drain_wins_the_game(ctx, source.id, &spell_links(&abilities)))
+    (!untargeted_drain_wins_the_game(ctx, source.id, &abilities))
         .then_some(RejectReason::DecksOutBeforeOwnDraw)
 }
 
-/// CR 119.3 + CR 704.5a + CR 104.2a: whether the untargeted drains among
-/// `nodes` ("each opponent loses N life", "deals N damage to each player")
-/// win the game when they resolve: summed per player, they bring every
-/// opponent still in the game to 0 or less and leave the AI above 0. A drain
-/// that also brings the AI to 0 or less is a draw at best (CR 104.4a). Fails
-/// closed: an amount it cannot resolve, or a drain whose player set is other
-/// than each opponent or each player, reads as no win. Damage prevention is
+/// CR 119.3 + CR 704.5a + CR 104.2a: whether the untargeted drains of
+/// `abilities` ("each opponent loses N life", "deals N damage to each
+/// player") win the game when they resolve: summed per player, they bring
+/// every opponent still in the game to 0 or less and leave the AI above 0. A
+/// drain that also brings the AI to 0 or less is a draw at best (CR 104.4a).
+/// Only the main chain (each ability and its `sub_ability` links) is read; an
+/// `else_ability` leg is not. Fails closed, reading as no win: a drain that
+/// carries a condition (CR 608.2c: it may not happen) or is optional (may, an
+/// optional player, an unless payment), an amount it cannot resolve, or a
+/// player set other than each opponent or each player. Damage prevention is
 /// not read. Unlike `untargeted_part_is_lethal_to_an_opponent` (any one
 /// opponent dies, failing open), which the own-target rule keeps using.
 fn untargeted_drain_wins_the_game(
     ctx: &PolicyContext<'_>,
     source_id: ObjectId,
-    nodes: &[&AbilityDefinition],
+    abilities: &[&AbilityDefinition],
 ) -> bool {
     let mut to_opponents = 0;
     let mut to_ai = 0;
-    for node in nodes {
+    let chain = abilities.iter().flat_map(|ability| {
+        std::iter::successors(Some(*ability), |node| node.sub_ability.as_deref())
+    });
+    for node in chain {
         let (amount, players) = match (node.effect.as_ref(), &node.player_scope) {
             (
                 Effect::DamageEachPlayer {
@@ -648,6 +654,14 @@ fn untargeted_drain_wins_the_game(
             ) => (amount, scope),
             _ => continue,
         };
+        let delivered = node.condition.is_none()
+            && !node.optional
+            && node.optional_player.is_none()
+            && node.optional_for.is_none()
+            && node.unless_pay.is_none();
+        if !delivered {
+            return false;
+        }
         let Some(loss) =
             try_resolve_quantity_in_source_context(ctx.state, amount, ctx.ai_player, source_id)
         else {
