@@ -235,6 +235,52 @@ fn jr1_own_trigger_loop_terminates() {
     assert!(el.as_secs() < 60, "terminates in bounded time ({el:?})");
 }
 
+/// JR1 with an opposing response: the same lifegain loop while P1 holds a
+/// -3/-3 instant and {B}, so every pass over the loop's trigger is an
+/// opponent window searched at no depth. The search SHALL terminate with a
+/// finite value in bounded time (the windows on a path are capped at
+/// `MAX_FREE_OPPONENT_WINDOWS`; the rollout charges no node budget and
+/// measurement mode sets no deadline).
+#[test]
+fn own_trigger_loop_with_an_opposing_response_terminates() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    libraries(&mut s, 20);
+    s.add_basic_land(P0, ManaColor::Blue);
+    s.add_basic_land(P1, ManaColor::Black);
+    s.add_creature(P0, "Caster", 1, 1)
+        .from_oracle_text("Whenever you cast a noncreature spell, you gain 1 life.");
+    s.add_creature(P0, "Looper", 1, 1)
+        .from_oracle_text("Whenever you gain life, you gain 1 life.");
+    let spell = s
+        .add_spell_to_hand(P0, "Peek", false)
+        .from_oracle_text(PEEK)
+        .with_mana_cost(u())
+        .id();
+    s.add_spell_to_hand(P1, "Gasp", true)
+        .from_oracle_text(GASP)
+        .with_mana_cost(cost(vec![ManaCostShard::Black], 0));
+    let st = s.build().state().clone();
+    let top = on_top(&st, spell);
+    let window = opponent_window(&top);
+    assert!(
+        engine::ai_support::legal_actions(window.state())
+            .iter()
+            .any(|action| !matches!(action, GameAction::PassPriority)),
+        "reach-guard: P1 can respond over the loop's trigger"
+    );
+    let t = std::time::Instant::now();
+    let v1 = searched(&top, 1);
+    let v2 = searched(&top, 2);
+    let (c, p) = cast_and_pass(&st, spell);
+    let el = t.elapsed();
+    eprintln!(
+        "loop with response: depth1 {v1:.3} depth2 {v2:.3} root cast {c:.3} pass {p:.3} in {el:?}"
+    );
+    assert!(v1.is_finite() && v2.is_finite() && c.is_finite() && p.is_finite());
+    assert!(el.as_secs() < 60, "terminates in bounded time ({el:?})");
+}
+
 /// JR2 may-trigger: "you may draw" on top SHALL search as the position at
 /// its optional prompt (the choice stays a node; no depth spent on the
 /// passes).
