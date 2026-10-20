@@ -2511,6 +2511,13 @@ fn mana_dork_and_body_fixture() -> (
 ) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
+    // An empty own library is the loss at a leaf (CR 504.1 + CR 121.4), so
+    // both players get a library.
+    for player in [P0, P1] {
+        for _ in 0..20 {
+            scenario.add_land_to_library_top(player, "Plains");
+        }
+    }
     scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
     scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
 

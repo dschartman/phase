@@ -27,7 +27,7 @@
 //! tin_street_gossip_restricted_mana_funds_face_down_cast}`.
 
 use engine::game::engine::apply_as_current;
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::actions::{AlternativeCastDecision, GameAction};
 use engine::types::game_state::{AlternativeCastKeyword, CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
@@ -43,6 +43,13 @@ const MORPH_ORACLE: &str = "Morph {4} (You may cast this card face down as a 2/2
 fn morph_at_alternative_choice(power: i32, toughness: i32) -> (GameRunner, ObjectId) {
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    // An empty own library is the loss at a leaf (CR 504.1 + CR 121.4), so
+    // both players get a library.
+    for player in [P0, P1] {
+        for _ in 0..20 {
+            scenario.add_land_to_library_top(player, "Plains");
+        }
+    }
     let morph = scenario
         .add_creature_to_hand_from_oracle(P0, "Test Morpher", power, toughness, MORPH_ORACLE)
         .with_mana_cost(ManaCost::generic(5))

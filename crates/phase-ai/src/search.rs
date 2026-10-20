@@ -7311,6 +7311,18 @@ mod tests {
         // ... and lethal 0/1 Wizards the 2 damage destroys outright.
         let wizard_a = add_creature(&mut state, P1, 0, 1);
         let wizard_b = add_creature(&mut state, P1, 0, 1);
+        // P0's library only: an empty own library is the loss at every leaf.
+        // P1's stays empty, the table this row was calibrated on.
+        for _ in 0..20 {
+            let card_id = CardId(state.next_object_id);
+            create_object(
+                &mut state,
+                card_id,
+                P0,
+                "Library card".to_string(),
+                Zone::Library,
+            );
+        }
 
         let config = create_config(AiDifficulty::VeryHard, Platform::Native);
         let mut rng = SmallRng::seed_from_u64(7);
@@ -14088,7 +14100,8 @@ mod tests {
 
     #[test]
     fn retained_root_payment_successor_bypasses_inapplicable_fallback() {
-        let state = make_state();
+        let mut state = make_state();
+        crate::test_support::stock_libraries(&mut state, 20);
         let retained = apply_candidate(
             &state,
             &CandidateAction {
@@ -14348,7 +14361,8 @@ mod tests {
     // makes A drain the pool first and B collapse toward quiesced eval.
     #[test]
     fn pv_rotate_gives_pv_candidate_full_depth_under_starvation() {
-        let state = starvation_state();
+        let mut state = starvation_state();
+        crate::test_support::stock_libraries(&mut state, 20);
         let policies = PolicyRegistry::shared();
         let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
         config.search.max_depth = 3; // ceiling 2 (rung 1 sets PV, rung 2 uses it)
@@ -14451,7 +14465,8 @@ mod tests {
     // two outputs to equality — so `assert_ne!` is revert-failing for the gate.
     #[test]
     fn rung_zero_rotate_is_gated_off() {
-        let state = starvation_state();
+        let mut state = starvation_state();
+        crate::test_support::stock_libraries(&mut state, 20);
         let policies = PolicyRegistry::shared();
         let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
         config.search.max_depth = 2; // ceiling 1

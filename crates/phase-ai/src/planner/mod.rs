@@ -2293,6 +2293,7 @@ mod tests {
         // lands for p0 so `available_mana(p0) <= 1` makes the counter-tapout
         // penalty reachable.
         let mut state = make_state();
+        crate::test_support::stock_libraries(&mut state, 20);
         state.turn_number = 5;
         state.players[0].life = 17;
         state.players[1].life = 12;

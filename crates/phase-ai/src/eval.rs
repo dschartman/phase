@@ -1429,7 +1429,9 @@ mod tests {
     use engine::types::zones::Zone;
 
     fn make_state() -> GameState {
-        GameState::new_two_player(42)
+        let mut state = GameState::new_two_player(42);
+        crate::test_support::stock_libraries(&mut state, 20);
+        state
     }
 
     fn add_creature(
@@ -2076,6 +2078,7 @@ mod tests {
                 players,
                 42,
             );
+            crate::test_support::stock_libraries(&mut state, 20);
             for _ in 0..p0_lands {
                 add_land(&mut state, PlayerId(0), false);
             }
@@ -2127,6 +2130,7 @@ mod tests {
     fn mana_development_aggregates_opponents_like_card_advantage() {
         // WEIGHTED — two opponents, asymmetric sources AND asymmetric bodies.
         let mut state = GameState::new(engine::types::format::FormatConfig::free_for_all(), 3, 42);
+        crate::test_support::stock_libraries(&mut state, 20);
         for _ in 0..5 {
             add_land(&mut state, PlayerId(0), false);
         }
@@ -2208,6 +2212,7 @@ mod tests {
         let measure = |remove_body_of: Option<PlayerId>| -> f64 {
             let mut state =
                 GameState::new(engine::types::format::FormatConfig::free_for_all(), 3, 42);
+            crate::test_support::stock_libraries(&mut state, 20);
             for _ in 0..9 {
                 add_land(&mut state, PlayerId(0), false);
             }
@@ -2896,6 +2901,7 @@ mod tests {
     #[test]
     fn breakdown_identity_holds_for_threat_weighted_multiplayer() {
         let mut state = GameState::new(engine::types::format::FormatConfig::free_for_all(), 3, 42);
+        crate::test_support::stock_libraries(&mut state, 20);
         state.turn_number = 9; // late phase
         add_creature(&mut state, PlayerId(0), 3, 3, vec![]);
         add_creature(&mut state, PlayerId(1), 5, 5, vec![]);
@@ -2988,7 +2994,7 @@ mod tests {
 
     /// `state` with P0's library at `own` cards and P1's at `opponent`.
     fn with_libraries(own: usize, opponent: usize) -> GameState {
-        let mut state = make_state();
+        let mut state = GameState::new_two_player(42);
         for (player, count) in [(PlayerId(0), own), (PlayerId(1), opponent)] {
             for _ in 0..count {
                 let card_id = CardId(state.next_object_id);
@@ -3028,7 +3034,7 @@ mod tests {
     }
 
     #[test]
-    fn an_own_library_of_one_costs_three_cards_and_of_zero_four() {
+    fn an_own_library_of_one_costs_three_cards() {
         let weights = EvalWeights::default();
         let at_four = library_score(4, 20, &weights);
         assert_close(
@@ -3036,10 +3042,69 @@ mod tests {
             -3.0 * weights.hand_size,
             "library 1",
         );
+    }
+
+    // The bottom (judge S3 on a85428a64): an own library of 0 at a leaf that is
+    // not yet over has the AI's own draw step ahead (CR 504.1), and that draw
+    // from an empty library loses (CR 121.4 + CR 704.5b), so the leaf is the
+    // loss, not four cards. A draw replacement that applies on an empty
+    // library (CR 614.11, the Laboratory Maniac shape) leaves it a position.
+
+    const EMPTY_LIBRARY_WIN_ORACLE: &str =
+        "If you would draw a card while your library has no cards in it, you win the game instead.";
+
+    #[test]
+    fn an_own_empty_library_with_its_draw_ahead_scores_as_the_loss() {
+        let weights = EvalWeights::default();
+        assert_eq!(library_score(0, 20, &weights), LOSS_SCORE);
+        let breakdown = evaluate_state_breakdown(&with_libraries(0, 20), PlayerId(0), &weights);
+        assert_eq!(
+            breakdown.err(),
+            Some(LOSS_SCORE),
+            "a terminal, not a feature row"
+        );
+    }
+
+    /// Guard: under a draw replacement that applies on an empty library the
+    /// position is not the loss; the linear floor prices it (four short).
+    #[test]
+    fn an_own_empty_library_under_a_surviving_replacement_is_not_the_loss() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        let build = |with_charm: bool| {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            for _ in 0..20 {
+                scenario.add_land_to_library_top(P1, "Plains");
+            }
+            if with_charm {
+                scenario.add_enchantment_from_oracle(P0, "Maniac Charm", EMPTY_LIBRARY_WIN_ORACLE);
+            }
+            scenario.build().state().clone()
+        };
+        let weights = EvalWeights::default();
+        let charmed = build(true);
+        assert!(charmed.players[0].library.is_empty());
+        let score = evaluate_state(&charmed, PlayerId(0), &weights);
+        assert!(
+            score > LOSS_SCORE,
+            "replacement in play: a position, got {score}"
+        );
+        // Reach-guard: without the replacement the same table is the loss.
+        assert_eq!(
+            evaluate_state(&build(false), PlayerId(0), &weights),
+            LOSS_SCORE
+        );
+    }
+
+    /// Guard: the opponent's side keeps the linear floor; its empty library
+    /// is four cards to the AI (the spec replaces only the AI's own bottom).
+    #[test]
+    fn an_opponent_empty_library_stays_four_cards_for_the_ai() {
+        let weights = EvalWeights::default();
         assert_close(
-            library_score(0, 20, &weights) - at_four,
-            -4.0 * weights.hand_size,
-            "library 0",
+            library_score(20, 0, &weights) - library_score(20, 4, &weights),
+            4.0 * weights.hand_size,
+            "the opponent four draws short",
         );
     }
 
