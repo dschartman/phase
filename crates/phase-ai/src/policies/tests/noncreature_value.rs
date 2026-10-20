@@ -156,10 +156,19 @@ impl Table {
     ) -> ObjectId {
         let mut builder = self.scenario.add_spell_to_hand(P0, name, false);
         builder.as_enchantment();
-        if let Some(subtype) = subtype {
-            builder.with_subtypes(vec![subtype]);
-        }
-        builder.from_oracle_text(text).with_mana_cost(mana).id()
+        // An Aura's "Enchant creature" line is a keyword line; the MTGJSON
+        // keyword list names it, as the card data does.
+        let keywords: &[&str] = match subtype {
+            Some(subtype) => {
+                builder.with_subtypes(vec![subtype]);
+                &["Enchant"]
+            }
+            None => &[],
+        };
+        builder
+            .from_oracle_text_with_keywords(keywords, text)
+            .with_mana_cost(mana)
+            .id()
     }
 
     fn the_theorist(&mut self) -> ObjectId {
