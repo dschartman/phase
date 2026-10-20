@@ -4250,6 +4250,45 @@ pub(crate) fn fight_targeting_is_optional(
     }
 }
 
+/// CR 601.2c + CR 603.3d + CR 115.6: how many target slots a `Fight` node
+/// surfaces, and whether they may be left empty. The single authority shared by
+/// the slot builder, the slot specs and both target-assignment walks, so all four
+/// count the same slots.
+///
+/// A one-slot "up to one" fight whose fought creature has no legal target
+/// surfaces no slot, exactly as the generic arm's "up to N" run does
+/// (`resolve_multi_target_bounds` caps the run at the legal count): zero targets
+/// is then the only answer, the ability goes on the stack with no target
+/// (CR 603.3d), and no prompt is raised. Surfacing an empty optional slot instead
+/// left the push-first trigger prompt with no active slot (Novel Nunchaku's
+/// reflexive fight). Legality is read with `BuiltSlots::NONE`, the same
+/// approximation the generic arm's slot specs make: a one-slot fight's target
+/// filter does not depend on an earlier slot's choice.
+fn fight_slot_shape(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    subject: &TargetFilter,
+    target: &TargetFilter,
+) -> (usize, bool) {
+    let optional = fight_targeting_is_optional(ability, subject, target);
+    let mut filters = fight_declared_slot_filters(subject, target);
+    let count = match (filters.next(), filters.next()) {
+        (None, _) => 0,
+        (Some(only), None) => {
+            if optional
+                && legal_targets_for_ability_filter(state, ability, only, BuiltSlots::NONE)
+                    .is_empty()
+            {
+                0
+            } else {
+                1
+            }
+        }
+        (Some(_), Some(_)) => 2 + filters.count(),
+    };
+    (count, optional)
+}
+
 /// CR 601.2c: The recipient is mandatory independently of the source count.
 fn each_power_damage_recipient_slot_filter(ability: &ResolvedAbility) -> Option<&TargetFilter> {
     if ability.target_choice_timing != TargetChoiceTiming::Stack {
@@ -4684,8 +4723,8 @@ fn collect_target_slots_inner(
     // fights …" only surface the opponent as a target slot — the fighter is the
     // ability source or the host permanent.
     if let Effect::Fight { subject, target } = &ability.effect {
-        let optional = fight_targeting_is_optional(ability, subject, target);
-        for filter in fight_declared_slot_filters(subject, target) {
+        let (slot_count, optional) = fight_slot_shape(state, ability, subject, target);
+        for filter in fight_declared_slot_filters(subject, target).take(slot_count) {
             // CR 608.2c + CR 701.14a: A context-ref fighter (SelfRef, ParentTarget,
             // ParentTargetSlot, TrackedSet — the reciprocal "those creatures fight
             // each other") resolves from chain context, never a cast-time choice,
@@ -7631,8 +7670,8 @@ fn collect_target_slot_specs(
     // `collect_target_slots` so per-slot specs line up one-for-one.
     if let Effect::Fight { subject, target } = &ability.effect {
         // CR 115.6: same authority as collect_target_slots_inner's Fight arm.
-        let optional = fight_targeting_is_optional(ability, subject, target);
-        for filter in fight_declared_slot_filters(subject, target) {
+        let (slot_count, optional) = fight_slot_shape(state, ability, subject, target);
+        for filter in fight_declared_slot_filters(subject, target).take(slot_count) {
             // Keep per-slot metadata aligned with the surfaced cast-time slots.
             let id = TargetInstanceId(*next_instance);
             *next_instance += 1;
@@ -10377,22 +10416,14 @@ fn assign_targets_recursive(
     }
 
     if let Effect::Fight { subject, target } = &ability.effect {
-        let mut filters: Vec<&TargetFilter> = Vec::new();
-        if fight_subject_needs_target_slot(subject) {
-            filters.push(subject);
-        }
-        filters.push(target);
         // Mirror `collect_target_slots`: a context-ref fighter (SelfRef,
         // ParentTarget, ParentTargetSlot, reciprocal-fight TrackedSet)
         // surfaces no slot, so it consumes no selected target here either —
         // otherwise the assign/slot-gen counts diverge and a valid two-target
-        // selection reports a spurious "Missing required target".
-        let slot_count = filters
-            .into_iter()
-            .filter(|filter| !filter.is_context_ref())
-            .count();
-        // CR 115.6: same authority as collect_target_slots_inner's Fight arm.
-        let optional = fight_targeting_is_optional(ability, subject, target);
+        // selection reports a spurious "Missing required target". CR 115.6:
+        // neither does a one-slot "up to one" fight with no legal target; the
+        // count and optionality come from the same authority as the builder.
+        let (slot_count, optional) = fight_slot_shape(state, ability, subject, target);
         for _ in 0..slot_count {
             if let Some(chosen) = targets.get(*next_target) {
                 ability.push_chosen_target(chosen.clone());
@@ -10877,20 +10908,11 @@ fn assign_selected_slots_recursive(
     }
 
     if let Effect::Fight { subject, target } = &ability.effect {
-        let mut filters: Vec<&TargetFilter> = Vec::new();
-        if fight_subject_needs_target_slot(subject) {
-            filters.push(subject);
-        }
-        filters.push(target);
         // Mirror `collect_target_slots` and `assign_targets_recursive`:
-        // context-reference fighters resolve from the ability chain, so they
-        // consume no interactive target-selection slot.
-        let slot_count = filters
-            .into_iter()
-            .filter(|filter| !filter.is_context_ref())
-            .count();
-        // CR 115.6: same authority as collect_target_slots_inner's Fight arm.
-        let optional = fight_targeting_is_optional(ability, subject, target);
+        // context-reference fighters resolve from the ability chain, and a
+        // one-slot "up to one" fight with no legal target surfaces no slot, so
+        // neither consumes an interactive target-selection slot (CR 115.6).
+        let (slot_count, optional) = fight_slot_shape(state, ability, subject, target);
         for _ in 0..slot_count {
             let Some(selected_slot) = selected_slots.get(*next_slot) else {
                 return Err(EngineError::InvalidAction(
