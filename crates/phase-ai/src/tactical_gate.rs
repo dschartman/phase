@@ -13449,11 +13449,15 @@ mod tests {
         assert!(!murmuring_volume_loot_decision(2).is_reject());
     }
 
-    /// A draw that wins first: the reading the gate already has for an
-    /// untargeted drain lethal to an opponent
-    /// (`untargeted_part_is_lethal_to_an_opponent`, CR 119.3 + CR 704.5a).
-    /// Drawing the last card and draining the opponent to 0 wins at the
-    /// state-based check after it resolves, before any draw step.
+    /// A draw to 0 whose own resolution drains the opponent to 0 wins at the
+    /// state-based check after it resolves (CR 119.3 + CR 704.5a), before
+    /// any draw step. The gate does not keep it: the win-first exception was
+    /// dropped on 2026-10-20 (lead ruling), after three judge rounds each
+    /// found a drain the phase-ai walk read as a win and the engine did not
+    /// deliver (one opponent of two, the AI dying too, a false condition on
+    /// the drain or on an earlier link). No card in either FRA deck uses it.
+    /// The AI gives up these wins by design; reading them needs an
+    /// engine-side win preview.
     const DRAW_AND_DRAIN_ORACLE: &str = "Draw a card. Each opponent loses 2 life.";
 
     fn draw_and_drain_decision(opponent_life: i32) -> GateDecision {
@@ -13465,8 +13469,11 @@ mod tests {
     }
 
     #[test]
-    fn a_draw_to_zero_that_drains_the_opponent_to_zero_stays_a_candidate() {
-        assert!(!draw_and_drain_decision(2).is_reject());
+    fn a_draw_to_zero_that_drains_the_opponent_to_zero_is_rejected_as_decking_before_own_draw() {
+        assert_eq!(
+            draw_and_drain_decision(2).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
     }
 
     #[test]
@@ -14105,11 +14112,13 @@ mod tests {
         );
     }
 
-    // --- judge rows (782e5f146): the win-first exception is a win ----------
+    // --- judge rows (782e5f146, 8a233b046, 094f273f2): drains and a draw to 0
     //
-    // A draw to 0 is kept only when the same resolution's untargeted drain,
-    // at a resolved amount, brings every opponent still in the game to 0 or
-    // less and leaves the AI above 0 (CR 104.2a + CR 104.4a + CR 704.5a).
+    // Every draw to 0 is rejected, whatever the same resolution drains: the
+    // win-first exception was dropped on 2026-10-20 (see
+    // `DRAW_AND_DRAIN_ORACLE`). The engine outcome is asserted so the rows
+    // show which rejects give up a real win (JK2 at 3, JK3) and which give up
+    // none (CR 104.2a + CR 104.4a + CR 704.5a).
 
     /// P0 with four Islands and one card in library in a `players`-player
     /// game, every other player with 25; `setup` sets life totals.
@@ -14222,9 +14231,9 @@ mod tests {
 
     /// JK2: "deals 2 damage to each player" with the opponent at 2: the AI
     /// at exactly 2 dies too (the engine ends the game as a draw), at 3 it
-    /// wins.
+    /// wins. Both are rejected; at 3 the AI gives up the win by design.
     #[test]
-    fn jk2_damage_to_each_player_is_a_win_only_while_the_ai_survives() {
+    fn jk2_damage_to_each_player_is_rejected_whether_or_not_the_ai_survives() {
         let oracle = "Draw a card. Draw Spell deals 2 damage to each player.";
         let (at2, after2) = jg_drain_verdict_and_outcome(2, oracle, |s| {
             s.with_life(P0, 2);
@@ -14240,19 +14249,20 @@ mod tests {
             WaitingFor::GameOver { winner: Some(P0) }
         );
         assert_eq!(at2, Some(RejectReason::DecksOutBeforeOwnDraw));
-        assert_eq!(at3, None);
+        assert_eq!(at3, Some(RejectReason::DecksOutBeforeOwnDraw));
     }
 
-    /// JK3: two opponents, both at 2, "each opponent loses 2 life": a win.
+    /// JK3: two opponents, both at 2, "each opponent loses 2 life": a win
+    /// (engine), rejected; the AI gives up the win by design.
     #[test]
-    fn jk3_a_drain_killing_every_opponent_is_a_win() {
+    fn jk3_a_drain_killing_every_opponent_is_rejected() {
         let (verdict, after) =
             jg_drain_verdict_and_outcome(3, "Draw a card. Each opponent loses 2 life.", |s| {
                 s.with_life(P1, 2);
                 s.with_life(PlayerId(2), 2);
             });
         assert_eq!(after.waiting_for, WaitingFor::GameOver { winner: Some(P0) });
-        assert_eq!(verdict, None);
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
     }
 
     /// JK4: a conditional drain whose condition is false (no artifact): the
@@ -14270,6 +14280,41 @@ mod tests {
         assert!(!matches!(after.waiting_for, WaitingFor::GameOver { .. }));
         assert_eq!(after.players[1].life, 2);
         assert_eq!(after.players[0].library.len(), 0);
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
+    }
+
+    /// JM1: the condition sits on an earlier link of the chain ("If you
+    /// control an artifact, you gain 2 life and each opponent loses 2
+    /// life."), no artifact: the engine skips the dependent drain too, P1
+    /// stays at 2 and the AI is at library 0.
+    #[test]
+    fn jm1_a_drain_after_a_conditional_link_is_rejected() {
+        let (verdict, after) = jg_drain_verdict_and_outcome(
+            2,
+            "Draw a card. If you control an artifact, you gain 2 life and each opponent loses 2 life.",
+            |s| {
+                s.with_life(P1, 2);
+            },
+        );
+        assert!(!matches!(after.waiting_for, WaitingFor::GameOver { .. }));
+        assert_eq!(after.players[1].life, 2);
+        assert_eq!(after.players[0].library.len(), 0);
+        assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
+    }
+
+    /// JM2: an unless-payment drain (P1 can pay): rejected.
+    #[test]
+    fn jm2_an_unless_pay_drain_is_rejected() {
+        let (verdict, _after) = jg_drain_verdict_and_outcome(
+            2,
+            "Draw a card. Each opponent loses 2 life unless that player pays {1}.",
+            |s| {
+                s.with_life(P1, 2);
+                for _ in 0..3 {
+                    s.add_basic_land(P1, engine::types::mana::ManaColor::Blue);
+                }
+            },
+        );
         assert_eq!(verdict, Some(RejectReason::DecksOutBeforeOwnDraw));
     }
 }
