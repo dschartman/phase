@@ -2945,4 +2945,141 @@ mod tests {
             "reach-guard: a living opponent's battlefield creature must remain a valid consumer"
         );
     }
+
+    // --- a short library is priced ------------------------------------------
+    //
+    // CR 121.4 + CR 704.5b: a player who draws from an empty library loses. At
+    // three or fewer cards the leaf charges each side (4 - library) draws, one
+    // card each at the hand-size weight: the AI's own shortfall against it,
+    // the opponent's for it. Nothing changes at four or more. Seed 1001 T21:
+    // Liliana the Repentant milled two on each creature P0 cast at library 7,
+    // and P0 decked two turns later.
+
+    /// `state` with P0's library at `own` cards and P1's at `opponent`.
+    fn with_libraries(own: usize, opponent: usize) -> GameState {
+        let mut state = make_state();
+        for (player, count) in [(PlayerId(0), own), (PlayerId(1), opponent)] {
+            for _ in 0..count {
+                let card_id = CardId(state.next_object_id);
+                create_object(
+                    &mut state,
+                    card_id,
+                    player,
+                    "Library card".to_string(),
+                    Zone::Library,
+                );
+            }
+        }
+        assert_eq!(state.players[0].library.len(), own);
+        assert_eq!(state.players[1].library.len(), opponent);
+        state
+    }
+
+    fn library_score(own: usize, opponent: usize, weights: &EvalWeights) -> f64 {
+        evaluate_state(&with_libraries(own, opponent), PlayerId(0), weights)
+    }
+
+    fn assert_close(actual: f64, expected: f64, what: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "{what}: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn an_own_library_of_three_costs_one_card_against_four() {
+        let weights = EvalWeights::default();
+        assert_close(
+            library_score(3, 20, &weights) - library_score(4, 20, &weights),
+            -weights.hand_size,
+            "library 3 is one draw short of 4",
+        );
+    }
+
+    #[test]
+    fn an_own_library_of_one_costs_three_cards_and_of_zero_four() {
+        let weights = EvalWeights::default();
+        let at_four = library_score(4, 20, &weights);
+        assert_close(
+            library_score(1, 20, &weights) - at_four,
+            -3.0 * weights.hand_size,
+            "library 1",
+        );
+        assert_close(
+            library_score(0, 20, &weights) - at_four,
+            -4.0 * weights.hand_size,
+            "library 0",
+        );
+    }
+
+    /// The Liliana shape: milling two from five costs one card; from three,
+    /// two more.
+    #[test]
+    fn milling_two_costs_more_the_shorter_the_library() {
+        let weights = EvalWeights::default();
+        let from_five = library_score(3, 20, &weights) - library_score(5, 20, &weights);
+        let from_three = library_score(1, 20, &weights) - library_score(3, 20, &weights);
+        assert_close(from_five, -weights.hand_size, "five to three");
+        assert_close(from_three, -2.0 * weights.hand_size, "three to one");
+    }
+
+    /// The opponent's short library is priced for the AI, sign reversed.
+    #[test]
+    fn an_opponent_library_of_two_is_worth_two_cards_to_the_ai() {
+        let weights = EvalWeights::default();
+        assert_close(
+            library_score(20, 2, &weights) - library_score(20, 4, &weights),
+            2.0 * weights.hand_size,
+            "the opponent two draws short",
+        );
+    }
+
+    /// Priced at the hand-size weight of the weights in use.
+    #[test]
+    fn the_library_shortfall_is_priced_at_the_hand_size_weight() {
+        let weights = EvalWeights {
+            hand_size: 2.0,
+            ..EvalWeights::default()
+        };
+        assert_close(
+            library_score(2, 20, &weights) - library_score(7, 20, &weights),
+            -4.0,
+            "two draws short at hand-size weight 2.0",
+        );
+    }
+
+    /// Guard: four or more cards on either side changes nothing.
+    #[test]
+    fn libraries_of_four_or_more_are_not_priced() {
+        let weights = EvalWeights::default();
+        assert_close(
+            library_score(4, 4, &weights),
+            library_score(30, 30, &weights),
+            "four against thirty",
+        );
+        assert_close(
+            library_score(4, 30, &weights),
+            library_score(30, 4, &weights),
+            "own four against opponent four",
+        );
+    }
+
+    /// Guard: equal short libraries cancel, and the breakdown still sums to
+    /// the served score.
+    #[test]
+    fn equal_short_libraries_cancel_and_the_breakdown_sums_to_the_score() {
+        let weights = EvalWeights::default();
+        assert_close(
+            library_score(2, 2, &weights),
+            library_score(20, 20, &weights),
+            "both two short",
+        );
+        let state = with_libraries(1, 20);
+        let breakdown = evaluate_state_breakdown(&state, PlayerId(0), &weights).unwrap();
+        assert_close(
+            breakdown.total(),
+            evaluate_state(&state, PlayerId(0), &weights),
+            "breakdown total",
+        );
+    }
 }
