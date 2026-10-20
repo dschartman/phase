@@ -856,8 +856,15 @@ fn self_draw_exposure(ctx: &PolicyContext<'_>) -> Option<SelfDrawExposure> {
 /// (`card_value::permanent_card_credit`). Reads the engine's parse of the
 /// triggers, never the card's name. A draw a replacement would remove
 /// (CR 614.6) is no deck-out, so the replacement pipeline is asked whether one
-/// draw survives (`can_draw_at_least_one` is false on an empty library, the
-/// case being judged).
+/// draw survives at both of the stages the draw sequence proposes it
+/// (CR 121.2a: the instruction, then its individual draw), the replacement
+/// legs of `can_draw_at_least_one` without its library leg (that helper is
+/// false on an empty library, the case being judged; CR 614.11: a draw
+/// replacement applies even then).
+///
+/// Not yet read: a `CantDraw` static or a per-turn draw limit of 0. The
+/// engine's prohibition leg (`allowed_draw_count`) is crate-private and reads
+/// this turn's draws, while these draws fall on later turns.
 pub(crate) fn recurring_self_draw_exposure(
     state: &GameState,
     source: &engine::game::game_object::GameObject,
@@ -867,15 +874,23 @@ pub(crate) fn recurring_self_draw_exposure(
     if schedule.per_round == 0 {
         return None;
     }
-    let draw_survives = engine::game::replacement::proposed_draw_survives_replacement(
-        state,
-        &ProposedEvent::Draw {
-            player_id: controller,
-            count: 1,
-            stage: DrawEventStage::Individual,
-            applied: std::collections::HashSet::new(),
-        },
-    );
+    // CR 121.2 + CR 121.2a: the one-card instruction and its individual draw,
+    // the two events `start_draw_sequence` proposes. With no instruction-stage
+    // definition in play the instruction consult finds no candidate and
+    // survives, which is the engine's own skip.
+    let survives = |stage| {
+        engine::game::replacement::proposed_draw_survives_replacement(
+            state,
+            &ProposedEvent::Draw {
+                player_id: controller,
+                count: 1,
+                stage,
+                applied: std::collections::HashSet::new(),
+            },
+        )
+    };
+    let draw_survives =
+        survives(DrawEventStage::Instruction) && survives(DrawEventStage::Individual);
     draw_survives.then(|| SelfDrawExposure {
         library: state.players[controller.0 as usize].library.len() as u32,
         schedule,
