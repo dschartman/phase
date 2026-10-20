@@ -522,7 +522,6 @@ fn value_with(state: &GameState, obj_id: ObjectId, draws: DrawPricing) -> f64 {
 /// Each effect is priced by [`effect_payoff`]; anything else it does is 0,
 /// which is the old pricing.
 fn noncreature_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
-    let types = &obj.card_types.core_types;
     let mut payoff = 0.0;
 
     let spells: Vec<&AbilityDefinition> = obj
@@ -541,11 +540,7 @@ fn noncreature_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -
         };
     }
 
-    for trigger in obj.trigger_definitions.iter_unchecked() {
-        if let Some(execute) = trigger.definition.execute.as_deref() {
-            payoff += definition_payoff(state, obj, execute, draws);
-        }
-    }
+    payoff += trigger_payoff(state, obj, draws, Triggers::All);
 
     if aura_polarity(obj) == EffectPolarity::Harmful {
         if let Some(Keyword::Enchant(filter)) = obj
@@ -559,18 +554,132 @@ fn noncreature_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -
         }
     }
 
-    if types.contains(&CoreType::Planeswalker) {
-        let loyalty = obj.loyalty.unwrap_or(0);
-        payoff += f64::from(loyalty);
-        for ability in obj.abilities.iter() {
-            if let Some(AbilityCost::Loyalty { amount }) = ability.cost {
-                if amount >= -(loyalty as i32) {
-                    payoff += definition_payoff(state, obj, ability, draws);
-                }
-            }
-        }
+    payoff + planeswalker_payoff(state, obj, draws)
+}
+
+/// Which of a permanent's triggered abilities [`trigger_payoff`] prices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Triggers {
+    /// Every trigger once: the card as it would be cast.
+    All,
+    /// The permanent as it stands on the battlefield: its own
+    /// enters-the-battlefield trigger has already happened (CR 603.6a), so
+    /// only what it can still do is priced.
+    StillToFire,
+}
+
+/// Each triggered ability of `obj` once, what it does when it resolves.
+fn trigger_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing, which: Triggers) -> f64 {
+    obj.trigger_definitions
+        .iter_unchecked()
+        .filter(|trigger| which == Triggers::All || !is_own_etb(&trigger.definition))
+        .filter_map(|trigger| trigger.definition.execute.as_deref())
+        .map(|execute| definition_payoff(state, obj, execute, draws))
+        .sum()
+}
+
+/// CR 603.6a: "When this permanent enters": the trigger of its own entering.
+fn is_own_etb(trigger: &engine::types::ability::TriggerDefinition) -> bool {
+    trigger.mode == engine::types::triggers::TriggerMode::ChangesZone
+        && trigger.valid_card == Some(TargetFilter::SelfRef)
+        && trigger.destination == Some(Zone::Battlefield)
+}
+
+/// A planeswalker's loyalty (CR 306.5b: it enters with its printed loyalty;
+/// CR 306.5c: on the battlefield, its loyalty counters), plus each loyalty
+/// ability it can activate from that loyalty once (CR 606.3, CR 606.6: a
+/// negative cost needs that many counters). 0 for anything else.
+fn planeswalker_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
+    if !obj.card_types.core_types.contains(&CoreType::Planeswalker) {
+        return 0.0;
     }
-    payoff
+    let loyalty = obj.loyalty.unwrap_or(0);
+    let abilities: f64 = obj
+        .abilities
+        .iter()
+        .filter(|ability| {
+            matches!(ability.cost, Some(AbilityCost::Loyalty { amount }) if amount >= -(loyalty as i32))
+        })
+        .map(|ability| definition_payoff(state, obj, ability, draws))
+        .sum();
+    f64::from(loyalty) + abilities
+}
+
+/// What a spell still on the stack is worth to the search's leaf, in cards
+/// (`eval::EvalFeatures::card_credit`). CR 405.1 + CR 601.2a: a cast spell is
+/// the card, moved from hand to the stack; until it resolves or is countered it
+/// is not a card lost. A noncreature permanent spell is valued as resolved
+/// ([`permanent_card_credit`], CR 608.3: it becomes that permanent), so a
+/// leaf where an opponent could still respond reads the cast as the leaf after
+/// it would. That is not discounted for the chance of an answer, which the
+/// search explores as the opponent's own move. Any other spell is the card it
+/// was: an instant or sorcery has not yet done anything, and a creature spell
+/// is priced by its board terms once it resolves. A copy of a spell is put on
+/// the stack, not moved there from a hand (CR 707.10), so it earns nothing.
+pub(crate) fn stack_spell_card_credit(state: &GameState, obj: &GameObject) -> f64 {
+    if obj.is_token || obj.is_copy {
+        return 0.0;
+    }
+    let types = &obj.card_types.core_types;
+    let noncreature_permanent = !types.contains(&CoreType::Instant)
+        && !types.contains(&CoreType::Sorcery)
+        && !types.contains(&CoreType::Creature)
+        && !types.contains(&CoreType::Land);
+    if noncreature_permanent {
+        permanent_card_credit(state, obj).max(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// What a resolved noncreature permanent is worth to the search's leaf, in
+/// cards: the scale of the hand-size weight that values the card it was in
+/// hand (`eval::EvalFeatures::card_credit`).
+///
+/// - A permanent represented by a card is that card, 1.0, plus what it can
+///   still do in expected draws ([`draw_unit`], the unit [`intrinsic_value`]
+///   prices a drawn card in): a planeswalker's loyalty and the loyalty
+///   abilities its loyalty pays for, and the triggers it has yet to fire, as
+///   [`intrinsic_value`] reads them. So a cast never scores below the card it
+///   was, and The Theorist at 4 loyalty is her card plus her loyalty, her
+///   [+1]'s token and her draw.
+/// - CR 121.4 + CR 704.5b: when its recurring mandatory draws leave the
+///   controller fewer than six rounds of library
+///   (`anti_self_harm::recurring_self_draw_exposure`, the reading behind the
+///   cast's deck-out price), its draws are credited at nothing.
+/// - CR 111.1 + CR 707.10: a token or a copy is not a card, so it earns no card
+///   credit (it keeps the `card_advantage` weight alone). A creature is priced
+///   by its board terms, and a land or any other standing mana source (a mana
+///   rock, `is_intrinsic_mana_source`) by the mana-development offset, which
+///   is sized as a source's whole value against the hand card it costs; all
+///   are 0 here, so the rock-versus-body margins `ai_quality` discloses stand.
+///
+/// An Aura's effect on its host is not read here: the leaf reads the host
+/// (`eval::neutralized_creatures`).
+pub(crate) fn permanent_card_credit(state: &GameState, obj: &GameObject) -> f64 {
+    let types = &obj.card_types.core_types;
+    if obj.is_token
+        || obj.is_copy
+        || types.contains(&CoreType::Creature)
+        || types.contains(&CoreType::Land)
+        || is_intrinsic_mana_source(obj)
+    {
+        return 0.0;
+    }
+    let draws = match crate::policies::anti_self_harm::recurring_self_draw_exposure(
+        state,
+        obj,
+        obj.controller,
+    ) {
+        Some(exposure) if exposure.is_short() => DrawPricing::Unpriced,
+        _ => DrawPricing::LibraryMean,
+    };
+    let payoff = planeswalker_payoff(state, obj, draws)
+        + trigger_payoff(state, obj, draws, Triggers::StillToFire);
+    if payoff <= 0.0 {
+        return 1.0;
+    }
+    1.0 + payoff / draw_unit(state, obj.controller)
 }
 
 /// One ability's payoff: its best mode when it is modal (CR 700.2), otherwise

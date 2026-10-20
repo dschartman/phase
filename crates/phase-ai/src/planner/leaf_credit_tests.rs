@@ -27,7 +27,8 @@ use crate::context::AiContext;
 use crate::deck_profile::{DeckArchetype, DeckProfile};
 use crate::eval::{evaluate_state, EvalWeightSet, EvalWeights};
 
-const THE_THEORIST_ORACLE: &str = "At the beginning of each opponent's draw step, you draw a card.\n\
+const THE_THEORIST_ORACLE: &str =
+    "At the beginning of each opponent's draw step, you draw a card.\n\
      [+1]: Create a 1/1 blue Illusion creature token.\n\
      [\u{2212}2]: For each opponent, return up to one target artifact or creature that player \
      controls to its owner's hand.\n\
@@ -139,7 +140,10 @@ fn the_theorist_resolved_at(library: usize, loyalty: u32) -> (GameState, ObjectI
     let mut scenario = table(library);
     let theorist = the_theorist_in_hand(&mut scenario);
     let mut state = cast_and_resolve(scenario, theorist, &[]);
-    let obj = state.objects.get_mut(&theorist).expect("The Theorist exists");
+    let obj = state
+        .objects
+        .get_mut(&theorist)
+        .expect("The Theorist exists");
     assert_eq!(obj.zone, Zone::Battlefield, "The Theorist resolved");
     obj.counters.insert(CounterType::Loyalty, loyalty);
     obj.loyalty = Some(loyalty);
@@ -171,12 +175,8 @@ fn aggro_context(config: &AiConfig) -> AiContext {
             count: 4,
         })
         .collect();
-    let context = AiContext::analyze_for_player(
-        &deck,
-        &config.weights,
-        &config.archetype_multipliers,
-        P0,
-    );
+    let context =
+        AiContext::analyze_for_player(&deck, &config.weights, &config.archetype_multipliers, P0);
     assert_eq!(context.deck_profile.archetype, DeckArchetype::Aggro);
     context
 }
@@ -410,8 +410,8 @@ fn a_resolved_creature_spell_is_priced_by_its_board_terms_as_before() {
     for archetype in ARCHETYPES {
         let w = served_weights(archetype, LATE_TURN);
         let delta = evaluate_state(&resolved, P0, &w) - evaluate_state(&held, P0, &w);
-        let expected = w.board_presence + 2.0 * w.board_power + 2.0 * w.board_toughness
-            - w.hand_size;
+        let expected =
+            w.board_presence + 2.0 * w.board_power + 2.0 * w.board_toughness - w.hand_size;
         assert!(
             (delta - expected).abs() < 1e-9,
             "{archetype:?}: a resolved 2/2 moved the leaf by {delta:.6}, expected {expected:.6}"

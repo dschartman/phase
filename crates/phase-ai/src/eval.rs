@@ -159,6 +159,12 @@ pub struct EvaluationBreakdown {
     /// reaches 90.0 at the source target, which would make `hand_size`
     /// uninterpretable.
     pub mana_development: f64,
+    /// The cards each side has resolved as noncreature permanents, at the
+    /// hand-size weight (`EvalFeatures::card_credit`).
+    pub card_credit: f64,
+    /// The combat value of the creatures an attached Aura or Equipment holds
+    /// out of combat, at the board weights (`EvalFeatures::neutralized_*`).
+    pub neutralized: f64,
 }
 
 impl EvaluationBreakdown {
@@ -179,6 +185,8 @@ impl EvaluationBreakdown {
             aggression,
             card_advantage,
             mana_development,
+            card_credit,
+            neutralized,
         } = self;
         life + board_presence
             + board_power
@@ -187,6 +195,8 @@ impl EvaluationBreakdown {
             + aggression
             + card_advantage
             + mana_development
+            + card_credit
+            + neutralized
     }
 }
 
@@ -234,6 +244,28 @@ pub struct EvalFeatures {
     /// `card_advantage_breakdown`). NEGATIVE when opponents are ahead on mana.
     /// Added after weighting, so excluded from `weighted_total`.
     pub mana_development_offset: f64,
+    /// Card-equivalent (self − opponent) differential of the noncreature,
+    /// nonland permanents each side has resolved (`card_value::permanent_card_credit`)
+    /// and of the spells each has on the stack (`card_value::stack_spell_card_credit`,
+    /// a spell waiting to resolve is not a card lost): each is the card it was in hand,
+    /// plus what it can still do in expected draws (a planeswalker's loyalty
+    /// and the loyalty abilities it can pay for). Priced at the **hand-size
+    /// weight**, so a cast noncreature permanent is never worth less than the
+    /// card it was in hand at any archetype's weights. Not a 17Lands column:
+    /// `FeatureRow::extract` folds it into the harvested `hand_size`, the
+    /// weight it multiplies.
+    pub card_credit: f64,
+    /// CR 303.4b + CR 301.5a + CR 508.1a + CR 509.1a + CR 502.3: the creatures
+    /// an attached Aura or Equipment holds out of combat (it can neither attack
+    /// nor block, or it is tapped and doesn't untap), as an (opponent − self)
+    /// differential of their count, power and toughness: the combat value the
+    /// board features still count for them. Priced at the board weights, so
+    /// the attachment is worth its host's combat value; the board features
+    /// themselves are unchanged. `FeatureRow::extract` folds these into the
+    /// harvested board columns.
+    pub neutralized_presence: f64,
+    pub neutralized_power: f64,
+    pub neutralized_toughness: f64,
 }
 
 impl EvalFeatures {
@@ -249,6 +281,10 @@ impl EvalFeatures {
             + self.hand_size * w.hand_size
             + self.aggression * w.aggression
             + self.card_advantage_breakdown * w.card_advantage
+            + self.card_credit * w.hand_size
+            + self.neutralized_presence * w.board_presence
+            + self.neutralized_power * w.board_power
+            + self.neutralized_toughness * w.board_toughness
     }
 }
 
@@ -472,6 +508,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let mut weighted_opp_hand = 0.0;
         let mut weighted_opp_nc = 0.0;
         let mut weighted_opp_sources = 0.0;
+        let mut weighted_opp_credit = StructuralCredit::default();
 
         for &(opp, threat) in &threats {
             let w = threat / total_threat;
@@ -484,6 +521,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             weighted_opp_hand += o.hand.len() as f64 * w;
             weighted_opp_nc += opp_stats.non_creatures as f64 * w;
             weighted_opp_sources += opp_stats.mana_sources as f64 * w;
+            weighted_opp_credit.add_scaled(&structural_credit(state, opp), w);
         }
 
         // Life differential (against threat-weighted opponent)
@@ -496,6 +534,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         features.board_toughness = my_stats.toughness as f64 - weighted_opp_toughness;
         features.hand_size = p.hand.len() as f64 - weighted_opp_hand;
         features.card_advantage_breakdown = my_stats.non_creatures as f64 - weighted_opp_nc;
+        features.set_structural_credit(&structural_credit(state, player), &weighted_opp_credit);
 
         if p.life as f64 > weighted_opp_life && my_stats.power > 0 {
             features.aggression = my_stats.power as f64;
@@ -509,6 +548,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let mut total_opp_hand_size = 0;
         let mut total_opp_nc = 0;
         let mut total_opp_sources = 0;
+        let mut opp_credit = StructuralCredit::default();
         for &opp in &opponents {
             let o = &state.players[opp.0 as usize];
             total_opp_life += o.life;
@@ -519,6 +559,7 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             total_opp_hand_size += o.hand.len();
             total_opp_nc += opp_stats.non_creatures;
             total_opp_sources += opp_stats.mana_sources;
+            opp_credit.add_scaled(&structural_credit(state, opp), 1.0 / opp_count);
         }
 
         let avg_opp_life = total_opp_life as f64 / opp_count;
@@ -534,6 +575,8 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
 
         let avg_opp_nc = total_opp_nc as f64 / opp_count;
         features.card_advantage_breakdown = my_stats.non_creatures as f64 - avg_opp_nc;
+        // Averaged over opponents exactly like `card_advantage_breakdown`.
+        features.set_structural_credit(&structural_credit(state, player), &opp_credit);
 
         // Mirrors `card_advantage_breakdown` above — an AVERAGE, not a raw total
         // (§6.4): at exactly one opponent the two agree, and the distinction
@@ -585,6 +628,10 @@ pub fn evaluate_state_breakdown(
         aggression: features.aggression * weights.aggression,
         card_advantage: features.card_advantage_breakdown * weights.card_advantage,
         mana_development: 0.0,
+        card_credit: features.card_credit * weights.hand_size,
+        neutralized: features.neutralized_presence * weights.board_presence
+            + features.neutralized_power * weights.board_power
+            + features.neutralized_toughness * weights.board_toughness,
     };
 
     // CR 107.14: energy is a fixed-coefficient offset added AFTER weighting, so
@@ -599,6 +646,147 @@ pub fn evaluate_state_breakdown(
     breakdown.mana_development = features.mana_development_offset;
 
     Ok(breakdown)
+}
+
+/// One player's structural credit: what the leaf reads beyond the 17Lands
+/// board counts (`EvalFeatures::card_credit`, `EvalFeatures::neutralized_*`).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct StructuralCredit {
+    /// Card-equivalents of the player's resolved noncreature permanents.
+    cards: f64,
+    /// The player's creatures held out of combat by an attachment.
+    neutralized: CombatTotals,
+}
+
+/// Count, power and toughness of a set of creatures.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CombatTotals {
+    count: f64,
+    power: f64,
+    toughness: f64,
+}
+
+impl StructuralCredit {
+    fn add_scaled(&mut self, other: &StructuralCredit, scale: f64) {
+        self.cards += other.cards * scale;
+        self.neutralized.count += other.neutralized.count * scale;
+        self.neutralized.power += other.neutralized.power * scale;
+        self.neutralized.toughness += other.neutralized.toughness * scale;
+    }
+}
+
+impl EvalFeatures {
+    /// Cards are credited to their controller (self − opponent); a neutralized
+    /// creature is credit to its controller's opponents (opponent − self).
+    fn set_structural_credit(&mut self, mine: &StructuralCredit, opponents: &StructuralCredit) {
+        self.card_credit = mine.cards - opponents.cards;
+        self.neutralized_presence = opponents.neutralized.count - mine.neutralized.count;
+        self.neutralized_power = opponents.neutralized.power - mine.neutralized.power;
+        self.neutralized_toughness = opponents.neutralized.toughness - mine.neutralized.toughness;
+    }
+}
+
+fn structural_credit(state: &GameState, player: PlayerId) -> StructuralCredit {
+    let resolved: f64 = state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter(|obj| obj.controller == player)
+        .map(|obj| crate::card_value::permanent_card_credit(state, obj))
+        .sum();
+    // CR 405.1: a cast spell is its card, put on the stack; an activated or
+    // triggered ability goes on the stack with no card associated with it.
+    let on_stack: f64 = state
+        .stack
+        .iter()
+        .filter(|entry| entry.controller == player)
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                engine::types::game_state::StackEntryKind::Spell { .. }
+            )
+        })
+        .filter_map(|entry| state.objects.get(&entry.source_id))
+        .map(|obj| crate::card_value::stack_spell_card_credit(state, obj))
+        .sum();
+    StructuralCredit {
+        cards: resolved + on_stack,
+        neutralized: neutralized_creatures(state, player),
+    }
+}
+
+/// The creatures `player` controls that an attached Aura or Equipment holds
+/// out of combat, each counted once however many attachments hold it.
+///
+/// CR 303.4b + CR 301.5a: an Aura's "enchanted creature" (an Equipment's
+/// "equipped creature") is the permanent it is attached to. A host is held out
+/// when the attachment's own functioning statics on it say it can't attack and
+/// can't block, or that it doesn't untap (CR 502.3) while it is tapped: a
+/// tapped creature can't be declared an attacker or a blocker (CR 508.1a,
+/// CR 509.1a).
+fn neutralized_creatures(state: &GameState, player: PlayerId) -> CombatTotals {
+    let mut held: Vec<ObjectId> = Vec::new();
+    for attachment in state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+    {
+        let Some(engine::game::game_object::AttachTarget::Object(host_id)) = attachment.attached_to
+        else {
+            continue;
+        };
+        let Some(host) = state.objects.get(&host_id) else {
+            continue;
+        };
+        if host.zone != Zone::Battlefield
+            || host.controller != player
+            || !host.card_types.core_types.contains(&CoreType::Creature)
+            || held.contains(&host_id)
+        {
+            continue;
+        }
+        if attachment_holds_out_of_combat(state, attachment, host) {
+            held.push(host_id);
+        }
+    }
+    held.iter().filter_map(|id| state.objects.get(id)).fold(
+        CombatTotals::default(),
+        |mut totals, host| {
+            totals.count += 1.0;
+            totals.power += f64::from(host.power.unwrap_or(0));
+            totals.toughness += f64::from(host.toughness.unwrap_or(0));
+            totals
+        },
+    )
+}
+
+fn attachment_holds_out_of_combat(
+    state: &GameState,
+    attachment: &engine::game::game_object::GameObject,
+    host: &engine::game::game_object::GameObject,
+) -> bool {
+    use engine::types::statics::StaticMode;
+    let (mut cant_attack, mut cant_block, mut cant_untap) = (false, false, false);
+    for def in engine::game::functioning_abilities::active_static_definitions(state, attachment) {
+        if !def
+            .affected
+            .as_ref()
+            .is_some_and(|filter| filter.contains_source_attachment_host())
+        {
+            continue;
+        }
+        match &def.mode {
+            StaticMode::CantAttackOrBlock => {
+                cant_attack = true;
+                cant_block = true;
+            }
+            StaticMode::CantAttack => cant_attack = true,
+            StaticMode::CantBlock => cant_block = true,
+            StaticMode::CantUntap => cant_untap = true,
+            _ => {}
+        }
+    }
+    (cant_attack && cant_block) || (cant_untap && host.tapped)
 }
 
 /// Board statistics: (creature_count, total_power, total_toughness, non_creature_permanents).
