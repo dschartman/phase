@@ -294,6 +294,9 @@ struct SearchOverrides {
     /// opponent hidden-zone worlds averaged per decision (`0` = perfect
     /// information, the shipped default).
     determinization_samples: Option<u32>,
+    /// `SearchConfig::root_max_branching`: the root-only beam width (interior
+    /// nodes keep the preset's `max_branching`).
+    root_max_branching: Option<u32>,
 }
 
 impl SearchOverrides {
@@ -2580,10 +2583,39 @@ mod tests {
             SearchOverrides {
                 temperature: Some(0.0),
                 determinization_samples: Some(4),
+                root_max_branching: None,
             }
         );
         let defaults = parse_cli(&args(&[])).expect("parses");
         assert_eq!(defaults.search_overrides, SearchOverrides::default());
+    }
+
+    /// `--root-width W` sets the root-only beam width on the preset; the
+    /// interior width stays the preset's `max_branching`.
+    #[test]
+    fn root_width_override_parses_and_reaches_only_the_root_width() {
+        let cli = parse_cli(&args(&["--difficulty", "VeryHard", "--root-width", "1000"]))
+            .expect("parses");
+        assert_eq!(cli.search_overrides.root_max_branching, Some(1000));
+        let preset = create_config_for_players(AiDifficulty::VeryHard, Platform::Native, 2);
+        let applied = cli.search_overrides.apply(preset.clone());
+        assert_eq!(applied.search.root_max_branching, Some(1000));
+        assert_eq!(applied.search.root_branching(), 1000);
+        assert_eq!(applied.search.max_branching, preset.search.max_branching);
+        assert_eq!(
+            SearchOverrides::default()
+                .apply(preset.clone())
+                .search
+                .root_branching(),
+            preset.search.max_branching as usize,
+            "no flag: the root keeps the preset width"
+        );
+        for bad in ["0", "-1", "wide"] {
+            let err = parse_cli(&args(&["--root-width", bad])).expect_err(bad);
+            assert!(err.contains("--root-width"), "{err}");
+        }
+        let err = parse_cli(&args(&["--suite", "--root-width", "8"])).expect_err("suite");
+        assert!(err.contains("single"), "{err}");
     }
 
     #[test]

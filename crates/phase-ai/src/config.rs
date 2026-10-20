@@ -158,6 +158,21 @@ pub struct SearchConfig {
     /// set it directly on `SearchConfig` after construction (as the `search.rs`
     /// ensemble tests do) to exercise the retained machinery.
     pub determinization_samples: u32,
+    /// Root-only beam width. `None` (every shipped preset) keeps the decision
+    /// root at `max_branching`, like every interior node. `Some(w)` keeps the
+    /// `w` best-ranked root candidates instead, while interior nodes still
+    /// truncate to `max_branching`: a measurement knob for how much the root
+    /// cut moves the AI's picks (ai-duel `--root-width`). Read only through
+    /// [`SearchConfig::root_branching`].
+    pub root_max_branching: Option<u32>,
+}
+
+impl SearchConfig {
+    /// Width of the root beam: the root-only override when set, otherwise
+    /// `max_branching`. Interior nodes read `max_branching` directly.
+    pub fn root_branching(&self) -> usize {
+        self.root_max_branching.unwrap_or(self.max_branching) as usize
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +278,7 @@ impl Default for SearchConfig {
             threat_awareness: ThreatAwareness::None,
             projection_min_budget_ms: 2000,
             determinization_samples: 0,
+            root_max_branching: None,
         }
     }
 }
@@ -1394,6 +1410,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 threat_awareness: ThreatAwareness::None,
                 projection_min_budget_ms: 0,
                 determinization_samples: 0,
+                root_max_branching: None,
             },
         ),
         AiDifficulty::Easy => (
@@ -1419,6 +1436,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 threat_awareness: ThreatAwareness::None,
                 projection_min_budget_ms: 0,
                 determinization_samples: 0,
+                root_max_branching: None,
             },
         ),
         AiDifficulty::Medium => (
@@ -1450,6 +1468,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 // cost the ladder its monotonicity when shipped (see
                 // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
                 determinization_samples: 0,
+                root_max_branching: None,
             },
         ),
         AiDifficulty::Hard => (
@@ -1481,6 +1500,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 // cost the ladder its monotonicity when shipped (see
                 // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
                 determinization_samples: 0,
+                root_max_branching: None,
             },
         ),
         AiDifficulty::VeryHard => (
@@ -1517,6 +1537,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 // cost the ladder its monotonicity when shipped (see
                 // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
                 determinization_samples: 0,
+                root_max_branching: None,
             },
         ),
         AiDifficulty::CEDH => (
@@ -1551,6 +1572,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 // cost the ladder its monotonicity when shipped (see
                 // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
                 determinization_samples: 0,
+                root_max_branching: None,
             },
         ),
     };

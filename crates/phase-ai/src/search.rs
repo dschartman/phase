@@ -13926,6 +13926,148 @@ mod tests {
         )
     }
 
+    /// A main-phase priority root wider than the default beam: `spells`
+    /// distinct one-mana creatures in hand, the pool to cast any of them, and
+    /// an opposing creature so the evaluation has a gradient.
+    fn wide_root_state(spells: usize) -> GameState {
+        let mut state = make_state();
+        state.lands_played_this_turn = 1;
+        let _opp = add_creature(&mut state, PlayerId(1), 3, 3);
+        for i in 0..spells {
+            let card_id = CardId(state.next_object_id);
+            let id = create_object(
+                &mut state,
+                card_id,
+                PlayerId(0),
+                format!("Wide Root Bear {i}"),
+                Zone::Hand,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(1 + (i % 3) as i32);
+            obj.toughness = Some(1 + (i % 2) as i32);
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_power = obj.power;
+            obj.base_toughness = obj.toughness;
+            obj.mana_cost = engine::types::mana::ManaCost::Cost {
+                shards: vec![engine::types::mana::ManaCostShard::Green],
+                generic: 0,
+            };
+        }
+        add_mana(&mut state, PlayerId(0), ManaType::Green, spells);
+        state
+    }
+
+    fn wide_root_config(root_max_branching: Option<u32>) -> AiConfig {
+        let mut config =
+            create_config(AiDifficulty::VeryHard, Platform::Native).into_measurement(7);
+        config.search.planner_mode = PlannerMode::BeamOnly;
+        config.search.determinization_samples = 0;
+        config.search.root_max_branching = root_max_branching;
+        config
+    }
+
+    /// The root-only width override above the gated pool keeps every root
+    /// candidate; unset, the root keeps `max_branching` (5). The five the
+    /// default keeps score the same either way: only the root width moved.
+    #[test]
+    fn root_width_override_above_the_pool_keeps_every_root_candidate() {
+        let state = wide_root_state(7);
+        let session = AiSession::arc_from_game(&state);
+        let default_config = wide_root_config(None);
+        assert_eq!(
+            default_config.search.max_branching, 5,
+            "preset width precondition"
+        );
+
+        let cut = score_candidates_with_session(&state, PlayerId(0), &default_config, &session);
+        let wide = score_candidates_with_session(
+            &state,
+            PlayerId(0),
+            &wide_root_config(Some(50)),
+            &session,
+        );
+
+        let casts = |scored: &[(GameAction, f64)]| {
+            scored
+                .iter()
+                .filter(|(action, _)| matches!(action, GameAction::CastSpell { .. }))
+                .count()
+        };
+        assert_eq!(
+            cut.len(),
+            5,
+            "unset override: the root beam is cut to max_branching"
+        );
+        assert_eq!(
+            wide.len(),
+            8,
+            "override 50 over a pool of 8 (7 casts and pass): the root keeps all of them"
+        );
+        assert_eq!(
+            casts(&wide),
+            7,
+            "every castable creature reaches the scored root"
+        );
+        assert!(wide
+            .iter()
+            .any(|(action, _)| *action == GameAction::PassPriority));
+        for (action, score) in &cut {
+            assert_eq!(
+                score_of(&wide, action).to_bits(),
+                score.to_bits(),
+                "a candidate both runs keep scores the same: {action:?}"
+            );
+        }
+    }
+
+    /// The override is root-only: an interior node over the same wide pool
+    /// still expands `max_branching` children and reaches the same value.
+    #[test]
+    fn root_width_override_leaves_the_interior_width_unchanged() {
+        let state = wide_root_state(7);
+        let policies = PolicyRegistry::default();
+        let run = |root_max_branching: Option<u32>| {
+            let mut config = wide_root_config(root_max_branching);
+            config.search.planner_mode = PlannerMode::BeamPlusRollout;
+            let mut services = PlannerServices::new_default(PlayerId(0), &config, &policies);
+            let ctx = services.build_decision_context(&state);
+            assert!(
+                ctx.candidates.len() > 5,
+                "reach-guard: the interior pool exceeds the beam width"
+            );
+            let planner = BeamContinuationPlanner {
+                depth: 1,
+                rollout_depth: 0,
+            };
+            let mut budget = SearchBudget::new(100_000);
+            let value = planner.search_value(
+                &state,
+                1,
+                1,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                &mut services,
+                &mut budget,
+            );
+            (value.to_bits(), budget.nodes_evaluated)
+        };
+        let (default_value, default_nodes) = run(None);
+        let (override_value, override_nodes) = run(Some(50));
+        assert_eq!(
+            default_nodes, 6,
+            "the interior node plus its max_branching (5) children"
+        );
+        assert_eq!(
+            override_nodes, default_nodes,
+            "interior width unchanged by the root override"
+        );
+        assert_eq!(
+            override_value, default_value,
+            "interior value unchanged by the root override"
+        );
+    }
+
     fn score_of(scored: &[(GameAction, f64)], action: &GameAction) -> f64 {
         scored
             .iter()
