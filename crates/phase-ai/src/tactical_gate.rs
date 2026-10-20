@@ -13816,4 +13816,234 @@ mod tests {
             GateDecision::AllowWithPenalty(-5.0)
         );
     }
+
+    // --- judge rows (a85428a64), constructed -------------------------------
+    //
+    // `phase/.git/fork-checks/a85428a64/JUDGE.md`, rows JR1 to JR9, landed
+    // without their diagnostics. JR2, JR4 and JR9 asserted the withdrawn
+    // "exact N kept" premise; they land with the draw-to-zero reading (lead
+    // ruling 2026-10-20). JR10 belongs to the leaf-after-own-stack spec (S2).
+
+    const JR_LOOT_ORACLE: &str = "{2}, {T}, Discard a card: Draw a card.";
+    const JR_FLIP_ORACLE: &str = "Draw two cards. If this spell was cast from a graveyard, draw a card instead.\nFlashback {2}{U}";
+    const JR_STATE_INSTEAD_ORACLE: &str =
+        "Draw a card. If you control an artifact, draw two cards instead.";
+    const JR_TARGET_PLAYER_ORACLE: &str = "Target player draws two cards.";
+    const JR_BRAINSTORM_ORACLE: &str =
+        "Draw three cards, then put two cards from your hand on top of your library in any order.";
+    const JR_MANIAC_ORACLE: &str =
+        "If you would draw a card while your library has no cards in it, you win the game instead.";
+
+    fn jr_flip_in(zone: Zone) -> impl FnOnce(&mut GameScenario) -> ObjectId {
+        move |scenario| {
+            match zone {
+                Zone::Graveyard => scenario.add_spell_to_graveyard(P0, "Flip Vision", false),
+                _ => scenario.add_spell_to_hand(P0, "Flip Vision", false),
+            }
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            })
+            .from_oracle_text_with_keywords(&["Flashback"], JR_FLIP_ORACLE)
+            .id()
+        }
+    }
+
+    fn jr_loot_decision(library: usize) -> GateDecision {
+        let (state, source) = self_draw_table(library, |scenario| {
+            scenario.add_creature_to_hand(P0, "Spare Bear", 2, 2);
+            scenario
+                .add_artifact_from_oracle(P0, "Loot Volume", JR_LOOT_ORACLE)
+                .id()
+        });
+        issued_decision(
+            &state,
+            |action| matches!(action, GameAction::ActivateAbility { source_id, ability_index: 0 } if *source_id == source),
+        )
+    }
+
+    /// P0 casts `add`'s spell on a three-Island board with `library` cards
+    /// and it resolves (P1 with 25): the engine's own outcome.
+    fn jr_resolved_waiting_for(
+        library: usize,
+        board: impl FnOnce(&mut GameScenario),
+        add: impl FnOnce(&mut GameScenario) -> ObjectId,
+    ) -> WaitingFor {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..3 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
+        }
+        for _ in 0..library {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        board(&mut scenario);
+        let spell = add(&mut scenario);
+        let mut runner = scenario.build();
+        let _commit = runner.cast(spell).commit();
+        runner.resolve_top();
+        runner.state().waiting_for.clone()
+    }
+
+    /// JR1: the instead leg flips the other way. From hand it draws two
+    /// (condition "cast from a graveyard" is false): at library 1, a loss.
+    #[test]
+    fn jr1_flip_from_hand_at_library_one_is_rejected() {
+        let (state, spell) = self_draw_table(1, jr_flip_in(Zone::Hand));
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// JR2: flashed back from the graveyard it draws one: at library 1 that
+    /// is the last card (draw to 0), at library 2 it is kept.
+    #[test]
+    fn jr2_flip_flashback_draws_one_to_zero_at_library_one_and_is_kept_at_two() {
+        let (state, spell) = self_draw_table(1, jr_flip_in(Zone::Graveyard));
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+        let (state, spell) = self_draw_table(2, jr_flip_in(Zone::Graveyard));
+        assert!(!issued_cast_decision(&state, spell).is_reject());
+    }
+
+    /// JR3, library 0: an instead leg the cast origin does not decide (a
+    /// board condition) counts the fewer, one draw, which an empty library
+    /// cannot give.
+    #[test]
+    fn jr3_state_conditioned_instead_at_library_zero_is_rejected() {
+        let (state, spell) = self_draw_table(0, |scenario| {
+            scenario.add_artifact_from_oracle(P0, "Trinket", "");
+            sorcery_in_hand(JR_STATE_INSTEAD_ORACLE)(scenario)
+        });
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// JR3 (S5): with an artifact in play the engine draws two at library 1
+    /// and P0 loses; the gate should read the board condition and reject it
+    /// as a draw past the library. The lower bound counts one (a draw to 0).
+    #[test]
+    #[ignore = "S5: needs a pub engine predicate evaluating an AbilityCondition for a prospective cast (queued with draw_prohibited); the gate reads a board-conditioned instead leg as the fewer draw"]
+    fn jr3_state_conditioned_instead_with_an_artifact_draws_past_the_library() {
+        let (state, spell) = self_draw_table(1, |scenario| {
+            scenario.add_artifact_from_oracle(P0, "Trinket", "");
+            sorcery_in_hand(JR_STATE_INSTEAD_ORACLE)(scenario)
+        });
+        let engine_outcome = jr_resolved_waiting_for(
+            1,
+            |scenario| {
+                scenario.add_artifact_from_oracle(P0, "Trinket", "");
+            },
+            sorcery_in_hand(JR_STATE_INSTEAD_ORACLE),
+        );
+        assert_eq!(
+            engine_outcome,
+            WaitingFor::GameOver { winner: Some(P1) },
+            "engine truth: two draws from one lose"
+        );
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// JR4: Murmuring Volume's loot at library 1 draws the last card.
+    #[test]
+    fn jr4_loot_at_library_one_decks_before_own_draw() {
+        assert_eq!(
+            jr_loot_decision(1).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
+
+    /// JR5: the loot at library 0 is a draw from an empty library.
+    #[test]
+    fn jr5_loot_at_library_zero_is_rejected() {
+        assert_eq!(
+            jr_loot_decision(0).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// JR6: "Target player draws two cards." at library 1: the target is
+    /// chosen later; the count is 0 (not the controller), so it is kept.
+    #[test]
+    fn jr6_target_player_draws_two_at_library_one_stays_a_candidate() {
+        let (state, spell) = self_draw_table(1, sorcery_in_hand(JR_TARGET_PLAYER_ORACLE));
+        assert!(!issued_cast_decision(&state, spell).is_reject());
+    }
+
+    /// JR7: Laboratory Maniac shape. Draw two at library 1 draws the last card,
+    /// then the second draw is replaced by a win (engine truth); the gate
+    /// over-rejects (disclosed). At library 0 the replacement already
+    /// applies: kept.
+    #[test]
+    fn jr7_maniac_shape_over_rejects_at_library_one_and_keeps_at_zero() {
+        let with_maniac = |library| {
+            self_draw_table(library, |scenario| {
+                scenario.add_enchantment_from_oracle(P0, "Maniac Charm", JR_MANIAC_ORACLE);
+                sorcery_in_hand(DIVINATION_ORACLE)(scenario)
+            })
+        };
+        let (s1, d1) = with_maniac(1);
+        let (s0, d0) = with_maniac(0);
+        let engine_outcome = jr_resolved_waiting_for(
+            1,
+            |scenario| {
+                scenario.add_enchantment_from_oracle(P0, "Maniac Charm", JR_MANIAC_ORACLE);
+            },
+            sorcery_in_hand(DIVINATION_ORACLE),
+        );
+        assert_eq!(
+            engine_outcome,
+            WaitingFor::GameOver { winner: Some(P0) },
+            "engine truth: the replaced draw wins"
+        );
+        assert_eq!(
+            issued_cast_decision(&s1, d1).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary),
+            "documented over-reject"
+        );
+        assert_eq!(
+            issued_cast_decision(&s0, d0).reject_reason(),
+            None,
+            "replacement applies at an empty library"
+        );
+    }
+
+    /// JR8: Brainstorm at library 2: three draws first, so the third is from
+    /// an empty library before any card goes back.
+    #[test]
+    fn jr8_brainstorm_at_library_two_is_rejected() {
+        let (state, spell) = self_draw_table(2, sorcery_in_hand(JR_BRAINSTORM_ORACLE));
+        assert_eq!(
+            issued_cast_decision(&state, spell).reject_reason(),
+            Some(RejectReason::DrawsPastLibrary)
+        );
+    }
+
+    /// JR9: one reading. The Theorist at library 1 leaves the AI at 0 before
+    /// its own draw step (`>=`), and so does a draw two at library 2: both
+    /// rejected as `DecksOutBeforeOwnDraw`.
+    #[test]
+    fn jr9_theorist_at_library_one_and_draw_two_at_library_two_share_the_reason() {
+        let (state, theorist) = self_draw_table(1, theorist_in_hand);
+        let (state2, spell) = self_draw_table(2, sorcery_in_hand(DIVINATION_ORACLE));
+        assert_eq!(
+            issued_cast_decision(&state, theorist).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+        assert_eq!(
+            issued_cast_decision(&state2, spell).reject_reason(),
+            Some(RejectReason::DecksOutBeforeOwnDraw)
+        );
+    }
 }
