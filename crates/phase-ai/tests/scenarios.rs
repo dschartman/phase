@@ -819,6 +819,15 @@ fn scenario_very_hard_wasm_passes_instead_of_postcombat_giant_growth() {
 #[test]
 fn scenario_very_hard_wasm_uses_giant_growth_to_win_combat() {
     let mut scenario = GameScenario::new();
+    // Both libraries stocked: with empty libraries every line is P0's deck-out
+    // loss (about -10000), and the cast led the pass by 0.476 only while the
+    // search added the move-ordering prior to node values (0.121 without it,
+    // so seed 18's softmax draw passed). With libraries the search alone puts
+    // the cast 7.0 above the pass.
+    for _ in 0..20 {
+        scenario.add_land_to_library_top(P0, "Island");
+        scenario.add_land_to_library_top(P1, "Plains");
+    }
     let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
     let blocker = scenario.add_creature(P1, "Blocker", 4, 4).id();
     let growth = scenario

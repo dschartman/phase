@@ -2353,6 +2353,9 @@ mod precombat_pump_tests;
 mod own_trigger_window_tests;
 
 #[cfg(test)]
+mod ordering_value_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
