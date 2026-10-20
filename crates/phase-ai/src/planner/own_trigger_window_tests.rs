@@ -615,3 +615,34 @@ fn break_under_pressure_over_a_fight_trigger_is_searched() {
         "the fight's kill SHALL NOT be counted as certain (on top {a:.3}, kill line {kill:.3})"
     );
 }
+
+/// Judge row JB on 19b88154a (the move-ordering prior at the window): with
+/// Mind Meanderer's fight trigger on top, P1's window is a min node whose
+/// best line is Break Under Pressure, searched one ply shallower than the
+/// window (`OwnTriggerStop::child_depth`). The on-top value SHALL equal that
+/// response line searched at depth 1, with no ordering residue (red at
+/// 19b88154a: 13.1825 against 13.1575, gap 0.0250 = 0.05 x the response's
+/// ranked score 0.5).
+#[test]
+fn jb_window_value_is_the_searched_response_line() {
+    let (top, _meanderer, _rival, pressure) = meanderer_fight_on_top();
+    let mut r = opponent_window(&top);
+    r.cast(pressure).target_player(P0).commit();
+    let resp = r.state().clone();
+    let killed = pass_over_own_triggers(&top);
+    let on_top = searched(&top, 2);
+    let response_line = searched(&resp, 1);
+    let kill = searched(&killed, 2);
+    eprintln!(
+        "JB on top {on_top:.6} response line at depth 1 {response_line:.6} kill line {kill:.6} gap {:.6}",
+        on_top - response_line
+    );
+    assert!(
+        response_line < kill,
+        "reach-guard: the response line is the min"
+    );
+    assert!(
+        (on_top - response_line).abs() < 1e-9,
+        "the window's value SHALL be the searched response line ({on_top:.6} against {response_line:.6})"
+    );
+}

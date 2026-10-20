@@ -350,20 +350,21 @@ fn root_scores(state: &GameState) -> Vec<f64> {
 
 /// Guard: an opponent's trigger on top stays a search node. P0's root scores
 /// and the depth-2 value with P1's prowess trigger on top, on P1's turn and on
-/// P0's, SHALL equal the values at f684984f4 (pinned).
+/// P0's, SHALL equal the pinned values (f684984f4's, less the ordering
+/// residue the search no longer adds to node values).
 #[test]
 fn an_opponents_trigger_on_top_is_searched_as_before() {
-    // (P1's turn, P0's root scores sorted, depth-2 value), read at f684984f4.
+    // (P1's turn, P0's root scores sorted, depth-2 value), read at f684984f4
+    // and re-read with the move-ordering residue out of node values
+    // (spec-ai-ordering-bonus-out-of-values): P1's turn roots 1.24636 / 2.13057
+    // to 1.10636 / 1.99856, depth-2 2.52171 to 2.40720; P0's turn roots
+    // 8.54742 / 14.85198 to 8.40742 / 14.76114, depth-2 14.71948 to 14.62114.
     let pinned: [(bool, [f64; 2], f64); 2] = [
-        (
-            true,
-            [1.2463600000000001, 2.130569803921569],
-            2.5217098039215684,
-        ),
+        (true, [1.10636, 1.9985600000000001], 2.4072),
         (
             false,
-            [8.547422857142857, 14.85197619047619],
-            14.71947619047619,
+            [8.407422857142857, 14.761142857142858],
+            14.621142857142857,
         ),
     ];
     for (p1_turn, roots_at_base, value_at_base) in pinned {
