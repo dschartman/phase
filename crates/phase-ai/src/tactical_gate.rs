@@ -14680,4 +14680,377 @@ mod tests {
         assert_parses_as_temporary_pump(&state, bloodseeker);
         assert_eq!(issued_activation_verdict(&state, bloodseeker), Some(None));
     }
+
+    // --- target choice for a committed shrink or damage outside combat ---
+    //
+    // CR 601.2c + CR 115.1: once a fixed -X/-X or damage spell or activation is
+    // committed (cast announced, activation's cost about to be paid), its
+    // target is chosen at a separate prompt. CR 704.5f + CR 704.5g + CR 514.2:
+    // outside combat a shrink or damage that leaves its creature alive is gone
+    // at cleanup, so while the prompt offers an opposing creature the effect
+    // kills, a target it leaves alive is pruned (seed 1011 T10 in the shrink
+    // run, Proft's -3/-1 aimed at Traxos 1/5 with Fblthp 1/1 offered; the
+    // judge's row L4 on 60ae8209b, an until-end-of-turn -3/-3 on a 3/4 scored
+    // above killing a 1/1).
+
+    const SHRINK_AND_BOUNCE_ORACLE: &str =
+        "Target creature gets -1/-1 until end of turn. Return that creature to its owner's hand.";
+
+    /// The name the driver prints for the target-choice prune.
+    const TARGET_PRUNE: &str = "target_survives_kill_offered";
+
+    /// P0 holds Proft in P1's precombat main with five untapped Swamps, P1
+    /// controls `opposing` (name, power, toughness, keyword), 25 cards in each
+    /// library; `setup` may adjust the state before the activation (combat).
+    /// Proft's ability is activated and the state is at its target prompt.
+    fn proft_target_prompt(
+        opposing: &[(&str, i32, i32, Option<Keyword>)],
+        setup: impl FnOnce(&mut GameState, &[ObjectId]),
+    ) -> (GameState, Vec<ObjectId>) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..5 {
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P0, "Swamp");
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let ids: Vec<ObjectId> = opposing
+            .iter()
+            .map(|(name, power, toughness, keyword)| {
+                let mut builder = scenario.add_creature(P1, name, *power, *toughness);
+                if let Some(keyword) = keyword {
+                    builder.with_keyword(keyword.clone());
+                }
+                builder.id()
+            })
+            .collect();
+        let proft = proft_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        setup(state, &ids);
+        let mut state = state.clone();
+        engine::game::engine::apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: proft,
+                ability_index: 0,
+            },
+        )
+        .expect("activate Proft");
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TargetSelection { .. }),
+            "reach-guard: Proft's target prompt, got {:?}",
+            state.waiting_for
+        );
+        (state, ids)
+    }
+
+    /// The gate's verdict on each engine-issued `ChooseTarget` of an object
+    /// at the current prompt, by object, with `extra` targets appended to the
+    /// prompt's candidates (a candidate the engine would not issue).
+    fn target_verdicts_with(
+        state: &GameState,
+        extra: &[ObjectId],
+    ) -> Vec<(ObjectId, Option<&'static str>)> {
+        let mut issued = candidate_actions(state);
+        for id in extra {
+            issued.push(CandidateAction {
+                action: GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(*id)),
+                },
+                metadata: issued[0].metadata.clone(),
+            });
+        }
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        let context = AiContext::empty(&config.weights);
+        let decisions = gate_decisions(state, &decision, &issued, P0, &config, &context);
+        issued
+            .iter()
+            .zip(decisions)
+            .filter_map(|(candidate, decision)| match &candidate.action {
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(id)),
+                } => Some((*id, decision.reject_reason().map(RejectReason::as_str))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn target_verdicts(state: &GameState) -> Vec<(ObjectId, Option<&'static str>)> {
+        target_verdicts_with(state, &[])
+    }
+
+    fn verdict_of(
+        verdicts: &[(ObjectId, Option<&'static str>)],
+        id: ObjectId,
+    ) -> Option<Option<&'static str>> {
+        verdicts
+            .iter()
+            .find(|(target, _)| *target == id)
+            .map(|(_, verdict)| *verdict)
+    }
+
+    /// Apply the engine-issued cast of `spell` (CR 601.2: announce it).
+    fn cast_issued(state: &mut GameState, spell: ObjectId) {
+        let action = candidate_actions(state)
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .find(|action| {
+                matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == spell)
+            })
+            .unwrap_or_else(|| panic!("reach-guard: the cast of {spell:?} is issued"));
+        engine::game::engine::apply_as_current(state, action).expect("cast");
+    }
+
+    /// The best-scored `ChooseTarget` object at the current prompt through
+    /// the production search (gate, then scoring).
+    fn chosen_target(state: &GameState) -> Option<ObjectId> {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let scored = crate::search::score_candidates(state, P0, &config);
+        eprintln!("scored targets: {scored:?}");
+        scored
+            .into_iter()
+            .filter_map(|(action, score)| match action {
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(id)),
+                } => Some((id, score)),
+                _ => None,
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    }
+
+    /// Seed 1011 T10 (shrink run): Proft's -3/-1 at its target prompt in the
+    /// opponent's main, an opposing Traxos 1/5 and Fblthp 1/1 offered, no
+    /// combat. The -1 kills only Fblthp: Traxos is pruned, Fblthp is kept
+    /// and chosen.
+    #[test]
+    fn shrink_target_prompt_prunes_the_survivor_while_a_kill_is_offered() {
+        let (state, ids) =
+            proft_target_prompt(&[("Traxos", 1, 5, None), ("Fblthp", 1, 1, None)], |_, _| {});
+        let (traxos, fblthp) = (ids[0], ids[1]);
+        assert_eq!(chosen_target(&state), Some(fblthp), "Traxos {traxos:?}");
+        let verdicts = target_verdicts(&state);
+        assert_eq!(verdict_of(&verdicts, traxos), Some(Some(TARGET_PRUNE)));
+        assert_eq!(verdict_of(&verdicts, fblthp), Some(None));
+    }
+
+    /// Guard: no offered target dies to the -1 (a 1/5 and a 4/4): nothing is
+    /// pruned, the scorer picks as before.
+    #[test]
+    fn shrink_target_prompt_with_no_kill_prunes_nothing() {
+        let (state, ids) = proft_target_prompt(
+            &[("Traxos", 1, 5, None), ("Arbiter", 4, 4, None)],
+            |_, _| {},
+        );
+        let verdicts = target_verdicts(&state);
+        assert_eq!(verdict_of(&verdicts, ids[0]), Some(None));
+        assert_eq!(verdict_of(&verdicts, ids[1]), Some(None));
+    }
+
+    /// CR 702.11b + CR 702.18a + CR 702.16b: a 1/1 the shrink would kill but
+    /// that has hexproof, shroud or protection from black (Proft is black) is
+    /// not a legal target, so it is no killable sibling, even when it is put
+    /// among the prompt's candidates by hand: the 1/5 is kept. Read from the
+    /// engine's targeting legality (`find_legal_targets`). A 4/4 is offered
+    /// too, so the prompt has two legal targets; the control (the 1/1 with no
+    /// keyword) prunes the 1/5.
+    #[test]
+    fn shrink_target_prompt_ignores_an_untargetable_kill() {
+        for keyword in [
+            None,
+            Some(Keyword::Hexproof),
+            Some(Keyword::Shroud),
+            Some(Keyword::Protection(
+                engine::types::keywords::ProtectionTarget::Color(
+                    engine::types::mana::ManaColor::Black,
+                ),
+            )),
+        ] {
+            let (state, ids) = proft_target_prompt(
+                &[
+                    ("Traxos", 1, 5, None),
+                    ("Arbiter", 4, 4, None),
+                    ("Small", 1, 1, keyword.clone()),
+                ],
+                |_, _| {},
+            );
+            let (traxos, small) = (ids[0], ids[2]);
+            let issued = target_verdicts(&state);
+            let Some(_) = keyword else {
+                assert_eq!(verdict_of(&issued, traxos), Some(Some(TARGET_PRUNE)));
+                assert_eq!(verdict_of(&issued, small), Some(None));
+                continue;
+            };
+            assert_eq!(
+                verdict_of(&issued, small),
+                None,
+                "reach-guard: the engine does not issue the {keyword:?} 1/1"
+            );
+            assert_eq!(verdict_of(&issued, traxos), Some(None), "{keyword:?}");
+            let with_extra = target_verdicts_with(&state, &[small]);
+            assert_eq!(
+                verdict_of(&with_extra, traxos),
+                Some(None),
+                "{keyword:?} 1/1 put among the candidates by hand"
+            );
+        }
+    }
+
+    /// Guard, CR 510.1a: the opposing 1/5 is attacking before damage (the
+    /// leaf-stack run's 1011 T10 shape: Traxos attacking unblocked in the
+    /// declare-blockers step). Shrinking it cuts its damage without killing
+    /// it, so the prompt is unchanged.
+    #[test]
+    fn shrink_target_prompt_is_unchanged_with_an_opposing_creature_in_combat() {
+        let (state, ids) = proft_target_prompt(
+            &[("Traxos", 1, 5, None), ("Fblthp", 1, 1, None)],
+            |state, ids| {
+                set_priority_window(state, Phase::DeclareBlockers, P1);
+                state.combat = Some(CombatState {
+                    attackers: vec![AttackerInfo::attacking_player(ids[0], P0)],
+                    ..Default::default()
+                });
+            },
+        );
+        let verdicts = target_verdicts(&state);
+        assert_eq!(verdict_of(&verdicts, ids[0]), Some(None));
+        assert_eq!(verdict_of(&verdicts, ids[1]), Some(None));
+    }
+
+    /// Guard: a shrink with a deliberate self-target rider (a bounce of the
+    /// same creature, `is_deliberate_self_target_rider`) is aimed on purpose,
+    /// at the AI's own 1/5 or at an opposing one; with an opposing 1/1 it
+    /// would kill offered, nothing is pruned.
+    #[test]
+    fn shrink_with_a_self_target_rider_prunes_nothing() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P0, "Island");
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let own = scenario.add_creature(P0, "Own Wall", 1, 5).id();
+        let big = scenario.add_creature(P1, "Big", 1, 5).id();
+        let small = scenario.add_creature(P1, "Small", 1, 1).id();
+        let spell = scenario
+            .add_spell_to_hand(P0, "Shrink and Bounce", true)
+            .from_oracle_text(SHRINK_AND_BOUNCE_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            })
+            .id();
+        let mut state = scenario.build().state().clone();
+        assert!(
+            crate::cast_facts::collect_definition_effects(&state.objects[&spell].abilities[0])
+                .iter()
+                .any(|effect| is_deliberate_self_target_rider(effect)),
+            "reach-guard: the bounce rider parses as a self-target rider"
+        );
+        cast_issued(&mut state, spell);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        let verdicts = target_verdicts(&state);
+        for id in [own, big, small] {
+            assert_eq!(verdict_of(&verdicts, id), Some(None), "{id:?}");
+        }
+    }
+
+    /// Damage is the same class: Shock at its target prompt in the opponent's
+    /// main with an opposing 1/5 and 1/1 offered (and both players). The 2
+    /// damage kills only the 1/1 (CR 704.5g): the 1/5 is pruned; the 1/1 and
+    /// the players are kept.
+    #[test]
+    fn damage_target_prompt_prunes_the_survivor_while_a_kill_is_offered() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Red);
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P0, "Mountain");
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        let big = scenario.add_creature(P1, "Big", 1, 5).id();
+        let small = scenario.add_creature(P1, "Small", 1, 1).id();
+        let shock = scenario
+            .add_spell_to_hand(P0, "Shock", true)
+            .from_oracle_text(SHOCK_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            })
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        let mut state = state.clone();
+        cast_issued(&mut state, shock);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        let verdicts = target_verdicts(&state);
+        assert_eq!(verdict_of(&verdicts, big), Some(Some(TARGET_PRUNE)));
+        assert_eq!(verdict_of(&verdicts, small), Some(None));
+        let players_kept = candidate_actions(&state)
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.action,
+                    GameAction::ChooseTarget {
+                        target: Some(TargetRef::Player(_))
+                    }
+                )
+            })
+            .count();
+        assert_eq!(players_kept, 2, "reach-guard: both players are offered");
+    }
+
+    /// Judge row L4 on 60ae8209b: Last Gasp (-3/-3 until end of turn) at its
+    /// target prompt in the AI's precombat main, nothing open for P1, an
+    /// opposing 3/4 (survives at 0/1) and 1/1 (dies). The search scored the
+    /// survivor above the kill (8.21 against 6.12): the AI kills the 1/1.
+    #[test]
+    fn l4_gasp_kills_the_small_body_with_nothing_open() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..20 {
+            scenario.add_land_to_library_top(P0, "Island");
+        }
+        for _ in 0..25 {
+            scenario.add_land_to_library_top(P1, "Plains");
+        }
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+        let gasp = scenario
+            .add_spell_to_hand(P0, "Gasp", true)
+            .from_oracle_text(LAST_GASP_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 1,
+            })
+            .id();
+        let big = scenario.add_creature(P1, "Big Arbiter", 3, 4).id();
+        let small = scenario.add_creature(P1, "Small Illusion", 1, 1).id();
+        let mut state = scenario.build().state().clone();
+        cast_issued(&mut state, gasp);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        assert_eq!(chosen_target(&state), Some(small), "big {big:?}");
+        let verdicts = target_verdicts(&state);
+        assert_eq!(verdict_of(&verdicts, big), Some(Some(TARGET_PRUNE)));
+    }
 }
