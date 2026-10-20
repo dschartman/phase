@@ -3561,7 +3561,9 @@ fn score_candidates_core_for_root(
 
     // Score actions via search or heuristics
     if config.search.enabled {
-        let branching = config.search.max_branching as usize;
+        // Root beam width: `max_branching` unless the root-only override is set;
+        // interior nodes always read `max_branching` (planner `search_value_at`).
+        let branching = config.search.root_branching();
 
         // Target selection decisions are dominated by the tactical policy
         // (anti-self-harm) but benefit from limited search lookahead.
@@ -13922,7 +13924,7 @@ mod tests {
             &gated,
             &[],
             services,
-            services.config.search.max_branching as usize,
+            services.config.search.root_branching(),
         )
     }
 
