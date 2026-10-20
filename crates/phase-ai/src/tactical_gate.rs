@@ -12100,4 +12100,221 @@ mod tests {
             "a creature spell was judged by its activated ability"
         );
     }
+
+    // --- Round 2: stand-downs ahead of the creature-only check, life-loss
+    // drains, the mode prompt, and slots that name the caster's own permanents ---
+
+    const DESTROY_AND_DRAIN_ORACLE: &str =
+        "Destroy target creature. Death Drain deals 1 damage to each opponent.";
+    const SHRINK_AND_DRAIN_ORACLE: &str = "Target creature gets -2/-2 until end of turn. \
+        Withering Drain deals 1 damage to each opponent.";
+    const EXILE_AND_LOSE_LIFE_ORACLE: &str =
+        "Exile target creature or planeswalker. Each opponent loses 3 life.";
+    const SETTLE_BEYOND_REALITY_ORACLE: &str = "Choose one or both —\n\
+        • Exile target creature you don't control.\n\
+        • Exile target creature you control, then return it to the battlefield under its owner's control.";
+
+    /// CR 115.1a + CR 702.11b: Unsummon whose only legal target is the AI's own
+    /// creature because the opposing attacker has hexproof. Returning one's own
+    /// creature to hand is a deliberate play (a rescue), so the cast stays a
+    /// candidate; the creature-only check must not overrule that stand-down.
+    #[test]
+    fn own_only_bounce_behind_a_hexproof_attacker_stays_a_candidate() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        let attacker = scenario.add_creature(P1, "Shrouded Brute", 5, 5).id();
+        let unsummon = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Unsummon",
+                true,
+                "Return target creature to its owner's hand.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Hexproof);
+        set_priority_window(state, Phase::DeclareAttackers, P1);
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, P0)],
+            ..Default::default()
+        });
+        assert_ne!(gate_spell_cast(state, unsummon), GateDecision::Reject);
+    }
+
+    /// CR 120.3a + CR 704.5a: creature-only removal whose untargeted part is
+    /// lethal keeps the cast even with only the AI's own creature to aim at,
+    /// for destroy and for -2/-2. At 2 life the drain is not lethal and the
+    /// cast is rejected.
+    #[test]
+    fn creature_only_removal_with_a_lethal_drain_stays_a_candidate() {
+        for (name, oracle) in [
+            ("Death Drain", DESTROY_AND_DRAIN_ORACLE),
+            ("Withering Drain", SHRINK_AND_DRAIN_ORACLE),
+        ] {
+            let mut scenario = GameScenario::new();
+            scenario.add_creature(P0, "Our Bear", 2, 2);
+            scenario.with_life(P1, 1);
+            let spell = scenario
+                .add_spell_to_hand_from_oracle(P0, name, true, oracle)
+                .id();
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            set_priority_window(state, Phase::PreCombatMain, P0);
+            assert!(
+                spell_effect_kinds(state, spell).contains(&EffectKind::DamageEachPlayer),
+                "fixture: {name} parses with a drain to each opponent"
+            );
+            assert_ne!(
+                gate_spell_cast(state, spell),
+                GateDecision::Reject,
+                "{name} with a lethal drain was gated"
+            );
+            state.players[P1.0 as usize].life = 2;
+            assert_eq!(gate_spell_cast(state, spell), GateDecision::Reject);
+        }
+    }
+
+    /// CR 119.3 + CR 704.5a: "each opponent loses 3 life" is as lethal as 3
+    /// damage to an opponent at 3, so the cast is kept with only own targets;
+    /// at 4 life it is not lethal and the cast is rejected.
+    #[test]
+    fn own_target_removal_with_a_lethal_life_loss_stays_a_candidate() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        scenario.with_life(P1, 3);
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, "Exile and Drain", true, EXILE_AND_LOSE_LIFE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        assert!(
+            spell_effect_kinds(state, spell).contains(&EffectKind::LoseLife),
+            "fixture: parses with a life loss"
+        );
+        assert_ne!(gate_spell_cast(state, spell), GateDecision::Reject);
+        state.players[P1.0 as usize].life = 4;
+        assert_eq!(gate_spell_cast(state, spell), GateDecision::Reject);
+    }
+
+    /// CR 601.2b + CR 700.2a: once the spell is announced there is no later
+    /// window to wait for, so the mode prompt applies only the own-permanent
+    /// rule (and the counter reach), not the pump-window timing verdict. Icy
+    /// Reception in the opponent's precombat main, a creature spell of theirs
+    /// on the stack that they can pay {3} to keep, their 1/2 flier out: the
+    /// -5/-0 mode, which lasts through their combat, stays offered beside the
+    /// counter (seed 1021 shape).
+    #[test]
+    fn icy_reception_shrink_mode_stays_offered_at_the_mode_prompt() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Geist of Saint Thalia", 1, 2);
+        for _ in 0..3 {
+            scenario.add_basic_land(P1, engine::types::mana::ManaColor::Blue);
+        }
+        let icy = scenario
+            .add_spell_to_hand_from_oracle(P0, "Icy Reception", true, ICY_RECEPTION_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        fund_blue_black(state);
+        push_stack_spell(state, P1, "Fblthp, Impossibly Lost", CoreType::Creature);
+        assert_modal_with_modes(state, icy, 2);
+
+        let announced = announce_to_mode_choice(state, icy);
+        let kept = gated_actions(announced.state());
+        assert!(
+            kept.contains(&GameAction::SelectModes { indices: vec![0] }),
+            "the counter mode was pruned: {kept:?}"
+        );
+        assert!(
+            kept.contains(&GameAction::SelectModes { indices: vec![1] }),
+            "the -5/-0 mode was pruned at the prompt: {kept:?}"
+        );
+    }
+
+    /// CR 700.2a + CR 700.2d: Settle Beyond Reality, choose one or both. The
+    /// flicker mode aims at the AI's own creature on purpose, so at the prompt
+    /// it and the both-modes choice stay offered beside the exile mode.
+    #[test]
+    fn settle_beyond_reality_flicker_mode_stays_offered_at_the_mode_prompt() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P0, "Our Bear", 2, 2);
+        scenario.add_creature(P1, "Their Bear", 2, 2);
+        let settle = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Settle Beyond Reality",
+                false,
+                SETTLE_BEYOND_REALITY_ORACLE,
+            )
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        fund_blue_black(state);
+        assert_modal_with_modes(state, settle, 2);
+
+        let announced = announce_to_mode_choice(state, settle);
+        let issued: Vec<GameAction> = candidate_actions(announced.state())
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .collect();
+        let kept = gated_actions(announced.state());
+        for choice in [vec![0], vec![1], vec![0, 1]] {
+            let action = GameAction::SelectModes { indices: choice };
+            if issued.contains(&action) {
+                assert!(kept.contains(&action), "{action:?} was pruned: {kept:?}");
+            }
+        }
+        assert!(
+            issued.contains(&GameAction::SelectModes { indices: vec![1] }),
+            "reach-guard: the flicker mode is issued: {issued:?}"
+        );
+    }
+
+    /// CR 115.1a: a slot whose own filter names the caster's permanents ("target
+    /// land you control", "target permanent you control") is the card asking
+    /// for its own permanent, so it is not self-harm by mistake: Boom, Teferi's
+    /// Time Twist and Liberate shapes stay candidates.
+    #[test]
+    fn slots_that_name_the_casters_own_permanents_stay_candidates() {
+        let cases: [(&str, &str); 3] = [
+            (
+                "Boom",
+                "Destroy target land you control and target land you don't control.",
+            ),
+            (
+                "Teferi's Time Twist",
+                "Exile target permanent you control. Return that card to the battlefield under its owner's control at the beginning of the next end step.",
+            ),
+            (
+                "Liberate",
+                "Exile target creature you control. Return that card to the battlefield under its owner's control at the beginning of the next end step.",
+            ),
+        ];
+        for (name, oracle) in cases {
+            let mut scenario = GameScenario::new();
+            scenario.add_creature(P0, "Our Bear", 2, 2);
+            scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
+            scenario.add_basic_land(P1, engine::types::mana::ManaColor::Red);
+            let spell = scenario
+                .add_spell_to_hand_from_oracle(P0, name, true, oracle)
+                .id();
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            set_priority_window(state, Phase::PreCombatMain, P0);
+            assert_ne!(
+                gate_spell_cast(state, spell),
+                GateDecision::Reject,
+                "{name} was gated"
+            );
+        }
+    }
 }
