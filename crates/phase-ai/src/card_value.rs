@@ -68,8 +68,9 @@ use engine::game::mana_abilities::is_mana_ability;
 use engine::game::players;
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, CostCategory, Effect,
-    PtValue, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef,
+    CostCategory, DamageKindFilter, Effect, PlayerFilter, PtValue, QuantityExpr, ResolvedAbility,
+    TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition,
 };
 use engine::types::actions::GameAction;
 use engine::types::card::LayoutKind;
@@ -80,6 +81,7 @@ use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use crate::ability_chain::collect_chain_effects;
@@ -833,6 +835,12 @@ fn planeswalker_payoff(
 ///   reading).
 /// - **Every other trigger** once, with its sign ([`self_mill_cost`]).
 ///
+/// A trigger whose resolution removes the creature itself from the
+/// battlefield ([`removes_own_source`]) nets the body it removes, and a
+/// trigger whose event its controller does not decide alone
+/// ([`controller_decides`]) is priced at [`UNDECIDED_TRIGGER_SHARE`] of what
+/// it does ([`creature_trigger_payoff`]).
+///
 /// Optional parts (a "you may" trigger) are never below 0. Keywords are not
 /// priced. The leaf does not read this: [`permanent_card_credit`] credits no
 /// creature, and the board sum in `eval` credits its body.
@@ -844,17 +852,143 @@ fn creature_ability_payoff(state: &GameState, obj: &GameObject, draws: DrawPrici
         .map(|entry| &entry.definition)
         .filter(|trigger| !(on_battlefield && is_own_etb(trigger)))
         .filter_map(|trigger| trigger.execute.as_deref().map(|execute| (trigger, execute)))
-        .map(|(trigger, execute)| {
-            let payoff =
-                definition_payoff(state, obj, execute, draws) + self_mill_cost(state, obj, execute);
-            if trigger.optional || execute.optional {
-                payoff.max(0.0)
-            } else {
-                payoff
-            }
-        })
+        .map(|(trigger, execute)| creature_trigger_payoff(state, obj, trigger, execute, draws))
         .sum();
     activated_payoff(state, obj, draws) + prepare_spell_payoff(state, obj, draws) + triggers
+}
+
+/// One triggered ability of a creature, once (CR 603.2: it triggers when its
+/// event happens), with its sign ([`self_mill_cost`]):
+///
+/// - When its resolution removes the creature itself from the battlefield
+///   ([`removes_own_source`]: it is sacrificed, destroyed, bounced, exiled or
+///   shuffled away), the creature's body and pips ([`nested_value`]) are
+///   what it pays, netted from the payoff, never below 0: a trigger that only
+///   removes the creature (the one-shot attacker whose haste and evasion are
+///   not priced here) leaves the body as it was.
+/// - When its event is not one its controller decides alone
+///   ([`controller_decides`]), it is priced at [`UNDECIDED_TRIGGER_SHARE`] of
+///   that payoff: what it does happens only if the event does.
+///
+/// An optional trigger is never below 0.
+fn creature_trigger_payoff(
+    state: &GameState,
+    obj: &GameObject,
+    trigger: &TriggerDefinition,
+    execute: &AbilityDefinition,
+    draws: DrawPricing,
+) -> f64 {
+    let mut payoff =
+        definition_payoff(state, obj, execute, draws) + self_mill_cost(state, obj, execute);
+    if removes_own_source(execute) {
+        payoff = (payoff - nested_value(state, obj.id)).max(0.0);
+    }
+    if !controller_decides(trigger) {
+        payoff *= UNDECIDED_TRIGGER_SHARE;
+    }
+    if trigger.optional || execute.optional {
+        payoff.max(0.0)
+    } else {
+        payoff
+    }
+}
+
+/// The share of its payoff a creature's trigger keeps when its event is not
+/// one its controller decides alone ([`controller_decides`]): the chance the
+/// event happens. UNTUNED.
+pub(crate) const UNDECIDED_TRIGGER_SHARE: f64 = 0.5;
+
+/// Whether a trigger's event is one its controller brings about alone. Not
+/// when:
+///
+/// - it is combat damage (CR 120.2a; any damage mode read with
+///   `DamageKindFilter::CombatOnly`): the defending player's blocks (CR
+///   509.1) decide whether and where combat damage is dealt as much as the
+///   attack does;
+/// - its actor is an opponent's (CR 102.2): the object or player the event
+///   is about (`valid_card`, `valid_source`, `valid_subject_player`, and for
+///   a mode other than damage the acting player in `valid_target`, as "an
+///   opponent casts" and "an opponent draws" parse) names only an opponent's;
+/// - it can trigger only during an opponent's turn
+///   (`TriggerConstraint::OnlyDuringOpponentsTurn`), except a phase or step
+///   trigger: that step comes every turn.
+///
+/// Everything else is its controller's own act or a step that comes anyway
+/// (its own cast, its own creature entering, its own attack, an upkeep), and
+/// is priced as before.
+fn controller_decides(trigger: &TriggerDefinition) -> bool {
+    let damage_mode = matches!(
+        trigger.mode,
+        TriggerMode::DamageDone
+            | TriggerMode::DamageDoneOnce
+            | TriggerMode::DamageAll
+            | TriggerMode::DamageDealtOnce
+            | TriggerMode::DamageDoneOnceByController
+            | TriggerMode::DamageReceived
+            | TriggerMode::ExcessDamage
+            | TriggerMode::ExcessDamageAll
+    );
+    if damage_mode && trigger.damage_kind == DamageKindFilter::CombatOnly {
+        return false;
+    }
+    let actor = [
+        trigger.valid_card.as_ref(),
+        trigger.valid_source.as_ref(),
+        trigger.valid_subject_player.as_ref(),
+        trigger.valid_target.as_ref().filter(|_| !damage_mode),
+    ];
+    if actor.into_iter().flatten().any(filter_names_only_opponents) {
+        return false;
+    }
+    !(trigger.constraint == Some(TriggerConstraint::OnlyDuringOpponentsTurn)
+        && trigger.mode != TriggerMode::Phase)
+}
+
+/// CR 102.2: whether `filter` admits only opponents or what opponents
+/// control.
+fn filter_names_only_opponents(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Opponent => true,
+        TargetFilter::Typed(typed) => matches!(
+            typed.controller,
+            Some(ControllerRef::Opponent | ControllerRef::TargetOpponent)
+        ),
+        TargetFilter::And { filters } => filters.iter().any(filter_names_only_opponents),
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(filter_names_only_opponents)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an ability's resolution, as [`definition_payoff`] reads it
+/// ([`priced_effects`]), moves its own source off the battlefield: CR
+/// 701.21a sacrifice, CR 701.8a destroy, a return to hand, or a move from
+/// the battlefield to any other zone (an exile, a shuffle into a library).
+fn removes_own_source(ability: &AbilityDefinition) -> bool {
+    priced_effects(ability)
+        .into_iter()
+        .any(|effect| match effect {
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+            | Effect::Destroy {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+            | Effect::Bounce {
+                target: TargetFilter::SelfRef,
+                ..
+            } => true,
+            Effect::ChangeZone {
+                origin: None | Some(Zone::Battlefield),
+                destination,
+                target: TargetFilter::SelfRef,
+                ..
+            } => *destination != Zone::Battlefield,
+            _ => false,
+        })
 }
 
 /// CR 602.1: a creature's activated abilities, each priced once at its
@@ -1116,7 +1250,15 @@ fn definition_payoff(
             .map(|mode| definition_payoff(state, obj, mode, draws))
             .fold(0.0, f64::max);
     }
-    let effects = effects_cast_from(ability, Zone::Hand).unwrap_or_else(|| {
+    let effects = priced_effects(ability);
+    chain_payoff(state, obj, &effects, draws, performers(state, obj, ability))
+}
+
+/// The effects of a non-modal ability [`definition_payoff`] prices: those it
+/// performs as cast from hand, or for any other branch shape the
+/// unconditional links of its chain.
+fn priced_effects(ability: &AbilityDefinition) -> Vec<&Effect> {
+    effects_cast_from(ability, Zone::Hand).unwrap_or_else(|| {
         let mut effects = Vec::new();
         let mut next = Some(ability);
         while let Some(node) = next {
@@ -1126,19 +1268,61 @@ fn definition_payoff(
             next = node.sub_ability.as_deref();
         }
         effects
-    });
-    chain_payoff(state, obj, &effects, draws)
+    })
+}
+
+/// Who performs a chain's draws and discards (`TargetFilter::Controller`
+/// links).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Performers {
+    /// Its controller, once.
+    Controller,
+    /// CR 608.2c + CR 115.10: "each player" / "each opponent" (the root's
+    /// `player_scope`): each of `players` performs the chain in turn, as its
+    /// "you". `each_may`: each decides for themself whether to (CR 101.4,
+    /// "each player may").
+    Each {
+        players: Vec<PlayerId>,
+        each_may: bool,
+    },
+}
+
+/// The [`Performers`] of `ability`: every living player for
+/// `PlayerFilter::All`, the opponents of its controller for
+/// `PlayerFilter::Opponent`; any other scope, or none, its controller.
+fn performers(state: &GameState, obj: &GameObject, ability: &AbilityDefinition) -> Performers {
+    let players = match ability.player_scope {
+        Some(PlayerFilter::All) => state
+            .seat_order
+            .iter()
+            .copied()
+            .filter(|&player| players::is_alive(state, player))
+            .collect(),
+        Some(PlayerFilter::Opponent) => players::opponents(state, obj.controller),
+        _ => return Performers::Controller,
+    };
+    Performers::Each {
+        players,
+        each_may: ability.optional,
+    }
 }
 
 /// The payoff of one resolving chain. Removal and tokens add up effect by
 /// effect. Cards drawn are netted against cards the same chain makes its
 /// controller discard (CR 121.1, CR 701.9a: "draw two cards, then discard a
 /// card" nets one) and each net card is one expected draw.
+///
+/// Performed by each of several players ([`Performers::Each`]), the draws and
+/// discards are netted per player ([`player_refill`]): the cards the
+/// controller gains are its gain, and the cards each opponent gains its loss,
+/// both at the controller's expected draw (an opposing card is priced as our
+/// own, as `answer_value` prices one we remove). The net can be below 0.
 fn chain_payoff(
     state: &GameState,
     obj: &GameObject,
     effects: &[&Effect],
     draws: DrawPricing,
+    performers: Performers,
 ) -> f64 {
     let quantity =
         |count: &QuantityExpr| resolve_quantity(state, count, obj.controller, obj.id).max(0);
@@ -1159,11 +1343,80 @@ fn chain_payoff(
             _ => payoff += effect_payoff(state, obj, effect, draws),
         }
     }
-    let net = (drawn - discarded).max(0);
-    if net > 0 && draws == DrawPricing::LibraryMean {
+    let net = match performers {
+        Performers::Controller => (drawn - discarded).max(0),
+        Performers::Each { players, each_may } => players
+            .into_iter()
+            .map(|player| {
+                let refill = player_refill(state, obj, effects, player, each_may);
+                if player == obj.controller {
+                    refill
+                } else {
+                    -refill
+                }
+            })
+            .sum(),
+    };
+    if net != 0 && draws == DrawPricing::LibraryMean {
         payoff += f64::from(net) * draw_unit(state, obj.owner);
     }
     payoff
+}
+
+/// The cards `player` gains performing a chain's draws and discards as its
+/// "you" (CR 608.2c), in chain order, never below 0:
+///
+/// - its hand is the hand it holds when the chain resolves, so without the
+///   card being priced while that card is in `player`'s hand (it is cast, or
+///   for a prepare spell its creature is cast, before the chain resolves);
+///   a discard takes at most the cards in hand (CR 701.9a), a draw adds to
+///   it (CR 121.1);
+/// - when each player may (`each_may`, CR 101.4), `player` performs it only
+///   when it gains cards and its library holds every card it would draw:
+///   drawing from an empty library loses the game (CR 121.4 + CR 704.5b).
+fn player_refill(
+    state: &GameState,
+    obj: &GameObject,
+    effects: &[&Effect],
+    player: PlayerId,
+    each_may: bool,
+) -> i32 {
+    let Some(seat) = state.players.iter().find(|p| p.id == player) else {
+        return 0;
+    };
+    let mut hand = seat.hand.len() as i32 - i32::from(seat.hand.contains(&obj.id));
+    let quantity = |count: &QuantityExpr| resolve_quantity(state, count, player, obj.id).max(0);
+    let mut drawn = 0;
+    let mut discarded = 0;
+    for effect in effects {
+        match effect {
+            Effect::Draw {
+                count,
+                target: TargetFilter::Controller,
+            } => {
+                let cards = quantity(count);
+                drawn += cards;
+                hand += cards;
+            }
+            Effect::Discard {
+                count,
+                target: TargetFilter::Controller,
+                ..
+            } => {
+                let cards = quantity(count).min(hand.max(0));
+                discarded += cards;
+                hand -= cards;
+            }
+            _ => {}
+        }
+    }
+    let gained = drawn - discarded;
+    let declines = gained <= 0 || seat.library.len() < drawn as usize;
+    if each_may && declines {
+        0
+    } else {
+        gained.max(0)
+    }
 }
 
 /// One effect other than a draw or a discard, on the creature scale:
