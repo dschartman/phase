@@ -13,6 +13,7 @@ pub mod effect_classify_snapshot;
 pub mod enchantments_payoff;
 pub mod energy_payoff;
 pub mod equipment_payoff;
+pub mod flashback_keep_value;
 pub mod graveyard_types;
 pub mod lifegain_payoff;
 pub mod mill_payoff;
