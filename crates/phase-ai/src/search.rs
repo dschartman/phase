@@ -42,6 +42,7 @@ use crate::combat_ai::{
 };
 use crate::config::{AiConfig, PlannerMode, ThreatAwareness};
 use crate::context::AiContext;
+use crate::decision_receipt::SearchRungUse;
 use crate::features::DeckFeatures;
 use crate::plan::{PlanSnapshot, PlanState};
 use crate::planner::{
@@ -532,6 +533,7 @@ fn choose_action_with_session_inner(
         }
     }
 
+    let mut search_rungs = Vec::new();
     let mut scored = score_candidates_for_root(
         state,
         ai_player,
@@ -541,6 +543,7 @@ fn choose_action_with_session_inner(
             contract: &contract,
             priority_shortcut,
         },
+        &mut search_rungs,
     );
     if durable_pact_routes {
         draft_pact_routes_for_scored_actions(state, ai_player, &scored, session);
@@ -582,13 +585,15 @@ fn choose_action_with_session_inner(
         receipt: diagnostics
             .then(|| {
                 action.as_ref().map(|selected| {
-                    crate::decision_receipt::ranked_receipt(
+                    let mut receipt = crate::decision_receipt::ranked_receipt(
                         &contract,
                         &scored,
                         selected_index,
                         config.temperature,
                         selected.clone(),
-                    )
+                    );
+                    receipt.search_rungs = search_rungs;
+                    receipt
                 })
             })
             .flatten(),
@@ -2680,7 +2685,14 @@ pub(crate) fn score_candidates_with_session(
     config: &AiConfig,
     session: &Arc<AiSession>,
 ) -> Vec<(GameAction, f64)> {
-    score_candidates_for_root(state, ai_player, config, session, RootReuse::Fresh)
+    score_candidates_for_root(
+        state,
+        ai_player,
+        config,
+        session,
+        RootReuse::Fresh,
+        &mut Vec::new(),
+    )
 }
 
 /// Whether the chooser already knows the priority shortcut is unavailable at
@@ -2727,24 +2739,42 @@ thread_local! {
 
 /// [`score_candidates_with_session`] with the caller's knowledge of the root.
 /// `root` is forwarded only to the searches that run on `state` itself; every
-/// determinized sample is a different state and is scored `Fresh`.
+/// determinized sample is a different state and is scored `Fresh`. Each root
+/// search that runs pushes the rung its scores came from onto `search_rungs`.
 fn score_candidates_for_root(
     state: &GameState,
     ai_player: PlayerId,
     config: &AiConfig,
     session: &Arc<AiSession>,
     root: RootReuse<'_>,
+    search_rungs: &mut Vec<SearchRungUse>,
 ) -> Vec<(GameAction, f64)> {
     // Attacker declarations are public-state tactical choices. Running K hidden
     // information samples cannot improve them, but would multiply the bounded
     // multiplayer comparison and make a singleton support drift.
     if matches!(state.waiting_for, WaitingFor::DeclareAttackers { .. }) {
-        return score_candidates_core_for_root(state, ai_player, config, session, None, root);
+        return score_candidates_core_for_root(
+            state,
+            ai_player,
+            config,
+            session,
+            None,
+            root,
+            search_rungs,
+        );
     }
     let k = config.search.determinization_samples;
     if k == 0 {
         // Unchanged path: no determinization, no shared-deadline override.
-        return score_candidates_core_for_root(state, ai_player, config, session, None, root);
+        return score_candidates_core_for_root(
+            state,
+            ai_player,
+            config,
+            session,
+            None,
+            root,
+            search_rungs,
+        );
     }
 
     // ONE shared wall-clock ceiling across all K sequential samples (bounds
@@ -2783,7 +2813,15 @@ fn score_candidates_for_root(
         let seed = base_seed.wrapping_add(crate::determinize::splitmix64(i as u64));
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let sampled = crate::determinize::determinize_opponents(state, ai_player, &mut rng);
-        let scored = score_candidates_core(&sampled, ai_player, config, session, Some(deadline));
+        let scored = score_candidates_core_for_root(
+            &sampled,
+            ai_player,
+            config,
+            session,
+            Some(deadline),
+            RootReuse::Fresh,
+            search_rungs,
+        );
         merge_into(&mut acc, &mut positions, &mut counts, scored);
     }
     let mut out = finalize_mean(acc, counts, k as usize);
@@ -3410,6 +3448,9 @@ fn retain_live_pact_route(state: &GameState, ai_player: PlayerId, session: &Arc<
 /// the pre-feature `score_candidates_with_session` except it threads a shared
 /// `deadline_override` into `PlannerServices` — `None` reproduces the old
 /// behavior exactly. Derives the root contract and priority shortcut itself.
+/// Test entry point; the determinized samples call
+/// [`score_candidates_core_for_root`] to collect each sample's rung.
+#[cfg(test)]
 fn score_candidates_core(
     state: &GameState,
     ai_player: PlayerId,
@@ -3424,6 +3465,7 @@ fn score_candidates_core(
         session,
         deadline_override,
         RootReuse::Fresh,
+        &mut Vec::new(),
     )
 }
 
@@ -3449,7 +3491,8 @@ fn root_issued_candidates(
 /// [`score_candidates_core`] with the caller's knowledge of the root. Under
 /// [`RootReuse::FromChooser`] the contract's candidates stand in for a second
 /// contract issue, and a priority shortcut the chooser found absent is not run
-/// again; everything else is identical to the `Fresh` path.
+/// again; everything else is identical to the `Fresh` path. When the root
+/// search runs, the rung its scores came from is pushed onto `search_rungs`.
 fn score_candidates_core_for_root(
     state: &GameState,
     ai_player: PlayerId,
@@ -3457,6 +3500,7 @@ fn score_candidates_core_for_root(
     session: &Arc<AiSession>,
     deadline_override: Option<engine::util::Deadline>,
     root: RootReuse<'_>,
+    search_rungs: &mut Vec<SearchRungUse>,
 ) -> Vec<(GameAction, f64)> {
     // The scored/parallel-worker path bypasses `choose_action_with_session_inner`.
     // Preserve Resolve All's user-proposed shortcut semantics here as well: Grant
@@ -3649,7 +3693,9 @@ fn score_candidates_core_for_root(
             branching,
         );
 
-        run_iterative_deepening(state, ranked, tactical_weight, config, &mut services)
+        let scored = run_iterative_deepening(state, ranked, tactical_weight, config, &mut services);
+        search_rungs.push(SearchRungUse::from_rung_stats(&services.rung_stats));
+        scored
     } else {
         // Heuristic-only scoring
         let mut out: Vec<_> = gated
@@ -3731,12 +3777,21 @@ fn run_iterative_deepening(
 
         let mut rung_scored = Vec::with_capacity(ranked.len());
         let mut completed = true;
+        let mut ran_out_of_nodes = false;
         for r in &ranked {
             // Rungs >= 1 may bail mid-rung (interior search is expensive) and
             // discard the partial. Rung 0 is cheap (branching quiesced evals)
             // and runs atomically once entered, so it is never left partial.
             if iter_depth > 0 && services.deadline.expired() {
                 completed = false;
+                break;
+            }
+            // The root siblings share this rung's node budget. Once it is
+            // spent, every sibling still to come would return its quiesced
+            // static value (`search_value_at`): stop, the rung is partial.
+            if iter_depth > 0 && budget.nodes_spent() {
+                completed = false;
+                ran_out_of_nodes = true;
                 break;
             }
             let score = if let Some((child, sim)) = services.successor_edge(
@@ -3759,14 +3814,21 @@ fn run_iterative_deepening(
             rung_scored.push((r.candidate.action.clone(), score));
         }
 
+        // A node cut off by the node count anywhere in the rung, the last
+        // sibling included, scored part of the rung at a shallower depth.
+        // Every sibling a decision compares is scored at one depth, so a rung
+        // whose node budget ran out before its last sibling finished does not
+        // count, as on the deadline below, and the deepest rung every sibling
+        // completed decides. No node is spent beyond the budget, and a rung
+        // that spends exactly its `max_nodes` with no node cut off counts.
+        ran_out_of_nodes |= budget.cut_off();
         // "Fully completed" also requires the deadline to be live after the
         // LAST candidate: expiry mid-final-evaluation is invisible to the
         // per-candidate entry check and would accept a rung whose tail score
         // was truncated. Rung 0 stays exempt (atomic once entered — it is the
-        // no-regression floor, == origin/main's deadline collapse). Node-budget
-        // exhaustion deliberately does NOT discard: the deepest rung consuming
-        // its full `max_nodes` reproduces origin/main's single fixed-depth pass.
-        let accepted = completed && (iter_depth == 0 || !services.deadline.expired());
+        // no-regression floor, == origin/main's deadline collapse).
+        let accepted =
+            completed && !ran_out_of_nodes && (iter_depth == 0 || !services.deadline.expired());
 
         // D3: one witness per executed rung (completion + node headroom). A
         // pre-expired deadline breaks at the entry guard above, so zero rungs
@@ -3774,6 +3836,7 @@ fn run_iterative_deepening(
         services.rung_stats.push(RungStat {
             depth: iter_depth,
             completed: accepted,
+            ran_out_of_nodes,
             nodes_used: budget.nodes_evaluated,
             max_nodes: budget.max_nodes,
         });
@@ -3819,8 +3882,10 @@ fn run_iterative_deepening(
 /// Budget-allocation policy, not alpha-beta: root siblings share one per-rung
 /// `SearchBudget` (constructed once per rung in `run_iterative_deepening`) and
 /// each opens a fresh `(-inf, +inf)` window, so PV-first spends the shared pool
-/// on the strongest known candidate before the tail starves — no alpha carries
-/// between root siblings.
+/// on the strongest known candidate first — no alpha carries between root
+/// siblings. A rung whose pool runs out before its last sibling finishes is
+/// discarded (`run_iterative_deepening`), so the order changes which siblings
+/// were searched before the pool ran out, never a score that is returned.
 ///
 /// NaN-safe: `unwrap_or(Equal)` defers to the `cmp_stable` total order so ties
 /// and non-finite scores resolve deterministically, never a bare
@@ -14504,6 +14569,40 @@ mod tests {
         }
     }
 
+    // PR4: the diagnostic receipt carries, per root search, the rung its scores
+    // came from and whether a deeper rung ran out of nodes and was discarded.
+    #[test]
+    fn partial_rung_receipt_names_the_rung_used_and_the_discard() {
+        use crate::decision_receipt::SearchRungUse;
+        let mut state = starvation_state();
+        crate::test_support::stock_libraries(&mut state, 20);
+        let session = AiSession::arc_from_game(&state);
+        let receipt_rungs = |max_nodes: u32| {
+            let mut config =
+                create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+            config.search.max_depth = 3; // ceiling 2
+            config.search.max_nodes = max_nodes;
+            config.search.determinization_samples = 0; // one root search
+            let mut rng = SmallRng::seed_from_u64(7);
+            choose_action_with_session_diagnostic(&state, PlayerId(0), &config, &mut rng, &session)
+                .receipt
+                .expect("a ranked decision has a receipt")
+                .search_rungs
+        };
+        assert_eq!(
+            receipt_rungs(64),
+            vec![SearchRungUse {
+                rung: Some(2),
+                discarded_partial: false,
+            }],
+            "every rung completes: rung 2, nothing discarded"
+        );
+        let tight = receipt_rungs(4);
+        assert_eq!(tight.len(), 1, "{tight:?}");
+        assert!(tight[0].discarded_partial, "{tight:?}");
+        assert!(tight[0].rung.is_some_and(|rung| rung < 2), "{tight:?}");
+    }
+
     // V6 hostile (pre-expired): an already-expired interactive deadline breaks at
     // the rung-entry guard before any candidate loop runs, so zero rungs execute
     // and the witness list is empty — the honest "no search happened" trace (and
@@ -14563,8 +14662,12 @@ mod tests {
     // candidate. Budget-starvation fixture: a tight node cap means the first-
     // searched root subtree drains the pool. With the rotate, the PV candidate B
     // is searched FIRST at rung 2, so its rung-2 score equals its independent
-    // full-depth continuation (computed on FRESH services). Reverting the rotate
-    // makes A drain the pool first and B collapse toward quiesced eval.
+    // full-depth continuation (computed on FRESH services). Before
+    // spec-ai-search-partial-rung-2026-10-20, reverting the rotate made A drain
+    // the pool first and B collapse toward quiesced eval; now that rung runs
+    // out before its last sibling and is discarded, and B's rung-1 score here
+    // equals its depth-2 value, so this row no longer fails on a reverted
+    // rotate.
     #[test]
     fn pv_rotate_gives_pv_candidate_full_depth_under_starvation() {
         let mut state = starvation_state();
@@ -18476,6 +18579,7 @@ one on the bottom of your library.";
                 contract: &contract,
                 priority_shortcut: RootPriorityShortcut::Recompute,
             },
+            &mut Vec::new(),
         );
         assert_eq!(root_witnesses(), (0, 1));
         assert_eq!(score_bits(&recomputed), score_bits(&direct));
@@ -18500,6 +18604,7 @@ one on the bottom of your library.";
                     &config,
                     &session,
                     root,
+                    &mut Vec::new(),
                 ))
             };
             let fresh = score(RootReuse::Fresh);
