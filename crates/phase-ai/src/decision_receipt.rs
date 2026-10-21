@@ -20,6 +20,39 @@ pub struct AiDecisionDiagnosticReceipt {
     /// policy chose the action without a scored candidate distribution.
     pub sampling_temperature: Option<f64>,
     pub candidates: Vec<AiDecisionDiagnosticCandidate>,
+    /// One entry per root search behind the scores (one per determinized
+    /// world), empty when no search ran. Local diagnostics only: not part of
+    /// the serialized receipt the client reads.
+    #[serde(skip)]
+    pub search_rungs: Vec<SearchRungUse>,
+}
+
+/// Which iterative-deepening rung a root search's scores came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchRungUse {
+    /// Depth of the deepest rung every root sibling completed, whose scores
+    /// were returned; `None` when no rung ran (the deadline had expired) and
+    /// the tactical floor was returned.
+    pub rung: Option<u32>,
+    /// A deeper rung ran out of nodes before its last root sibling finished
+    /// and was discarded.
+    pub discarded_partial: bool,
+}
+
+impl SearchRungUse {
+    /// Read from the per-rung witnesses of one `run_iterative_deepening` call.
+    pub fn from_rung_stats(rung_stats: &[crate::planner::RungStat]) -> Self {
+        Self {
+            rung: rung_stats
+                .iter()
+                .rev()
+                .find(|stat| stat.completed)
+                .map(|stat| stat.depth),
+            discarded_partial: rung_stats
+                .iter()
+                .any(|stat| !stat.completed && stat.ran_out_of_nodes),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -144,6 +177,7 @@ pub fn ranked_receipt(
         status: AiDecisionReceiptStatus::Ranked,
         selection_explanation,
         sampling_temperature: finite(temperature),
+        search_rungs: Vec::new(),
         candidates: scored
             .iter()
             .enumerate()
@@ -177,6 +211,7 @@ pub fn direct_receipt(
         selection_explanation:
             "A direct AI policy selected this action; no scored distribution was used.".to_string(),
         sampling_temperature: None,
+        search_rungs: Vec::new(),
         candidates: contract
             .candidates
             .iter()

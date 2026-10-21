@@ -229,6 +229,9 @@ pub struct SearchBudget {
     pub max_nodes: u32,
     pub nodes_evaluated: u32,
     deadline: engine::util::Deadline,
+    /// A searched node was cut off: it returned its quiesced static value
+    /// because the node count had reached `max_nodes`.
+    cut_off: bool,
 }
 
 impl SearchBudget {
@@ -237,6 +240,7 @@ impl SearchBudget {
             max_nodes,
             nodes_evaluated: 0,
             deadline: engine::util::Deadline::none(),
+            cut_off: false,
         }
     }
 
@@ -256,11 +260,28 @@ impl SearchBudget {
             max_nodes,
             nodes_evaluated: 0,
             deadline,
+            cut_off: false,
         }
     }
 
     pub fn exhausted(&self) -> bool {
-        self.nodes_evaluated >= self.max_nodes || self.deadline.expired()
+        self.nodes_spent() || self.deadline.expired()
+    }
+
+    /// Whether the node count alone has reached `max_nodes`. From here on a
+    /// searched node returns its quiesced static value
+    /// (`BeamContinuationPlanner::search_value_at`), so a root sibling entered
+    /// now would be scored at a shallower depth than the siblings before it.
+    pub fn nodes_spent(&self) -> bool {
+        self.nodes_evaluated >= self.max_nodes
+    }
+
+    /// Whether a searched node has been cut off by the node count: scored at
+    /// its quiesced static value instead of searched to its remaining depth.
+    /// The deadline does not set it; a rung the deadline cuts is discarded on
+    /// its own path.
+    pub fn cut_off(&self) -> bool {
+        self.cut_off
     }
 
     pub fn tick(&mut self) {
@@ -574,6 +595,10 @@ const MAX_KILLER_PLY: usize = 8;
 pub struct RungStat {
     pub depth: u32,
     pub completed: bool,
+    /// The rung's node budget ran out before its last root sibling finished
+    /// (a searched node was cut off, or a sibling was left with no nodes), so
+    /// the rung was discarded (`completed` is false).
+    pub ran_out_of_nodes: bool,
     pub nodes_used: u32,
     pub max_nodes: u32,
 }
@@ -2147,7 +2172,11 @@ impl BeamContinuationPlanner {
         // window over one is this node, its pass searched at this depth.
         let (node, own_resolved, stop) = services.resolve_own_triggers_at(node, state);
         let state = own_resolved.state();
-        if budget.exhausted() || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
+        let game_over = matches!(state.waiting_for, WaitingFor::GameOver { .. });
+        if budget.exhausted() || game_over {
+            // A live position left unsearched by the node count is a cut-off
+            // (`SearchBudget::cut_off`); a finished game's value is exact.
+            budget.cut_off |= !game_over && budget.nodes_spent();
             return services.evaluate_state_quiesced_at(node, state);
         }
 
