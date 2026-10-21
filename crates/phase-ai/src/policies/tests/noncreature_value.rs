@@ -507,8 +507,11 @@ fn creature_and_land_values_are_unchanged() {
     let state = table.state();
     assert_eq!(value(&state, three_drop), 8.0);
     assert_eq!(value(&state, land), 3.0);
-    // 1.5 * 2 + 2 + 0.5 * 5: the creature formula, its enters trigger unread.
-    assert_eq!(value(&state, etb_removal), 7.5);
+    // 1.5 * 2 + 2 + 0.5 * 5 = 7.5, the creature formula, plus its enters
+    // trigger on the current board: it destroys the opposing 3/3 (9.0).
+    // Re-pinned from 7.5 (its enters trigger unread) by
+    // spec-ai-creature-ability-pricing (creature_ability_value.rs).
+    assert_eq!(value(&state, etb_removal), 16.5);
 }
 
 // --- the sites read the same order ----------------------------------------

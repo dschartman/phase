@@ -5,6 +5,7 @@ pub mod activation_patience_repro;
 pub mod artifact_synergy;
 pub mod blink_payoff;
 pub mod cost_reduction;
+pub mod creature_ability_value;
 pub mod devotion;
 pub mod discard_cost_price;
 pub mod discard_payoff;
