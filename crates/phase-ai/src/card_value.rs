@@ -131,7 +131,8 @@ pub(crate) enum ManaRole {
 /// declaration order below IS the specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum KeepTier {
-    /// A mana source held while the plan says the player is already flooded.
+    /// A land held past the plan's land target (CR 305.2: one land a turn).
+    /// Lands only: a nonland mana source past the mana target is `Ordinary`.
     Surplus,
     /// Everything else. Also the tier for every card when no plan authority
     /// exists, and for every mana source while exactly on curve. When all cards
@@ -190,8 +191,10 @@ pub(crate) fn mana_role(state: &GameState, obj_id: ObjectId) -> ManaRole {
 /// gate (`policies::sacrifice_cost_mana_gate`).
 /// A mana source is promoted only while the plan says the player is behind on
 /// **its own** development axis — the land schedule for a land, the mana
-/// schedule for an accelerant (see [`ManaRole`]) — and demoted only while that
-/// axis says they are past it. On curve — and whenever no plan authority exists
+/// schedule for an accelerant (see [`ManaRole`]) — and a land is demoted to
+/// `Surplus` only while the land schedule says the player is past it; an
+/// accelerant past the mana target keeps the tier its other value earns,
+/// `Ordinary` (a mana creature's body, a rock's other abilities). On curve — and whenever no plan authority exists
 /// — every card is `Ordinary`, which reproduces the pure-intrinsic ordering
 /// exactly.
 ///
@@ -215,8 +218,13 @@ pub(crate) fn keep_tier(state: &GameState, obj_id: ObjectId, plan: Option<PlanSt
             KeepTier::Ordinary
         }
         Some(Ordering::Greater) => KeepTier::NeededManaSource,
-        Some(Ordering::Less) => KeepTier::Surplus,
-        Some(Ordering::Equal) | None => KeepTier::Ordinary,
+        // CR 305.2: only a land is played as a land, one a turn, so only a
+        // land past the land target adds nothing the plan wants. An
+        // accelerant past the mana target is a card with a body or an
+        // effect: its mana role adds nothing there, and it keeps the tier
+        // its other value earns.
+        Some(Ordering::Less) if role == ManaRole::LandDrop => KeepTier::Surplus,
+        Some(Ordering::Less) | Some(Ordering::Equal) | None => KeepTier::Ordinary,
     }
 }
 
@@ -600,7 +608,7 @@ pub(crate) const KEEP_VALUE_FLOOR: f64 = 0.1;
 ///   card. A land scores 3.0 on the scalar, so only this test can bin one; per
 ///   CR 305.2 a player normally plays one land a turn, and past the plan's land
 ///   target another land is surplus. An accelerant past the mana target is
-///   excess the same way.
+///   not (its mana role adds nothing there; its other value is read).
 ///
 /// `plan == None` (no plan authority, as on the rollout path) leaves every card
 /// `Ordinary`, so the scalar alone decides.
