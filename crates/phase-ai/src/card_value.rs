@@ -2239,9 +2239,17 @@ mod tests {
                     "a land must read lands_behind ({lands_behind}), not \
                      mana_behind ({mana_behind})"
                 );
+                // Past the mana target an accelerant is Ordinary, not
+                // Surplus: Surplus is for lands only (it was Surplus before
+                // the 2026-10-21 ruling; its mana role adds nothing there and
+                // its other value keeps its tier).
+                let rock_tier = match tier_of(mana_behind) {
+                    KeepTier::Surplus => KeepTier::Ordinary,
+                    tier => tier,
+                };
                 assert_eq!(
                     keep_tier(&state, rock, plan),
-                    tier_of(mana_behind),
+                    rock_tier,
                     "an accelerant must read mana_behind ({mana_behind}), not \
                      lands_behind ({lands_behind})"
                 );
@@ -2257,6 +2265,32 @@ mod tests {
         for id in [land, rock, plain] {
             assert_eq!(keep_tier(&state, id, None), KeepTier::Ordinary);
         }
+    }
+
+    /// CR 305.2: only a land is played as a land, one a turn, so only a land
+    /// past the plan's land target is `Surplus`. A mana creature (a 0/1 with
+    /// "{T}: Add {B}") reads the mana schedule: below the mana target it is
+    /// `NeededManaSource`; past it, its mana role adds nothing and it keeps
+    /// the tier its body earns, `Ordinary`, with its intrinsic value as the
+    /// scalar. A land past its target is still `Surplus` on the same plan.
+    #[test]
+    fn a_mana_creature_is_needed_below_the_mana_target_and_ordinary_past_it() {
+        let mut state = GameState::new_two_player(7);
+        let dork = rock_card(&mut state);
+        {
+            let obj = state.objects.get_mut(&dork).unwrap();
+            obj.card_types.core_types = vec![CoreType::Creature];
+            obj.power = Some(0);
+            obj.toughness = Some(1);
+        }
+        let land = land_card(&mut state);
+        assert_eq!(mana_role(&state, dork), ManaRole::Accelerant);
+        assert_eq!(
+            keep_tier(&state, dork, behind(-3, 2)),
+            KeepTier::NeededManaSource
+        );
+        assert_eq!(keep_tier(&state, dork, behind(-3, -3)), KeepTier::Ordinary);
+        assert_eq!(keep_tier(&state, land, behind(-3, -3)), KeepTier::Surplus);
     }
 
     #[test]

@@ -15177,6 +15177,45 @@ mod tests {
         assert_ne!(chosen, junk);
     }
 
+    /// CR 514.1 + CR 305.2: the cleanup discard at nine lands (default plan,
+    /// land target 6) with a surplus Swamp and a 0/1 mana creature ("{T}: Add
+    /// {B}", {B}, intrinsic 1.5 under the land's 3.0) in hand. Only a land is
+    /// `Surplus` past its target (2026-10-21 ruling, after the J2 row on
+    /// dd79de333): the creature keeps the tier its body earns, so the Swamp
+    /// SHALL be given up. Before, both read Surplus and the cheaper creature
+    /// went.
+    #[test]
+    fn discard_to_hand_size_pitches_a_surplus_land_before_a_mana_creature() {
+        let mut state = commander_discard_state();
+        let ai = PlayerId(0);
+        for _ in 0..9 {
+            land_on_battlefield(&mut state, ai);
+        }
+        let swamp = land_in_hand(&mut state, ai);
+        let dork = named_vanilla_in_hand(&mut state, ai, "Mana Dork");
+        {
+            let obj = state.objects.get_mut(&dork).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(0);
+            obj.toughness = Some(1);
+        }
+        set_cost(&mut state, dork, vec![ManaCostShard::Black], 0);
+        push_mana_ability(&mut state, dork);
+        for _ in 0..2 {
+            fatty_in_hand(&mut state, ai);
+        }
+        state.waiting_for = discard_waiting_for(&state, ai, 1);
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let chosen = selected_card(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+
+        assert_eq!(
+            chosen, swamp,
+            "the surplus Swamp goes, not the mana creature"
+        );
+    }
+
     /// A mana rock on `player`'s battlefield — an artifact carrying a
     /// renewable `{T}: Add {B}` ability, so `zone_eval::is_intrinsic_mana_source`
     /// counts it toward `mana_behind` while `plan::controlled_lands` ignores it.

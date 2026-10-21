@@ -401,7 +401,11 @@ fn j1_lethal_graveyard_cast_is_not_given_up_for_a_surplus_land() {
 /// J2 (judge, 754e28a81 B2): the surplus mana source in hand is a 4/4
 /// creature with a mana ability (an accelerant past the mana target), not a
 /// land. The surplus-land reading is for lands; the 4/4 SHALL NOT be given up
-/// in place of Twinned Vision.
+/// in place of Twinned Vision. With the hand credit the leaf ties the two
+/// (pitching either loses one hand card), so the keep order decides: a mana
+/// creature past the mana target keeps the tier its body earns
+/// (`KeepTier::Surplus` is for lands only), and Twinned Vision SHALL be given
+/// up.
 #[test]
 fn j2_surplus_mana_creature_is_not_given_up_before_twinned_vision() {
     let (mut s, volume) = board(9);
@@ -416,7 +420,7 @@ fn j2_surplus_mana_creature_is_not_given_up_before_twinned_vision() {
     let scores = named_scores(&prompt, &session);
     eprintln!("J2 scores {scores:?}");
     let pick = chosen(&prompt, &session);
-    assert_ne!(pick, "Grove Hulk", "scores {scores:?}");
+    assert_eq!(pick, "Twinned Vision", "scores {scores:?}");
 }
 
 // --- Leaf rows: what the planner's two leaves read -------------------------
