@@ -2247,17 +2247,13 @@ mod tests {
                     "a land must read lands_behind ({lands_behind}), not \
                      mana_behind ({mana_behind})"
                 );
-                // Past the mana target an accelerant is Ordinary, not
-                // Surplus: Surplus is for lands only (it was Surplus before
-                // the 2026-10-21 ruling; its mana role adds nothing there and
-                // its other value keeps its tier).
-                let rock_tier = match tier_of(mana_behind) {
-                    KeepTier::Surplus => KeepTier::Ordinary,
-                    tier => tier,
-                };
+                // The rock is a pure rock (nothing beyond its mana ability),
+                // so past the mana target it is Surplus like a land past its
+                // target (judge P1 on c3a3a59a6); a rock or creature with
+                // other value is Ordinary there (the mana-creature row).
                 assert_eq!(
                     keep_tier(&state, rock, plan),
-                    rock_tier,
+                    tier_of(mana_behind),
                     "an accelerant must read mana_behind ({mana_behind}), not \
                      lands_behind ({lands_behind})"
                 );
