@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use engine::game::players;
 use engine::types::card_type::CoreType;
 use engine::types::format::FormatTopology;
@@ -8,6 +10,7 @@ use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 use serde::{Deserialize, Serialize};
 
+use crate::plan::{PlanSnapshot, PlanState};
 use crate::planner::ValueEstimate;
 use crate::projection::Projection;
 use crate::zone_eval;
@@ -168,6 +171,12 @@ pub struct EvaluationBreakdown {
     /// The draws each side's library is short of [`LIBRARY_FLOOR`], at the
     /// hand-size weight (`EvalFeatures::library_floor`).
     pub library_floor: f64,
+    /// What each side's graveyard can still cast, at the hand-size weight
+    /// (`EvalFeatures::graveyard_casts`).
+    pub graveyard_casts: f64,
+    /// The lands each side holds past its plan's land target, at the
+    /// hand-size weight (`EvalFeatures::surplus_lands`).
+    pub surplus_lands: f64,
 }
 
 impl EvaluationBreakdown {
@@ -191,6 +200,8 @@ impl EvaluationBreakdown {
             card_credit,
             neutralized,
             library_floor,
+            graveyard_casts,
+            surplus_lands,
         } = self;
         life + board_presence
             + board_power
@@ -202,6 +213,8 @@ impl EvaluationBreakdown {
             + card_credit
             + neutralized
             + library_floor
+            + graveyard_casts
+            + surplus_lands
     }
 }
 
@@ -285,6 +298,27 @@ pub struct EvalFeatures {
     /// loss, a terminal [`evaluate_features`] returns, so it is never
     /// harvested; the opponent's 0 stays four cards here.
     pub library_floor: f64,
+    /// CR 702.34a + CR 702.138a + CR 702.84a: the (self - opponent)
+    /// differential of what each side's graveyard can still cast or unearth,
+    /// in cards (`card_value::graveyard_cast_credit`: the cast's payoff in
+    /// expected draws, less the cards its cost discards, while its mana is
+    /// within reach), opponents aggregated like `card_advantage_breakdown`.
+    /// Priced at the **hand-size weight**, so a flashback card whose
+    /// graveyard cast nets a card reads as that card whether the line has
+    /// spent the cast or kept it. Not a 17Lands column: `FeatureRow::extract`
+    /// folds it into the harvested `hand_size`, the weight it multiplies.
+    pub graveyard_casts: f64,
+    /// CR 305.2: the (opponent - self) differential of the lands each side
+    /// holds in hand past its plan's land target
+    /// (`card_value::surplus_lands_in_hand`, the keep order's
+    /// `KeepTier::Surplus`), one card each, opponents aggregated like
+    /// `card_advantage_breakdown`. Priced at the **hand-size weight**, so a
+    /// surplus land, which `hand_size` counts as a card, reads as none (the
+    /// price `card_value::held_value` puts on it), below a spell. Read only
+    /// where the leaf has each seat's plan
+    /// ([`evaluate_features_with_plans`]); 0 without one. Not a 17Lands
+    /// column: `FeatureRow::extract` folds it into the harvested `hand_size`.
+    pub surplus_lands: f64,
 }
 
 /// The library size below which the leaf charges each missing card as a
@@ -294,6 +328,32 @@ pub const LIBRARY_FLOOR: usize = 4;
 /// The draws `player`'s library is short of [`LIBRARY_FLOOR`].
 fn library_shortfall(state: &GameState, player: PlayerId) -> f64 {
     LIBRARY_FLOOR.saturating_sub(state.players[player.0 as usize].library.len()) as f64
+}
+
+/// What `player`'s graveyard can still cast or unearth, in cards
+/// (`card_value::graveyard_cast_credit`). CR 404.1 + CR 400.1: the graveyard
+/// `graveyard_of` resolves, so a shared graveyard reads alike for every seat.
+fn graveyard_cast_cards(state: &GameState, player: PlayerId) -> f64 {
+    state
+        .graveyard_of(player)
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter(|obj| zone_eval::has_recursion_keyword(obj))
+        .map(|obj| crate::card_value::graveyard_cast_credit(state, obj))
+        .sum()
+}
+
+/// The lands in `player`'s hand past their plan's land target, `0` when
+/// `plans` holds no plan for them.
+fn surplus_land_count(
+    state: &GameState,
+    player: PlayerId,
+    plans: Option<&HashMap<PlayerId, PlanSnapshot>>,
+) -> f64 {
+    let plan = plans
+        .and_then(|plans| plans.get(&player))
+        .map(|snapshot| PlanState::realize(state, player, snapshot));
+    crate::card_value::surplus_lands_in_hand(state, player, plan) as f64
 }
 
 impl EvalFeatures {
@@ -314,6 +374,8 @@ impl EvalFeatures {
             + self.neutralized_power * w.board_power
             + self.neutralized_toughness * w.board_toughness
             + self.library_floor * w.hand_size
+            + self.graveyard_casts * w.hand_size
+            + self.surplus_lands * w.hand_size
     }
 }
 
@@ -457,7 +519,18 @@ pub fn threat_level_projected(
 /// Returns a score where higher is better for `player`.
 /// In multiplayer, weights opponent scores by threat level (focus fire on highest threat).
 pub fn evaluate_state(state: &GameState, player: PlayerId, weights: &EvalWeights) -> f64 {
-    evaluate_state_breakdown(state, player, weights)
+    evaluate_state_with_plans(state, player, weights, None)
+}
+
+/// [`evaluate_state`] with each seat's plan (`AiSession::plan`), so the leaf
+/// reads a land past its plan's target ([`EvalFeatures::surplus_lands`]).
+pub fn evaluate_state_with_plans(
+    state: &GameState,
+    player: PlayerId,
+    weights: &EvalWeights,
+    plans: Option<&HashMap<PlayerId, PlanSnapshot>>,
+) -> f64 {
+    evaluate_state_breakdown_with_plans(state, player, weights, plans)
         .map(|breakdown| breakdown.total())
         .unwrap_or_else(|terminal| terminal)
 }
@@ -467,7 +540,18 @@ pub fn evaluate_for_planner(
     player: PlayerId,
     weights: &EvalWeights,
 ) -> ValueEstimate {
-    let value = evaluate_state(state, player, weights);
+    evaluate_for_planner_with_plans(state, player, weights, None)
+}
+
+/// [`evaluate_for_planner`] with each seat's plan
+/// ([`evaluate_state_with_plans`]).
+pub fn evaluate_for_planner_with_plans(
+    state: &GameState,
+    player: PlayerId,
+    weights: &EvalWeights,
+    plans: Option<&HashMap<PlayerId, PlanSnapshot>>,
+) -> ValueEstimate {
+    let value = evaluate_state_with_plans(state, player, weights, plans);
     ValueEstimate {
         value,
         intent: strategic_intent(state, player),
@@ -486,6 +570,17 @@ pub fn evaluate_for_planner(
 /// aggregations are covered — the harvested value is whatever multiplies the
 /// weight, so one extractor is path-agnostic.
 pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeatures, f64> {
+    evaluate_features_with_plans(state, player, None)
+}
+
+/// [`evaluate_features`] with each seat's plan (`AiSession::plan`): the one
+/// feature that reads a plan, [`EvalFeatures::surplus_lands`], is 0 for a
+/// seat `plans` has no plan for.
+pub fn evaluate_features_with_plans(
+    state: &GameState,
+    player: PlayerId,
+    plans: Option<&HashMap<PlayerId, PlanSnapshot>>,
+) -> Result<EvalFeatures, f64> {
     // Check for game over
     if let WaitingFor::GameOver { winner } = &state.waiting_for {
         return Err(match winner {
@@ -551,6 +646,8 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let mut weighted_opp_nc = 0.0;
         let mut weighted_opp_sources = 0.0;
         let mut weighted_opp_shortfall = 0.0;
+        let mut weighted_opp_graveyard_casts = 0.0;
+        let mut weighted_opp_surplus_lands = 0.0;
         let mut weighted_opp_credit = StructuralCredit::default();
 
         for &(opp, threat) in &threats {
@@ -565,6 +662,8 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             weighted_opp_nc += opp_stats.non_creatures as f64 * w;
             weighted_opp_sources += opp_stats.mana_sources as f64 * w;
             weighted_opp_shortfall += library_shortfall(state, opp) * w;
+            weighted_opp_graveyard_casts += graveyard_cast_cards(state, opp) * w;
+            weighted_opp_surplus_lands += surplus_land_count(state, opp, plans) * w;
             weighted_opp_credit.add_scaled(&structural_credit(state, opp, &after_cleanup), w);
         }
 
@@ -583,6 +682,10 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             &weighted_opp_credit,
         );
         features.library_floor = weighted_opp_shortfall - library_shortfall(state, player);
+        features.graveyard_casts =
+            graveyard_cast_cards(state, player) - weighted_opp_graveyard_casts;
+        features.surplus_lands =
+            weighted_opp_surplus_lands - surplus_land_count(state, player, plans);
 
         if p.life as f64 > weighted_opp_life && my_stats.power > 0 {
             features.aggression = my_stats.power as f64;
@@ -597,6 +700,8 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
         let mut total_opp_nc = 0;
         let mut total_opp_sources = 0;
         let mut total_opp_shortfall = 0.0;
+        let mut total_opp_graveyard_casts = 0.0;
+        let mut total_opp_surplus_lands = 0.0;
         let mut opp_credit = StructuralCredit::default();
         for &opp in &opponents {
             let o = &state.players[opp.0 as usize];
@@ -609,6 +714,8 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             total_opp_nc += opp_stats.non_creatures;
             total_opp_sources += opp_stats.mana_sources;
             total_opp_shortfall += library_shortfall(state, opp);
+            total_opp_graveyard_casts += graveyard_cast_cards(state, opp);
+            total_opp_surplus_lands += surplus_land_count(state, opp, plans);
             opp_credit.add_scaled(
                 &structural_credit(state, opp, &after_cleanup),
                 1.0 / opp_count,
@@ -634,6 +741,10 @@ pub fn evaluate_features(state: &GameState, player: PlayerId) -> Result<EvalFeat
             &opp_credit,
         );
         features.library_floor = total_opp_shortfall / opp_count - library_shortfall(state, player);
+        features.graveyard_casts =
+            graveyard_cast_cards(state, player) - total_opp_graveyard_casts / opp_count;
+        features.surplus_lands =
+            total_opp_surplus_lands / opp_count - surplus_land_count(state, player, plans);
 
         // Mirrors `card_advantage_breakdown` above — an AVERAGE, not a raw total
         // (§6.4): at exactly one opponent the two agree, and the distinction
@@ -675,7 +786,18 @@ pub fn evaluate_state_breakdown(
     player: PlayerId,
     weights: &EvalWeights,
 ) -> Result<EvaluationBreakdown, f64> {
-    let features = evaluate_features(state, player)?;
+    evaluate_state_breakdown_with_plans(state, player, weights, None)
+}
+
+/// [`evaluate_state_breakdown`] with each seat's plan
+/// ([`evaluate_features_with_plans`]).
+pub fn evaluate_state_breakdown_with_plans(
+    state: &GameState,
+    player: PlayerId,
+    weights: &EvalWeights,
+    plans: Option<&HashMap<PlayerId, PlanSnapshot>>,
+) -> Result<EvaluationBreakdown, f64> {
+    let features = evaluate_features_with_plans(state, player, plans)?;
     let mut breakdown = EvaluationBreakdown {
         life: features.life * weights.life,
         board_presence: features.board_presence * weights.board_presence,
@@ -690,6 +812,8 @@ pub fn evaluate_state_breakdown(
             + features.neutralized_power * weights.board_power
             + features.neutralized_toughness * weights.board_toughness,
         library_floor: features.library_floor * weights.hand_size,
+        graveyard_casts: features.graveyard_casts * weights.hand_size,
+        surplus_lands: features.surplus_lands * weights.hand_size,
     };
 
     // CR 107.14: energy is a fixed-coefficient offset added AFTER weighting, so

@@ -77,7 +77,7 @@ use engine::types::card::LayoutKind;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
-use engine::types::keywords::Keyword;
+use engine::types::keywords::{EscapeCost, FlashbackCost, Keyword};
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
@@ -452,6 +452,31 @@ fn held_value(state: &GameState, id: ObjectId, plan: Option<PlanState>) -> f64 {
         KeepTier::Surplus => 0.0,
         KeepTier::Ordinary | KeepTier::NeededManaSource => intrinsic_value(state, id),
     }
+}
+
+/// The lands in `player`'s hand the plan counts as [`KeepTier::Surplus`]:
+/// past the land target, each adds nothing the plan wants (CR 305.2, one
+/// land a turn), the reading [`held_value`] prices at 0. Lands only: an
+/// accelerant past the mana target is a card with a body or an effect, and
+/// the leaf reads it as one (`fork-checks/754e28a81/JUDGE.md` B2). `plan`
+/// `None` (no plan authority) counts none.
+pub(crate) fn surplus_lands_in_hand(
+    state: &GameState,
+    player: PlayerId,
+    plan: Option<PlanState>,
+) -> usize {
+    if plan.is_none() {
+        return 0;
+    }
+    state.players.get(player.0 as usize).map_or(0, |p| {
+        p.hand
+            .iter()
+            .filter(|&&id| {
+                mana_role(state, id) == ManaRole::LandDrop
+                    && keep_tier(state, id, plan) == KeepTier::Surplus
+            })
+            .count()
+    })
 }
 
 /// The first `count` cards of `pool` in [`cmp_keep`] order: the cards a
@@ -1234,6 +1259,183 @@ pub(crate) fn permanent_card_credit(state: &GameState, obj: &GameObject) -> f64 
     1.0 + payoff / draw_unit(state, obj.controller)
 }
 
+/// What a card in a graveyard can still do from there, in cards: the scale
+/// of the hand-size weight that values a card in hand
+/// (`eval::EvalFeatures::graveyard_casts`), so the line that keeps a flashback
+/// card's graveyard cast and the line that spends it are read on the same
+/// cards.
+///
+/// - CR 702.34a + CR 702.138a: a card with flashback or escape can be cast
+///   from its owner's graveyard. An instant or sorcery is what its spell
+///   abilities do cast from there ([`definition_payoff_from`] with the
+///   graveyard as origin, its best mode when modal, CR 700.2), in expected
+///   draws ([`draw_unit`]); Twinned Vision's flashback draws two. A permanent
+///   cast by escape is the card a cast from hand would put on the
+///   battlefield, one card, as the leaf reads a card in hand.
+/// - CR 702.84a: unearth returns a creature card to the battlefield until the
+///   next end step, so it is what the creature does on entering (its own
+///   enters triggers, [`creature_trigger_payoff`]), not its body.
+///
+/// Each card its cost discards (CR 601.2h: Twinned Vision's "Discard a
+/// card") is one card less, never below 0. Credited only while the cast is
+/// in reach: its mana within [`ABILITY_REACH_LAND_DROPS`] land drops of the
+/// owner's sources (`mana_colors::cost_within_land_drops`, CR 305.2), the
+/// reading an activated ability's reach takes, and as many other cards in
+/// that graveyard as its cost exiles (escape's "Exile N other cards", CR
+/// 702.138a). Any other card in a graveyard, and a token or a copy (CR
+/// 111.1 + CR 707.10: not a card), is 0.
+pub(crate) fn graveyard_cast_credit(state: &GameState, obj: &GameObject) -> f64 {
+    if obj.zone != Zone::Graveyard || obj.is_token || obj.is_copy || being_cast(state, obj.id) {
+        return 0.0;
+    }
+    let Some(cast) = GraveyardCast::of(state, obj) else {
+        return 0.0;
+    };
+    let caster = obj.owner;
+    let mana_in_reach = cast
+        .mana
+        .as_ref()
+        .is_none_or(|mana| cost_within_land_drops(state, caster, mana, ABILITY_REACH_LAND_DROPS));
+    let others_in_graveyard = state.graveyard_of(caster).len().saturating_sub(1);
+    if !mana_in_reach || others_in_graveyard < cast.graveyard_exiles {
+        return 0.0;
+    }
+    let types = &obj.card_types.core_types;
+    let cards = match cast.kind {
+        GraveyardCastKind::Cast
+            if types.contains(&CoreType::Instant) || types.contains(&CoreType::Sorcery) =>
+        {
+            let values = obj
+                .abilities
+                .iter()
+                .filter(|ability| ability.kind == AbilityKind::Spell)
+                .map(|ability| {
+                    definition_payoff_from(
+                        state,
+                        obj,
+                        ability,
+                        DrawPricing::LibraryMean,
+                        Zone::Graveyard,
+                    )
+                });
+            let payoff = if obj.modal.is_some() {
+                values.fold(0.0, f64::max)
+            } else {
+                values.sum()
+            };
+            payoff / draw_unit(state, caster)
+        }
+        GraveyardCastKind::Cast => 1.0,
+        GraveyardCastKind::Unearth => {
+            let payoff: f64 = obj
+                .trigger_definitions
+                .iter_unchecked()
+                .map(|entry| &entry.definition)
+                .filter(|trigger| is_own_etb(trigger))
+                .filter_map(|trigger| trigger.execute.as_deref().map(|execute| (trigger, execute)))
+                .map(|(trigger, execute)| {
+                    creature_trigger_payoff(state, obj, trigger, execute, DrawPricing::LibraryMean)
+                })
+                .sum();
+            payoff / draw_unit(state, caster)
+        }
+    };
+    (cards - f64::from(cast.discards)).max(0.0)
+}
+
+/// CR 601.2a: a spell being cast is put on the stack before its costs are
+/// paid; while the cast is underway its card can still sit in its origin
+/// zone, and the stack's credit (`stack_spell_card_credit`) is what reads it,
+/// not the graveyard's.
+fn being_cast(state: &GameState, id: ObjectId) -> bool {
+    state.stack.iter().any(|entry| {
+        entry.source_id == id
+            && matches!(
+                entry.kind,
+                engine::types::game_state::StackEntryKind::Spell { .. }
+            )
+    })
+}
+
+/// How a card leaves its graveyard by its own recursion keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraveyardCastKind {
+    /// CR 702.34a flashback, CR 702.138a escape: cast from the graveyard.
+    Cast,
+    /// CR 702.84a unearth: an activated ability that returns it to the
+    /// battlefield until the next end step.
+    Unearth,
+}
+
+/// A graveyard card's recursion keyword and what its cost asks for.
+struct GraveyardCast {
+    kind: GraveyardCastKind,
+    /// The mana the cost asks for, `None` for a cost with no fixed mana part
+    /// (read as in reach, as [`activation_mana`] reads one).
+    mana: Option<ManaCost>,
+    /// Cards the cost discards from hand.
+    discards: i32,
+    /// Other cards the cost exiles from the graveyard.
+    graveyard_exiles: usize,
+}
+
+impl GraveyardCast {
+    /// The first flashback, escape or unearth keyword on `obj`
+    /// (`zone_eval::has_recursion_keyword`'s set).
+    fn of(state: &GameState, obj: &GameObject) -> Option<Self> {
+        obj.keywords.iter().find_map(|keyword| match keyword {
+            Keyword::Flashback(FlashbackCost::Mana(mana))
+            | Keyword::Escape(EscapeCost::Mana(mana)) => Some(Self {
+                kind: GraveyardCastKind::Cast,
+                mana: Some(mana.clone()),
+                discards: 0,
+                graveyard_exiles: 0,
+            }),
+            Keyword::Flashback(FlashbackCost::NonMana(cost))
+            | Keyword::Escape(EscapeCost::NonMana(cost)) => Some(Self {
+                kind: GraveyardCastKind::Cast,
+                mana: activation_mana(cost),
+                discards: cost_discards(state, obj, cost),
+                graveyard_exiles: cost_graveyard_exiles(cost),
+            }),
+            Keyword::Unearth(mana) => Some(Self {
+                kind: GraveyardCastKind::Unearth,
+                mana: Some(mana.clone()),
+                discards: 0,
+                graveyard_exiles: 0,
+            }),
+            _ => None,
+        })
+    }
+}
+
+/// CR 701.9a: the cards a cost discards from its owner's hand.
+fn cost_discards(state: &GameState, obj: &GameObject, cost: &AbilityCost) -> i32 {
+    match cost {
+        AbilityCost::Discard { count, .. } => {
+            resolve_quantity(state, count, obj.owner, obj.id).max(0)
+        }
+        AbilityCost::Composite { costs } => costs
+            .iter()
+            .map(|cost| cost_discards(state, obj, cost))
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// CR 702.138a: the other cards a cost exiles from its graveyard.
+fn cost_graveyard_exiles(cost: &AbilityCost) -> usize {
+    match cost {
+        AbilityCost::Exile {
+            count,
+            zone: Some(Zone::Graveyard),
+            ..
+        } => *count as usize,
+        AbilityCost::Composite { costs } => costs.iter().map(cost_graveyard_exiles).sum(),
+        _ => 0,
+    }
+}
+
 /// One ability's payoff: its best mode when it is modal (CR 700.2), otherwise
 /// the effects it performs as cast from hand, or for any other branch shape
 /// the unconditional links of its chain.
@@ -1243,14 +1445,28 @@ fn definition_payoff(
     ability: &AbilityDefinition,
     draws: DrawPricing,
 ) -> f64 {
+    definition_payoff_from(state, obj, ability, draws, Zone::Hand)
+}
+
+/// [`definition_payoff`] for a spell cast from `origin` (CR 601.2a): an
+/// "instead" branch its origin decides is read for that origin
+/// ([`priced_effects_from`]); Twinned Vision cast from the graveyard draws
+/// two.
+fn definition_payoff_from(
+    state: &GameState,
+    obj: &GameObject,
+    ability: &AbilityDefinition,
+    draws: DrawPricing,
+    origin: Zone,
+) -> f64 {
     if !ability.mode_abilities.is_empty() {
         return ability
             .mode_abilities
             .iter()
-            .map(|mode| definition_payoff(state, obj, mode, draws))
+            .map(|mode| definition_payoff_from(state, obj, mode, draws, origin))
             .fold(0.0, f64::max);
     }
-    let effects = priced_effects(ability);
+    let effects = priced_effects_from(ability, origin);
     chain_payoff(state, obj, &effects, draws, performers(state, obj, ability))
 }
 
@@ -1258,7 +1474,13 @@ fn definition_payoff(
 /// performs as cast from hand, or for any other branch shape the
 /// unconditional links of its chain.
 fn priced_effects(ability: &AbilityDefinition) -> Vec<&Effect> {
-    effects_cast_from(ability, Zone::Hand).unwrap_or_else(|| {
+    priced_effects_from(ability, Zone::Hand)
+}
+
+/// [`priced_effects`] for a spell cast from `origin`
+/// (`self_cost::effects_cast_from`).
+fn priced_effects_from(ability: &AbilityDefinition, origin: Zone) -> Vec<&Effect> {
+    effects_cast_from(ability, origin).unwrap_or_else(|| {
         let mut effects = Vec::new();
         let mut next = Some(ability);
         while let Some(node) = next {

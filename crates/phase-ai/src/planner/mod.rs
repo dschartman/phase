@@ -20,7 +20,8 @@ use crate::card_hints::should_play_now_with_facts;
 use crate::cast_facts::cast_facts_for_action;
 use crate::config::{AiConfig, OpponentModel};
 use crate::eval::{
-    evaluate_for_planner, evaluate_state, strategic_intent, threat_level, StrategicIntent,
+    evaluate_for_planner_with_plans, evaluate_state_with_plans, strategic_intent, threat_level,
+    StrategicIntent,
 };
 use crate::policies::context::{PolicyContext, PriorsEnv, SearchDepth};
 use crate::policies::PolicyRegistry;
@@ -1515,7 +1516,12 @@ impl<'a> PlannerServices<'a> {
     /// Strategic dimensions (synergy, zone quality, card advantage) use AiContext.
     fn evaluate_with_strategy(&self, state: &GameState) -> f64 {
         let weights = self.context.adjusted_weights.for_turn(state.turn_number);
-        let tactical = evaluate_state(state, self.ai_player, weights);
+        let tactical = evaluate_state_with_plans(
+            state,
+            self.ai_player,
+            weights,
+            Some(&self.context.session.plan),
+        );
 
         let synergy = self
             .context
@@ -1576,7 +1582,12 @@ impl<'a> PlannerServices<'a> {
 
     pub fn evaluate_for_planner(&self, state: &GameState) -> ValueEstimate {
         let weights = self.context.adjusted_weights.for_turn(state.turn_number);
-        evaluate_for_planner(state, self.ai_player, weights)
+        evaluate_for_planner_with_plans(
+            state,
+            self.ai_player,
+            weights,
+            Some(&self.context.session.plan),
+        )
     }
 
     /// Quiescence search: resolve forced actions and mechanical choices until the

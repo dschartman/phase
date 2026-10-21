@@ -16,7 +16,6 @@ pub(crate) struct ZoneWeights {
     pub(crate) hand_card_base: f64,
     pub(crate) castable_bonus: f64,
     graveyard_base: f64,
-    recursion_bonus: f64,
 }
 
 impl ZoneWeights {
@@ -26,31 +25,26 @@ impl ZoneWeights {
                 hand_card_base: 0.3,
                 castable_bonus: 0.4,
                 graveyard_base: 0.05,
-                recursion_bonus: 0.1,
             },
             DeckArchetype::Midrange => Self {
                 hand_card_base: 0.4,
                 castable_bonus: 0.3,
                 graveyard_base: 0.1,
-                recursion_bonus: 0.2,
             },
             DeckArchetype::Control => Self {
                 hand_card_base: 0.6,
                 castable_bonus: 0.2,
                 graveyard_base: 0.15,
-                recursion_bonus: 0.3,
             },
             DeckArchetype::Combo => Self {
                 hand_card_base: 0.5,
                 castable_bonus: 0.3,
                 graveyard_base: 0.2,
-                recursion_bonus: 0.4,
             },
             DeckArchetype::Ramp => Self {
                 hand_card_base: 0.4,
                 castable_bonus: 0.3,
                 graveyard_base: 0.1,
-                recursion_bonus: 0.2,
             },
         }
     }
@@ -104,7 +98,10 @@ fn hand_quality(
         .sum()
 }
 
-/// Evaluate graveyard value: each card gets a base value, recursion-capable cards get a bonus.
+/// Evaluate graveyard value: each card gets a base value. What a flashback,
+/// escape or unearth card can still do from there is the leaf's
+/// graveyard-cast credit (`eval::EvalFeatures::graveyard_casts`), read at its
+/// payoff while it is in reach, not a flat bonus here.
 ///
 /// CR 404.1 + CR 400.1: a player's graveyard is the zone `graveyard_of` resolves, so a shared
 /// graveyard is every seat's.
@@ -113,19 +110,12 @@ fn graveyard_value(state: &GameState, player: PlayerId, weights: &ZoneWeights) -
         .graveyard_of(player)
         .iter()
         .filter_map(|&oid| state.objects.get(&oid))
-        .map(|obj| {
-            let base = weights.graveyard_base;
-            let recursion = if has_recursion_keyword(obj) {
-                weights.recursion_bonus
-            } else {
-                0.0
-            };
-            base + recursion
-        })
+        .map(|_| weights.graveyard_base)
         .sum()
 }
 
-/// Check if a game object has any graveyard-recursion keyword.
+/// Check if a game object has any graveyard-recursion keyword: the cards
+/// `card_value::graveyard_cast_credit` reads.
 pub(crate) fn has_recursion_keyword(obj: &engine::game::game_object::GameObject) -> bool {
     obj.keywords.iter().any(|kw| {
         matches!(
