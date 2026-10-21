@@ -333,8 +333,8 @@ fn library_shortfall(state: &GameState, player: PlayerId) -> f64 {
     LIBRARY_FLOOR.saturating_sub(state.players[player.0 as usize].library.len()) as f64
 }
 
-/// What `seat`'s graveyard and hand can still cast or unearth from the
-/// graveyard, in cards (`card_value::graveyard_cast_credit`), as `viewer`
+/// What `seat`'s graveyard, hand and permanents can still cast or unearth
+/// from the graveyard, in cards (`card_value::graveyard_cast_credit`), as `viewer`
 /// reads them: every graveyard card (CR 404.1 + CR 400.1, the graveyard
 /// `graveyard_of` resolves, so a shared graveyard reads alike for every
 /// seat), `viewer`'s own hand, and of another seat's hand only the cards
@@ -344,10 +344,18 @@ fn graveyard_cast_cards(state: &GameState, seat: PlayerId, viewer: PlayerId) -> 
         .hand
         .iter()
         .filter(|&&id| seat == viewer || crate::determinize::viewer_knows_card(state, viewer, id));
+    // CR 702.138a + CR 702.84a: an escape or unearth permanent the seat owns
+    // reaches its graveyard when it leaves (`graveyard_cast_credit` reads
+    // which do).
+    let battlefield = state
+        .battlefield
+        .iter()
+        .filter(|&&id| state.objects.get(&id).is_some_and(|obj| obj.owner == seat));
     state
         .graveyard_of(seat)
         .iter()
         .chain(hand)
+        .chain(battlefield)
         .filter_map(|id| state.objects.get(id))
         .filter(|obj| zone_eval::has_recursion_keyword(obj))
         .map(|obj| crate::card_value::graveyard_cast_credit(state, obj))
