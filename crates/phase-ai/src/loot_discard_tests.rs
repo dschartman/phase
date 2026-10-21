@@ -197,9 +197,11 @@ fn is_land(name: &str) -> bool {
 /// the Duelist is cast, so nothing in hand is castable inside the horizon;
 /// the hand holds a land (P0's land target is 6, so a seventh land adds
 /// nothing the plan wants) and a removal spell with a legal target, plus the
-/// Island the loot draws. The search ties the land and the spell; the keep
-/// order gives up the land (3.0) before Extended Absence. The land SHALL be
-/// discarded.
+/// Island the loot draws. The search ties the land and the spell, or with
+/// the leaf reading the surplus land below a spell
+/// (`eval::EvalFeatures::surplus_lands`) scores the land first; on a tie the
+/// keep order gives up the land (3.0) before Extended Absence. The land SHALL
+/// be discarded.
 #[test]
 fn ld1_loot_discard_at_six_lands_pitches_the_land_over_a_removal_spell() {
     let mut s = GameScenario::new();
@@ -222,8 +224,8 @@ fn ld1_loot_discard_at_six_lands_pitches_the_land_over_a_removal_spell() {
     let land = score_of(&scores, "Swamp").max(score_of(&scores, "Island"));
     let spell = score_of(&scores, "Extended Absence");
     assert!(
-        (land - spell).abs() <= TIE,
-        "precondition: the search ties the land and the spell: {scores:?}"
+        land >= spell - TIE,
+        "precondition: the search scores the land at least with the spell: {scores:?}"
     );
     let pick = chosen(&prompt, &session);
     assert!(is_land(&pick), "discarded {pick}, scores {scores:?}");
@@ -232,8 +234,9 @@ fn ld1_loot_discard_at_six_lands_pitches_the_land_over_a_removal_spell() {
 /// LD2, the 1004 T21 shape: seven lands in play, one left untapped after the
 /// Duelist; the hand holds a Swamp (past the land target of 6) and Mind
 /// Meanderer, which the lone open land cannot cast, plus the drawn Forest.
-/// The search ties every candidate; the keep order gives up a land first.
-/// A land SHALL be discarded.
+/// The search ties every candidate, or with the leaf reading the surplus
+/// land below a spell scores a land first; on a tie the keep order gives up a
+/// land first. A land SHALL be discarded.
 #[test]
 fn ld2_loot_discard_at_seven_lands_pitches_a_land_over_a_creature() {
     let mut s = GameScenario::new();
@@ -255,8 +258,8 @@ fn ld2_loot_discard_at_seven_lands_pitches_a_land_over_a_creature() {
     let land = score_of(&scores, "Swamp").max(score_of(&scores, "Forest"));
     let spell = score_of(&scores, "Mind Meanderer");
     assert!(
-        (land - spell).abs() <= TIE,
-        "precondition: the search ties the land and the creature: {scores:?}"
+        land >= spell - TIE,
+        "precondition: the search scores the land at least with the creature: {scores:?}"
     );
     let pick = chosen(&prompt, &session);
     assert!(is_land(&pick), "discarded {pick}, scores {scores:?}");

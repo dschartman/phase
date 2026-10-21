@@ -2395,6 +2395,9 @@ mod ordering_value_tests;
 mod mode_choice_value_tests;
 
 #[cfg(test)]
+mod leaf_graveyard_surplus_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
