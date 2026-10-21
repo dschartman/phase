@@ -80,6 +80,7 @@ use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{EscapeCost, FlashbackCost, Keyword};
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
+use engine::types::replacements::ReplacementEvent;
 use engine::types::statics::StaticMode;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
@@ -131,8 +132,10 @@ pub(crate) enum ManaRole {
 /// declaration order below IS the specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum KeepTier {
-    /// A land held past the plan's land target (CR 305.2: one land a turn).
-    /// Lands only: a nonland mana source past the mana target is `Ordinary`.
+    /// A land held past the plan's land target (CR 305.2: one land a turn), or
+    /// a nonland mana source past the mana target with nothing beyond its
+    /// mana ability (a pure rock). A mana creature or a rock with other
+    /// abilities is `Ordinary` there.
     Surplus,
     /// Everything else. Also the tier for every card when no plan authority
     /// exists, and for every mana source while exactly on curve. When all cards
@@ -194,7 +197,8 @@ pub(crate) fn mana_role(state: &GameState, obj_id: ObjectId) -> ManaRole {
 /// schedule for an accelerant (see [`ManaRole`]) — and a land is demoted to
 /// `Surplus` only while the land schedule says the player is past it; an
 /// accelerant past the mana target keeps the tier its other value earns,
-/// `Ordinary` (a mana creature's body, a rock's other abilities). On curve — and whenever no plan authority exists
+/// `Ordinary` (a mana creature's body, a rock's other abilities), and is
+/// `Surplus` with nothing beyond its mana ability (a pure rock). On curve — and whenever no plan authority exists
 /// — every card is `Ordinary`, which reproduces the pure-intrinsic ordering
 /// exactly.
 ///
@@ -218,14 +222,34 @@ pub(crate) fn keep_tier(state: &GameState, obj_id: ObjectId, plan: Option<PlanSt
             KeepTier::Ordinary
         }
         Some(Ordering::Greater) => KeepTier::NeededManaSource,
-        // CR 305.2: only a land is played as a land, one a turn, so only a
-        // land past the land target adds nothing the plan wants. An
-        // accelerant past the mana target is a card with a body or an
-        // effect: its mana role adds nothing there, and it keeps the tier
-        // its other value earns.
-        Some(Ordering::Less) if role == ManaRole::LandDrop => KeepTier::Surplus,
+        // CR 305.2: past its target a mana source's mana role adds nothing
+        // the plan wants. A land, or an accelerant with nothing beyond its
+        // mana ability (a pure rock), is then Surplus; an accelerant with a
+        // body or other abilities keeps the tier that value earns.
+        Some(Ordering::Less)
+            if role == ManaRole::LandDrop || !has_value_beyond_mana(state, obj_id) =>
+        {
+            KeepTier::Surplus
+        }
         Some(Ordering::Less) | Some(Ordering::Equal) | None => KeepTier::Ordinary,
     }
+}
+
+/// Whether a mana source has anything beyond its mana abilities (CR 605.1a):
+/// a body (a creature), a nonmana ability, a triggered ability or a static
+/// ability. A pure rock has none, and past the mana target is Surplus like a
+/// land past its target; Murmuring Volume's loot or a mana creature's body
+/// keep their value.
+fn has_value_beyond_mana(state: &GameState, obj_id: ObjectId) -> bool {
+    state.objects.get(&obj_id).is_some_and(|obj| {
+        obj.card_types.core_types.contains(&CoreType::Creature)
+            || obj
+                .abilities
+                .iter()
+                .any(|ability| !is_mana_ability(ability))
+            || !obj.trigger_definitions.is_empty()
+            || !obj.static_definitions.is_empty()
+    })
 }
 
 /// CR 305.1 + CR 305.2: whether this land is the one its owner's hand would
@@ -608,7 +632,7 @@ pub(crate) const KEEP_VALUE_FLOOR: f64 = 0.1;
 ///   card. A land scores 3.0 on the scalar, so only this test can bin one; per
 ///   CR 305.2 a player normally plays one land a turn, and past the plan's land
 ///   target another land is surplus. An accelerant past the mana target is
-///   not (its mana role adds nothing there; its other value is read).
+///   surplus only with nothing beyond its mana ability (a pure rock).
 ///
 /// `plan == None` (no plan authority, as on the rollout path) leaves every card
 /// `Ordinary`, so the scalar alone decides.
@@ -1298,7 +1322,7 @@ pub(crate) fn permanent_card_credit(state: &GameState, obj: &GameObject) -> f64 
 /// 702.138a). Any card in another zone or without such a keyword, and a
 /// token or a copy (CR 111.1 + CR 707.10: not a card), is 0.
 pub(crate) fn graveyard_cast_credit(state: &GameState, obj: &GameObject) -> f64 {
-    if !matches!(obj.zone, Zone::Graveyard | Zone::Hand)
+    if !matches!(obj.zone, Zone::Graveyard | Zone::Hand | Zone::Battlefield)
         || obj.is_token
         || obj.is_copy
         || being_cast(state, obj.id)
@@ -1308,12 +1332,22 @@ pub(crate) fn graveyard_cast_credit(state: &GameState, obj: &GameObject) -> f64 
     let Some(cast) = GraveyardCast::of(state, obj) else {
         return 0.0;
     };
+    // CR 702.138a + CR 702.84a: an escape or unearth permanent reaches its
+    // graveyard cast only after it leaves the battlefield, so on the
+    // battlefield it keeps the credit it carried in hand; an unearthed
+    // creature is exiled if it would leave and carries none. A flashback
+    // card's graveyard cast is an instant's or a sorcery's (CR 702.34a).
+    if obj.zone == Zone::Battlefield && (!cast.carried_on_battlefield || exiled_if_it_leaves(obj)) {
+        return 0.0;
+    }
     let caster = obj.owner;
     let mana_in_reach = cast
         .mana
         .as_ref()
         .is_none_or(|mana| cost_within_land_drops(state, caster, mana, ABILITY_REACH_LAND_DROPS));
     let in_graveyard = state.graveyard_of(caster).len();
+    // A card in the graveyard counts the others there; from hand or the
+    // battlefield it would join them.
     let others_in_graveyard = if obj.zone == Zone::Graveyard {
         in_graveyard.saturating_sub(1)
     } else {
@@ -1379,6 +1413,29 @@ fn being_cast(state: &GameState, id: ObjectId) -> bool {
     })
 }
 
+/// CR 702.84a + CR 614.1a: whether the permanent carries an "if it would
+/// leave the battlefield, exile it instead" replacement bound to itself (an
+/// unearthed creature's), so it never reaches its graveyard.
+fn exiled_if_it_leaves(obj: &GameObject) -> bool {
+    obj.replacement_definitions
+        .iter_unchecked()
+        .any(|replacement| {
+            replacement.event == ReplacementEvent::Moved
+                && replacement.valid_card == Some(TargetFilter::SelfRef)
+                && replacement.execute.as_deref().is_some_and(|execute| {
+                    matches!(
+                        &*execute.effect,
+                        Effect::ChangeZone {
+                            origin: None | Some(Zone::Battlefield),
+                            destination: Zone::Exile,
+                            target: TargetFilter::SelfRef,
+                            ..
+                        }
+                    )
+                })
+        })
+}
+
 /// How a card leaves its graveyard by its own recursion keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraveyardCastKind {
@@ -1392,6 +1449,9 @@ enum GraveyardCastKind {
 /// A graveyard card's recursion keyword and what its cost asks for.
 struct GraveyardCast {
     kind: GraveyardCastKind,
+    /// Escape and unearth: a permanent with the keyword carries the credit
+    /// on the battlefield (it reaches the graveyard when it leaves).
+    carried_on_battlefield: bool,
     /// The mana the cost asks for, `None` for a cost with no fixed mana part
     /// (read as in reach, as [`activation_mana`] reads one).
     mana: Option<ManaCost>,
@@ -1409,6 +1469,7 @@ impl GraveyardCast {
             Keyword::Flashback(FlashbackCost::Mana(mana))
             | Keyword::Escape(EscapeCost::Mana(mana)) => Some(Self {
                 kind: GraveyardCastKind::Cast,
+                carried_on_battlefield: matches!(keyword, Keyword::Escape(_)),
                 mana: Some(mana.clone()),
                 discards: 0,
                 graveyard_exiles: 0,
@@ -1416,12 +1477,14 @@ impl GraveyardCast {
             Keyword::Flashback(FlashbackCost::NonMana(cost))
             | Keyword::Escape(EscapeCost::NonMana(cost)) => Some(Self {
                 kind: GraveyardCastKind::Cast,
+                carried_on_battlefield: matches!(keyword, Keyword::Escape(_)),
                 mana: activation_mana(cost),
                 discards: cost_discards(state, obj, cost),
                 graveyard_exiles: cost_graveyard_exiles(cost),
             }),
             Keyword::Unearth(mana) => Some(Self {
                 kind: GraveyardCastKind::Unearth,
+                carried_on_battlefield: true,
                 mana: Some(mana.clone()),
                 discards: 0,
                 graveyard_exiles: 0,
