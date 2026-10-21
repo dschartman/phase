@@ -22,7 +22,7 @@ use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
 use serde::{Deserialize, Serialize};
 
-use crate::eval::{evaluate_features, EvalFeatures, EvalWeights};
+use crate::eval::{evaluate_features_with_plans, EvalFeatures, EvalWeights};
 use crate::session::AiSession;
 
 /// p0's perspective is fixed for the harvest — the win-label is p0's outcome and
@@ -120,7 +120,9 @@ impl FeatureRow {
             neutralized_power,
             neutralized_toughness,
             library_floor,
-        } = evaluate_features(state, player).ok()?;
+            graveyard_casts,
+            surplus_lands,
+        } = evaluate_features_with_plans(state, player, Some(&session.plan)).ok()?;
         let differential = crate::card_advantage::differential(state, player);
         let synergy = session
             .synergy
@@ -133,7 +135,8 @@ impl FeatureRow {
             .unwrap_or_default();
         let zone_quality = crate::zone_eval::zone_bonus(state, player, archetype);
 
-        // `card_credit` and `library_floor` are priced at the hand-size weight
+        // `card_credit`, `library_floor`, `graveyard_casts` and `surplus_lands`
+        // are priced at the hand-size weight
         // and the `neutralized_*` credits at the board weights, so each folds
         // into the column whose weight multiplies it: the harvested vector
         // still reconstructs the served leaf, and the trainer fits those
@@ -143,7 +146,7 @@ impl FeatureRow {
             board_presence: board_presence + neutralized_presence,
             board_power: board_power + neutralized_power,
             board_toughness: board_toughness + neutralized_toughness,
-            hand_size: hand_size + card_credit + library_floor,
+            hand_size: hand_size + card_credit + library_floor + graveyard_casts + surplus_lands,
             aggression,
             card_advantage: card_advantage_breakdown + differential,
             zone_quality,
