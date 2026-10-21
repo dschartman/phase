@@ -240,8 +240,12 @@ mod tests {
         );
     }
 
+    /// A flashback card in the graveyard is one graveyard card here, like any
+    /// other: what its graveyard cast can still do is the leaf's
+    /// graveyard-cast credit (`eval::EvalFeatures::graveyard_casts`), read at
+    /// its payoff while it is in reach, not a flat bonus.
     #[test]
-    fn graveyard_flashback_bonus() {
+    fn graveyard_flashback_is_not_a_zone_bonus() {
         let mut state = make_state();
 
         // Card in graveyard without recursion
@@ -266,8 +270,8 @@ mod tests {
         let score_flashback = zone_bonus(&state, PlayerId(0), DeckArchetype::Midrange);
 
         assert!(
-            score_flashback > score_plain,
-            "Flashback card should score higher: {score_flashback} > {score_plain}"
+            (score_flashback - score_plain).abs() < 1e-12,
+            "a flashback card is one graveyard card: {score_flashback} == {score_plain}"
         );
     }
 
@@ -342,12 +346,15 @@ mod tests {
         assert!((zone_bonus(&state, PlayerId(1), DeckArchetype::Midrange) + expected).abs() < 1e-9);
     }
 
+    /// Each graveyard card is `graveyard_base`, recursion or not: a castable
+    /// flashback, escape or unearth is the leaf's graveyard-cast credit
+    /// (`eval::EvalFeatures::graveyard_casts`), not a flat bonus here.
     #[test]
     fn per_seat_graveyard_counts_for_its_owner_only() {
         let mut state = make_state();
         add_graveyard_cards(&mut state, PlayerId(0), 3, true);
         let weights = ZoneWeights::for_archetype(DeckArchetype::Midrange);
-        let expected = 3.0 * weights.graveyard_base + weights.recursion_bonus;
+        let expected = 3.0 * weights.graveyard_base;
         assert_eq!(state.graveyard_of(PlayerId(0)).len(), 3);
         assert!(state.graveyard_of(PlayerId(1)).is_empty());
         assert!((zone_bonus(&state, PlayerId(0), DeckArchetype::Midrange) - expected).abs() < 1e-9);
