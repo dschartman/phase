@@ -243,6 +243,41 @@ pub(crate) fn is_reanimation_fuel(state: &GameState, player: PlayerId, card: Obj
         })
 }
 
+/// CR 404.1 + CR 110.1: whether `player` still has a reanimation to use: one
+/// of their own objects' usable reanimation chains
+/// ([`usable_reanimation_chains`]), or `card`'s own activated reanimation
+/// while `card` is not yet on the battlefield. A card priced as it would be
+/// cast brings its activated abilities with it (Liliana the Repentant in
+/// hand reanimates once she is cast), which the chains read in hand leave
+/// out by choice; on the battlefield the chains read them, spent exhaust
+/// excluded (CR 702.177a).
+///
+/// The question `card_value` asks of a self-mill trigger: milling its
+/// controller's own cards is fuel while this is true and a cost while it is
+/// not.
+pub(crate) fn has_live_reanimation(state: &GameState, player: PlayerId, card: &GameObject) -> bool {
+    let reanimates =
+        |ability: &AbilityDefinition| effects_include_reanimation(&collect_chain_effects(ability));
+    if card.zone != Zone::Battlefield
+        && card
+            .abilities
+            .iter()
+            .filter(|ability| ability.kind == AbilityKind::Activated)
+            .any(reanimates)
+    {
+        return true;
+    }
+    state
+        .objects
+        .values()
+        .filter(|object| object.owner == player)
+        .any(|object| {
+            usable_reanimation_chains(state, object)
+                .into_iter()
+                .any(reanimates)
+        })
+}
+
 /// The ability chains of `object` its owner can still use to reanimate.
 ///
 /// - On the battlefield: activated abilities (CR 602.1) and triggered
@@ -326,7 +361,7 @@ fn is_own_enters_trigger(trigger: &TriggerDefinition) -> bool {
 /// CR 702.177a: an exhaust ability can be activated only once; this reads
 /// whether it already has been, by the engine's per-object game counter, keyed
 /// by the ability's index in the object's current abilities.
-fn once_and_spent(
+pub(crate) fn once_and_spent(
     state: &GameState,
     id: ObjectId,
     index: usize,
@@ -342,7 +377,7 @@ fn once_and_spent(
 }
 
 /// The target filter of a reanimation effect ([`effect_is_reanimation`]).
-fn reanimation_target(effect: &Effect) -> Option<&TargetFilter> {
+pub(crate) fn reanimation_target(effect: &Effect) -> Option<&TargetFilter> {
     match effect {
         Effect::ChangeZone { target, .. } if effect_is_reanimation(effect) => Some(target),
         _ => None,

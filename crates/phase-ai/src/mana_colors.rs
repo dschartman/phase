@@ -21,7 +21,7 @@ use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::ManaType;
+use engine::types::mana::{ManaCost, ManaType};
 use engine::types::player::PlayerId;
 
 /// Distinct colored-mana types a land can produce, unioning (a) intrinsic mana
@@ -99,6 +99,142 @@ pub(crate) fn unmet_hand_colors_covered(
         return 0;
     }
     UnmetColors::for_player(state, player).covered(produced)
+}
+
+/// CR 305.2 + CR 107.4 + CR 202.3: whether `player` could pay `cost` once at
+/// most `drops` more lands from their hand are played, one a turn: the mana
+/// sources they control now plus up to `drops` lands from hand cover the mana
+/// value, and every coloured pip has a source of its own that produces one of
+/// its colours (a source pays one pip).
+///
+/// A mana source is a land or a permanent with a renewable mana ability
+/// (`zone_eval::is_intrinsic_mana_source`), read by the colours it can
+/// produce ([`land_produced_color_types`]); whether it is tapped now is not
+/// read, since this asks about a later turn. A shard payable another way
+/// ({2/U}, {U/P}) is read as needing its colour, the conservative reading.
+/// A cost with no mana symbols to pay (`NoCost`, a self-referential cost) is
+/// in reach.
+pub(crate) fn cost_within_land_drops(
+    state: &GameState,
+    player: PlayerId,
+    cost: &ManaCost,
+    drops: usize,
+) -> bool {
+    let ManaCost::Cost { shards, .. } = cost else {
+        return true;
+    };
+    let colours_of = |id: &ObjectId| -> Option<ColorDemand> {
+        let obj = state.objects.get(id)?;
+        let mut colours = [0u32; 5];
+        for produced in land_produced_color_types(&obj.card_types.subtypes, &obj.abilities) {
+            if let Some(index) = mana_type_to_demand_index(produced) {
+                colours[index] = 1;
+            }
+        }
+        Some(colours)
+    };
+    let in_play: Vec<ColorDemand> = state
+        .battlefield
+        .iter()
+        .filter(|id| {
+            state.objects.get(id).is_some_and(|obj| {
+                obj.controller == player && crate::zone_eval::is_intrinsic_mana_source(obj)
+            })
+        })
+        .filter_map(colours_of)
+        .collect();
+    let in_hand: Vec<ColorDemand> = state
+        .players
+        .get(player.0 as usize)
+        .map(|p| {
+            p.hand
+                .iter()
+                .filter(|id| {
+                    state
+                        .objects
+                        .get(id)
+                        .is_some_and(|obj| obj.card_types.core_types.contains(&CoreType::Land))
+                })
+                .filter_map(colours_of)
+                .collect()
+        })
+        .unwrap_or_default();
+    let played = drops.min(in_hand.len());
+    if in_play.len() + played < cost.mana_value() as usize {
+        return false;
+    }
+    let pips: Vec<ColorDemand> = shards
+        .iter()
+        .map(|&shard| {
+            outer_cost_color_demand(&ManaCost::Cost {
+                shards: vec![shard],
+                generic: 0,
+            })
+        })
+        .filter(|demand| demand.iter().any(|&n| n > 0))
+        .collect();
+    let mut chosen = Vec::with_capacity(played);
+    any_land_choice(&in_hand, played, 0, &mut chosen, &mut |chosen| {
+        let sources: Vec<ColorDemand> = in_play.iter().chain(chosen.iter()).copied().collect();
+        pips_have_own_sources(&pips, &sources)
+    })
+}
+
+/// Whether some choice of `count` lands from `lands[from..]`, added to
+/// `chosen`, satisfies `accept`.
+fn any_land_choice(
+    lands: &[ColorDemand],
+    count: usize,
+    from: usize,
+    chosen: &mut Vec<ColorDemand>,
+    accept: &mut impl FnMut(&[ColorDemand]) -> bool,
+) -> bool {
+    if chosen.len() == count {
+        return accept(chosen);
+    }
+    for index in from..lands.len() {
+        chosen.push(lands[index]);
+        let found = any_land_choice(lands, count, index + 1, chosen, accept);
+        chosen.pop();
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// CR 107.4: each coloured pip is paid by one mana, so each needs a source of
+/// its own. A bipartite matching of pips to sources (augmenting paths), so a
+/// dual land is spent on one pip, never counted for two.
+fn pips_have_own_sources(pips: &[ColorDemand], sources: &[ColorDemand]) -> bool {
+    fn assign(
+        pip: usize,
+        pips: &[ColorDemand],
+        sources: &[ColorDemand],
+        seen: &mut [bool],
+        owner: &mut [Option<usize>],
+    ) -> bool {
+        for (source, colours) in sources.iter().enumerate() {
+            let pays = pips[pip]
+                .iter()
+                .zip(colours)
+                .any(|(&need, &has)| need > 0 && has > 0);
+            if !pays || seen[source] {
+                continue;
+            }
+            seen[source] = true;
+            if owner[source].is_none_or(|other| assign(other, pips, sources, seen, owner)) {
+                owner[source] = Some(pip);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owner = vec![None; sources.len()];
+    (0..pips.len()).all(|pip| {
+        let mut seen = vec![false; sources.len()];
+        assign(pip, pips, sources, &mut seen, &mut owner)
+    })
 }
 
 /// One battlefield walk yielding both halves of the color-demand comparison:

@@ -63,23 +63,28 @@
 use std::cmp::{Ordering, Reverse};
 
 use engine::game::filter::{matches_target_filter, FilterContext};
-use engine::game::game_object::GameObject;
+use engine::game::game_object::{BackFaceData, GameObject};
+use engine::game::mana_abilities::is_mana_ability;
 use engine::game::players;
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, Effect, PtValue,
-    QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, CostCategory, Effect,
+    PtValue, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
 };
 use engine::types::actions::GameAction;
+use engine::types::card::LayoutKind;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
+use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
-use crate::mana_colors::{land_produced_color_types, UnmetColors};
+use crate::ability_chain::collect_chain_effects;
+use crate::features::reanimator::{has_live_reanimation, once_and_spent, reanimation_target};
+use crate::mana_colors::{cost_within_land_drops, land_produced_color_types, UnmetColors};
 use crate::plan::PlanState;
 use crate::policies::effect_classify::{
     aura_polarity, effect_polarity, filter_admits_creature, lethal_to_creature, EffectPolarity,
@@ -581,7 +586,12 @@ pub(crate) fn worth_drawing(state: &GameState, obj_id: ObjectId, plan: Option<Pl
 /// keep or draw. One scale for every card:
 ///
 /// - a creature is its body, `1.5 * power + toughness`, plus half a point a
-///   pip; a land is 3.0. Both are the original pricing, unchanged.
+///   pip, plus what its abilities do ([`creature_ability_payoff`]): an
+///   activated ability once, its prepare spell while it has one to cast, an
+///   enters trigger on the current board and any other trigger once with its
+///   sign. Before this a creature was its body and pips alone, so Liliana the
+///   Repentant (6.0) and Fatehold Chronologist (4.5) went before a cantrip
+///   (`fork-checks/96d0bfd2a/JUDGE.md` S4). A land is 3.0, unchanged.
 /// - a noncreature, nonland card is half a point a pip plus what it does,
 ///   read from the engine's parse of its abilities ([`noncreature_payoff`]):
 ///   removal by the creature it answers, card draw by the cards it nets, a
@@ -598,7 +608,25 @@ pub(crate) fn worth_drawing(state: &GameState, obj_id: ObjectId, plan: Option<Pl
 /// reveal and choose-from-zone selections, the mulligan bottom and the
 /// large-board cast baseline in `search`.
 pub(crate) fn intrinsic_value(state: &GameState, obj_id: ObjectId) -> f64 {
-    value_with(state, obj_id, DrawPricing::LibraryMean)
+    value_with(state, obj_id, DrawPricing::LibraryMean, Depth::Top)
+}
+
+/// Whether [`value_with`] prices a creature's abilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    /// The card being priced: a creature's abilities count.
+    Top,
+    /// A card priced inside another card's price (the creature a removal
+    /// spell kills, the card a reanimation returns, the creature a fight
+    /// meets, the library mean): a creature is its body and pips, the
+    /// pricing before creature abilities were read. A price never asks for
+    /// itself again, and every noncreature card's price is unchanged.
+    Nested,
+}
+
+/// A card's price inside another card's price ([`Depth::Nested`]).
+fn nested_value(state: &GameState, obj_id: ObjectId) -> f64 {
+    value_with(state, obj_id, DrawPricing::LibraryMean, Depth::Nested)
 }
 
 /// How [`value_with`] prices a card drawn by the card being valued.
@@ -612,7 +640,7 @@ enum DrawPricing {
     Unpriced,
 }
 
-fn value_with(state: &GameState, obj_id: ObjectId, draws: DrawPricing) -> f64 {
+fn value_with(state: &GameState, obj_id: ObjectId, draws: DrawPricing, depth: Depth) -> f64 {
     let Some(obj) = state.objects.get(&obj_id) else {
         return 0.0;
     };
@@ -639,6 +667,8 @@ fn value_with(state: &GameState, obj_id: ObjectId, draws: DrawPricing) -> f64 {
 
     if !types.contains(&CoreType::Creature) && !types.contains(&CoreType::Land) {
         value += noncreature_payoff(state, obj, draws);
+    } else if types.contains(&CoreType::Creature) && depth == Depth::Top {
+        value += creature_ability_payoff(state, obj, draws);
     }
     value
 }
@@ -695,7 +725,7 @@ fn noncreature_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -
             .find(|keyword| matches!(keyword, Keyword::Enchant(_)))
         {
             if filter_admits_creature(filter) && !filter_names_only_own_permanents(filter) {
-                payoff += answer_value(state, obj, None, filter, |_| true);
+                payoff += answer_value(state, obj, None, filter, ANSWER_FLOOR, |_| true);
             }
         }
     }
@@ -786,6 +816,207 @@ fn planeswalker_payoff(
         })
         .fold(f64::from(loyalty) + triggers, f64::max)
 }
+
+/// What a creature's abilities do, on the creature scale of
+/// [`intrinsic_value`], beside its body: the pricing the noncreature and
+/// planeswalker paths use ([`definition_payoff`], each ability once), read
+/// from the engine's parse of the card. Four terms, each the line the scalar
+/// did not count before (the step 0 table,
+/// `deck-builder/sims/fra-phase/2026-10-20-creature-abilities/NOTE.md`):
+///
+/// - **Activated abilities** ([`activated_payoff`]): each once.
+/// - **The prepare spell** ([`prepare_spell_payoff`]): while it has one to
+///   cast.
+/// - **Its enters trigger** (CR 603.6a): what it does on the board it would
+///   enter now, for a creature not yet on the battlefield; on the battlefield
+///   it has fired and is not priced again (the [`Triggers::StillToFire`]
+///   reading).
+/// - **Every other trigger** once, with its sign ([`self_mill_cost`]).
+///
+/// Optional parts (a "you may" trigger) are never below 0. Keywords are not
+/// priced. The leaf does not read this: [`permanent_card_credit`] credits no
+/// creature, and the board sum in `eval` credits its body.
+fn creature_ability_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
+    let on_battlefield = obj.zone == Zone::Battlefield;
+    let triggers: f64 = obj
+        .trigger_definitions
+        .iter_unchecked()
+        .map(|entry| &entry.definition)
+        .filter(|trigger| !(on_battlefield && is_own_etb(trigger)))
+        .filter_map(|trigger| trigger.execute.as_deref().map(|execute| (trigger, execute)))
+        .map(|(trigger, execute)| {
+            let payoff =
+                definition_payoff(state, obj, execute, draws) + self_mill_cost(state, obj, execute);
+            if trigger.optional || execute.optional {
+                payoff.max(0.0)
+            } else {
+                payoff
+            }
+        })
+        .sum();
+    activated_payoff(state, obj, draws) + prepare_spell_payoff(state, obj, draws) + triggers
+}
+
+/// CR 602.1: a creature's activated abilities, each priced once at its
+/// payoff ([`definition_payoff`]), never below 0 (activating is optional).
+/// Read: abilities activated from the battlefield (not from hand or
+/// graveyard), not mana abilities (CR 605.1a; a mana source is the keep
+/// order's tier), not one whose cost sacrifices (the body it would cost is
+/// not netted, so it is left out rather than counted twice), and not one that
+/// can be activated only once and already was (CR 702.177a, exhaust;
+/// `reanimator::once_and_spent`).
+///
+/// An ability whose mana is not within [`ABILITY_REACH_LAND_DROPS`] land
+/// drops (`mana_colors::cost_within_land_drops`: sources now plus that many
+/// lands from hand, each pip its own coloured source) is discounted to
+/// [`UNREACHED_ABILITY_SHARE`] of its payoff.
+fn activated_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
+    obj.abilities
+        .iter()
+        .enumerate()
+        .filter(|(index, ability)| {
+            ability.kind == AbilityKind::Activated
+                && matches!(ability.activation_zone, None | Some(Zone::Battlefield))
+                && !is_mana_ability(ability)
+                && !ability
+                    .cost_categories()
+                    .contains(&CostCategory::SacrificesPermanent)
+                && !once_and_spent(state, obj.id, *index, ability)
+        })
+        .map(|(_, ability)| {
+            let payoff = definition_payoff(state, obj, ability, draws).max(0.0);
+            if payoff == 0.0 {
+                return 0.0;
+            }
+            let in_reach = ability
+                .cost
+                .as_ref()
+                .and_then(activation_mana)
+                .is_none_or(|mana| {
+                    cost_within_land_drops(state, obj.controller, &mana, ABILITY_REACH_LAND_DROPS)
+                });
+            if in_reach {
+                payoff
+            } else {
+                payoff * UNREACHED_ABILITY_SHARE
+            }
+        })
+        .sum()
+}
+
+/// How many turns' land drops an activated ability's mana may still be away
+/// and count at its full payoff (CR 305.2: one land a turn). UNTUNED.
+pub(crate) const ABILITY_REACH_LAND_DROPS: usize = 2;
+
+/// The share of its payoff an activated ability keeps when its mana is
+/// further away than [`ABILITY_REACH_LAND_DROPS`]. UNTUNED.
+pub(crate) const UNREACHED_ABILITY_SHARE: f64 = 0.5;
+
+/// The mana an activation cost asks for, its mana components added together
+/// (CR 601.2h: the total cost is paid at once), as `policies::ritual_sink`
+/// reads a cost's mana value; `None` for a cost with no fixed mana part (no
+/// mana, an X cost, a choice of costs), which is read as in reach.
+fn activation_mana(cost: &AbilityCost) -> Option<ManaCost> {
+    match cost {
+        AbilityCost::Mana { cost } => Some(cost.clone()),
+        AbilityCost::Composite { costs } => costs
+            .iter()
+            .filter_map(activation_mana)
+            .reduce(|total, part| total.plus(&part)),
+        _ => None,
+    }
+}
+
+/// CR 722.2a + CR 722.3c: the prepare spell's payoff while the creature has
+/// it to cast: on the battlefield while it is prepared (casting the copy
+/// unprepares it), and from any other zone when it enters prepared (CR
+/// 722.3a, a "~ enters prepared" replacement). The spell is priced as a spell
+/// in hand is ([`definition_payoff`] over its spell abilities, its best mode
+/// when modal), cast by the creature's controller, never below 0 (the copy
+/// "may" be cast). Its mana is not discounted.
+fn prepare_spell_payoff(state: &GameState, obj: &GameObject, draws: DrawPricing) -> f64 {
+    let Some(face) = prepare_face(obj) else {
+        return 0.0;
+    };
+    let has_it = match obj.zone {
+        Zone::Battlefield => obj.prepared.is_some(),
+        _ => enters_prepared(obj),
+    };
+    if !has_it {
+        return 0.0;
+    }
+    let values = face
+        .abilities
+        .iter()
+        .filter(|ability| ability.kind == AbilityKind::Spell)
+        .map(|ability| definition_payoff(state, obj, ability, draws));
+    let payoff = if face.modal.is_some() {
+        values.fold(0.0, f64::max)
+    } else {
+        values.sum()
+    };
+    payoff.max(0.0)
+}
+
+/// CR 722.2a + CR 722.2b: the prepare spell `obj` has now. The read the
+/// engine's `printed_cards::effective_prepare_face` makes (crate-private
+/// there): while a Layer 1 copy effect applies, the copy's prepare spell (or
+/// none); otherwise its own face of the Prepare layout.
+fn prepare_face(obj: &GameObject) -> Option<&BackFaceData> {
+    if obj.layer1_copy_effect.is_some() {
+        return obj.copied_prepare_face.as_deref();
+    }
+    obj.back_face
+        .as_ref()
+        .filter(|face| face.layout_kind == Some(LayoutKind::Prepare))
+}
+
+/// CR 722.3a: "This creature enters prepared": a replacement on its own
+/// move to the battlefield whose effect prepares it.
+fn enters_prepared(obj: &GameObject) -> bool {
+    obj.replacement_definitions
+        .iter_unchecked()
+        .any(|definition| {
+            definition.destination_zone == Some(Zone::Battlefield)
+                && definition.valid_card == Some(TargetFilter::SelfRef)
+                && definition.execute.as_deref().is_some_and(|execute| {
+                    matches!(
+                        &*execute.effect,
+                        Effect::BecomePrepared {
+                            target: TargetFilter::SelfRef,
+                            ..
+                        }
+                    )
+                })
+        })
+}
+
+/// CR 701.17a: a trigger that mills its controller's own library, as a cost:
+/// [`SELF_MILL_CARD_COST`] a card, unless its controller still has a
+/// reanimation to use (`reanimator::has_live_reanimation`, the card's own
+/// counted), when the milled cards are fuel and cost nothing. 0 for a trigger
+/// that mills nothing of its controller's.
+fn self_mill_cost(state: &GameState, obj: &GameObject, execute: &AbilityDefinition) -> f64 {
+    let milled: i32 = collect_chain_effects(execute)
+        .into_iter()
+        .map(|effect| match effect {
+            Effect::Mill {
+                count,
+                target: TargetFilter::Controller,
+                destination: Zone::Graveyard,
+            } => resolve_quantity(state, count, obj.controller, obj.id).max(0),
+            _ => 0,
+        })
+        .sum();
+    if milled == 0 || has_live_reanimation(state, obj.controller, obj) {
+        return 0.0;
+    }
+    -f64::from(milled) * SELF_MILL_CARD_COST
+}
+
+/// What a card milled from its controller's own library costs when nothing
+/// can return it: half a point, a pip's worth. UNTUNED.
+pub(crate) const SELF_MILL_CARD_COST: f64 = 0.5;
 
 /// What a spell still on the stack is worth to the search's leaf, in cards
 /// (`eval::EvalFeatures::card_credit`). CR 405.1 + CR 601.2a: a cast spell is
@@ -925,7 +1156,7 @@ fn chain_payoff(
                 target: TargetFilter::Controller,
                 ..
             } => discarded += quantity(count),
-            _ => payoff += effect_payoff(state, obj, effect),
+            _ => payoff += effect_payoff(state, obj, effect, draws),
         }
     }
     let net = (drawn - discarded).max(0);
@@ -946,7 +1177,23 @@ fn chain_payoff(
 ///
 /// A bounce, a pump, a tap, protection, life gain and everything else is 0:
 /// not removal, and priced by its pips alone as before.
-fn effect_payoff(state: &GameState, obj: &GameObject, effect: &Effect) -> f64 {
+///
+/// A creature's own abilities (`obj` a creature) are priced on the current
+/// board, since they happen when it enters or is used, not when an answer
+/// finds a target later: removal is worth what it removes now, nothing when
+/// nothing is there (no [`ANSWER_FLOOR`]), and a destroy or exile also
+/// reaches an opposing noncreature, nonland permanent; and the shapes only a
+/// creature's abilities are priced for ([`creature_effect_payoff`]: a
+/// reanimation, life gain, a fight). A noncreature card's effects are priced
+/// as before.
+fn effect_payoff(state: &GameState, obj: &GameObject, effect: &Effect, draws: DrawPricing) -> f64 {
+    let creature_source = obj.card_types.core_types.contains(&CoreType::Creature);
+    if creature_source {
+        if let Some(payoff) = creature_effect_payoff(state, obj, effect, draws) {
+            return payoff;
+        }
+    }
+    let floor = if creature_source { 0.0 } else { ANSWER_FLOOR };
     match effect {
         Effect::Token {
             power: PtValue::Fixed(power),
@@ -961,22 +1208,156 @@ fn effect_payoff(state: &GameState, obj: &GameObject, effect: &Effect) -> f64 {
         }
         Effect::Counter { .. } => ANSWER_FLOOR,
         Effect::DestroyAll { target, .. } => {
-            sweep_value(state, obj, target, |id| !indestructible(state, id))
+            sweep_value(state, obj, target, floor, |id| !indestructible(state, id))
         }
         Effect::DamageAll { target, .. } | Effect::PumpAll { target, .. }
             if effect_polarity(effect) == EffectPolarity::Harmful =>
         {
-            sweep_value(state, obj, target, |id| {
+            sweep_value(state, obj, target, floor, |id| {
                 lethal_to_creature(state, id, &[effect]) == Some(true)
             })
         }
-        _ => match spot_kill(effect) {
-            Some((filter, kills)) => answer_value(state, obj, Some(effect), filter, |id| {
-                kills.kills(state, id, effect)
-            }),
-            None => 0.0,
-        },
+        _ => {
+            let creature_answer = match spot_kill(effect) {
+                Some((filter, kills)) => {
+                    answer_value(state, obj, Some(effect), filter, floor, |id| {
+                        kills.kills(state, id, effect)
+                    })
+                }
+                None => 0.0,
+            };
+            if creature_source {
+                creature_answer.max(noncreature_permanent_answer(state, obj, effect))
+            } else {
+                creature_answer
+            }
+        }
     }
+}
+
+/// The payoff of an effect only a creature's own abilities are priced for,
+/// or `None` to price it as any card's effect ([`effect_payoff`]):
+///
+/// - CR 404.1 + CR 110.1: a reanimation (`reanimator::reanimation_target`)
+///   is the best card it can return from a graveyard now, at its own price
+///   ([`nested_value`]); nothing when no legal card is there. The creature
+///   itself is not a target of its own ability.
+/// - CR 119.3: life its controller gains, at [`LIFE_CARD_SHARE_PER_POINT`]
+///   of one expected draw a point.
+/// - CR 701.14a: "it fights" (the creature itself fights a target): the
+///   best exchange it can take ([`fight_exchange`]).
+fn creature_effect_payoff(
+    state: &GameState,
+    obj: &GameObject,
+    effect: &Effect,
+    draws: DrawPricing,
+) -> Option<f64> {
+    if let Some(filter) = reanimation_target(effect) {
+        let filter_ctx = FilterContext::from_source(state, obj.id);
+        return Some(
+            state
+                .players
+                .iter()
+                .flat_map(|player| player.graveyard.iter().copied())
+                .filter(|&id| id != obj.id && matches_target_filter(state, id, filter, &filter_ctx))
+                .map(|id| nested_value(state, id))
+                .fold(0.0, f64::max),
+        );
+    }
+    match effect {
+        Effect::GainLife {
+            amount,
+            player: TargetFilter::Controller,
+        } => Some(match draws {
+            DrawPricing::LibraryMean => {
+                let life = resolve_quantity(state, amount, obj.controller, obj.id).max(0);
+                f64::from(life) * LIFE_CARD_SHARE_PER_POINT * draw_unit(state, obj.controller)
+            }
+            DrawPricing::Unpriced => 0.0,
+        }),
+        Effect::Fight {
+            target,
+            subject: TargetFilter::SelfRef,
+        } => Some(fight_exchange(state, obj, effect, target)),
+        _ => None,
+    }
+}
+
+/// Life on the card scale: the share of one card a point of life is worth,
+/// the existing life weight (`PolicyPenalties::mode_choice_damage_per_point`'s
+/// default, the price a modal choice puts on a point of damage). UNTUNED.
+pub(crate) const LIFE_CARD_SHARE_PER_POINT: f64 = 0.15;
+
+/// CR 701.14a: each fighter deals damage equal to its power to the other.
+/// The best exchange `fighter` can take against an opposing creature
+/// `filter` admits: the target's price ([`nested_value`]) if the damage
+/// destroys it, less the fighter's own price if the target's damage destroys
+/// it. Lethal damage is toughness less damage already marked (CR 704.5g),
+/// any damage from a deathtouch source (CR 702.2b), and an indestructible
+/// creature survives it (CR 702.12b). Never below 0: a losing fight is not
+/// taken (an "up to one" fight takes no target; the 2026-10-20 engine fix
+/// made that answer reachable). A fight its controller must take into a
+/// loss is read as 0 too.
+fn fight_exchange(
+    state: &GameState,
+    fighter: &GameObject,
+    effect: &Effect,
+    filter: &TargetFilter,
+) -> f64 {
+    let destroys = |source: &GameObject, victim: &GameObject| {
+        let power = source.power.unwrap_or(0).max(0);
+        let left = victim.toughness.unwrap_or(0) - victim.damage_marked as i32;
+        power > 0
+            && !victim.has_keyword(&Keyword::Indestructible)
+            && (power >= left || source.has_keyword(&Keyword::Deathtouch))
+    };
+    let own_price = nested_value(state, fighter.id);
+    opposing_creatures(state, fighter, Some(effect), filter)
+        .into_iter()
+        .filter_map(|id| state.objects.get(&id))
+        .map(|target| {
+            let gained = if destroys(fighter, target) {
+                nested_value(state, target.id)
+            } else {
+                0.0
+            };
+            let lost = if destroys(target, fighter) {
+                own_price
+            } else {
+                0.0
+            };
+            gained - lost
+        })
+        .fold(0.0, f64::max)
+}
+
+/// CR 701.8a + CR 406.1: what a destroy or an exile from the battlefield
+/// removes among the opposing noncreature, nonland permanents its filter
+/// admits, at the permanent's price ([`nested_value`]); 0 with none there or
+/// for any other effect. A creature target is [`spot_kill`]'s, a land is not
+/// removal on this scale.
+fn noncreature_permanent_answer(state: &GameState, obj: &GameObject, effect: &Effect) -> f64 {
+    let (filter, kill) = match effect {
+        Effect::Destroy { target, .. } => (target, SpotKill::Destroy),
+        Effect::ChangeZone {
+            origin: None | Some(Zone::Battlefield),
+            destination: Zone::Exile | Zone::Graveyard | Zone::Library,
+            target,
+            ..
+        } => (target, SpotKill::Removes),
+        _ => return 0.0,
+    };
+    if filter_names_only_own_permanents(filter) {
+        return 0.0;
+    }
+    opposing_permanents(state, obj, Some(effect), filter, |o| {
+        !o.card_types.core_types.contains(&CoreType::Creature)
+            && !o.card_types.core_types.contains(&CoreType::Land)
+    })
+    .into_iter()
+    .filter(|&id| kill != SpotKill::Destroy || !indestructible(state, id))
+    .map(|id| nested_value(state, id))
+    .fold(0.0, f64::max)
 }
 
 /// How a single-target removal effect ends a creature.
@@ -1075,28 +1456,33 @@ fn spot_kill(effect: &Effect) -> Option<(&TargetFilter, SpotKill)> {
 pub(crate) const ANSWER_FLOOR: f64 = 6.0;
 
 /// Removal's value: the most valuable opposing creature on the battlefield
-/// that `filter` admits and `kills` ends, at its own [`intrinsic_value`],
-/// never less than [`ANSWER_FLOOR`].
+/// that `filter` admits and `kills` ends, at its body ([`nested_value`]),
+/// never less than `floor` ([`ANSWER_FLOOR`] for a card held to answer a
+/// creature later, 0 for a creature's own ability, which acts on the board
+/// it enters).
 fn answer_value(
     state: &GameState,
     obj: &GameObject,
     effect: Option<&Effect>,
     filter: &TargetFilter,
+    floor: f64,
     kills: impl Fn(ObjectId) -> bool,
 ) -> f64 {
     opposing_creatures(state, obj, effect, filter)
         .into_iter()
         .filter(|&id| kills(id))
-        .map(|id| intrinsic_value(state, id))
-        .fold(ANSWER_FLOOR, f64::max)
+        .map(|id| nested_value(state, id))
+        .fold(floor, f64::max)
 }
 
 /// Mass removal's value: the opposing creatures it ends less the caster's
-/// own, each at its [`intrinsic_value`], never less than [`ANSWER_FLOOR`].
+/// own, each at its body ([`nested_value`]), never less than `floor` (as
+/// [`answer_value`]'s).
 fn sweep_value(
     state: &GameState,
     obj: &GameObject,
     filter: &TargetFilter,
+    floor: f64,
     kills: impl Fn(ObjectId) -> bool,
 ) -> f64 {
     let filter_ctx = FilterContext::from_source(state, obj.id);
@@ -1113,7 +1499,7 @@ fn sweep_value(
                 && kills(id)
         })
         .map(|id| {
-            let value = intrinsic_value(state, id);
+            let value = nested_value(state, id);
             if state.objects[&id].controller == obj.controller {
                 -value
             } else {
@@ -1121,7 +1507,7 @@ fn sweep_value(
             }
         })
         .sum();
-    net.max(ANSWER_FLOOR)
+    net.max(floor)
 }
 
 /// The opposing creatures on the battlefield that `filter` admits, read from
@@ -1135,6 +1521,19 @@ fn opposing_creatures(
     obj: &GameObject,
     effect: Option<&Effect>,
     filter: &TargetFilter,
+) -> Vec<ObjectId> {
+    opposing_permanents(state, obj, effect, filter, |o| {
+        o.card_types.core_types.contains(&CoreType::Creature)
+    })
+}
+
+/// [`opposing_creatures`] for any opposing permanent `kind` admits.
+fn opposing_permanents(
+    state: &GameState,
+    obj: &GameObject,
+    effect: Option<&Effect>,
+    filter: &TargetFilter,
+    kind: impl Fn(&GameObject) -> bool,
 ) -> Vec<ObjectId> {
     let mut found = Vec::new();
     for opponent in players::opponents(state, obj.controller) {
@@ -1151,9 +1550,11 @@ fn opposing_creatures(
             None => FilterContext::from_source(state, obj.id),
         };
         found.extend(state.battlefield.iter().copied().filter(|&id| {
-            state.objects.get(&id).is_some_and(|o| {
-                o.controller == opponent && o.card_types.core_types.contains(&CoreType::Creature)
-            }) && matches_target_filter(state, id, filter, &filter_ctx)
+            state
+                .objects
+                .get(&id)
+                .is_some_and(|o| o.controller == opponent && kind(o))
+                && matches_target_filter(state, id, filter, &filter_ctx)
         }));
     }
     found
@@ -1170,7 +1571,10 @@ fn indestructible(state: &GameState, id: ObjectId) -> bool {
 /// [`intrinsic_value`] scale: the library's mean with drawn cards unpriced
 /// ([`DrawPricing::Unpriced`]), floored at [`EXPECTED_DRAW_FLOOR`]. The
 /// library's order is hidden, so a draw is an expected card, as
-/// [`expected_draw_value`] reads it.
+/// [`expected_draw_value`] reads it. Library creatures are their bodies
+/// ([`Depth::Nested`]): the unit every draw is priced in does not move with
+/// creature abilities, and a creature's life-gain or draw term never asks for
+/// the mean it sits in.
 fn draw_unit(state: &GameState, player: PlayerId) -> f64 {
     let Some(library) = state.players.get(player.0 as usize).map(|p| &p.library) else {
         return EXPECTED_DRAW_FLOOR;
@@ -1180,7 +1584,7 @@ fn draw_unit(state: &GameState, player: PlayerId) -> f64 {
     }
     let total: f64 = library
         .iter()
-        .map(|&id| value_with(state, id, DrawPricing::Unpriced))
+        .map(|&id| value_with(state, id, DrawPricing::Unpriced, Depth::Nested))
         .sum();
     (total / library.len() as f64).max(EXPECTED_DRAW_FLOOR)
 }
