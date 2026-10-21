@@ -998,3 +998,214 @@ fn hc4_the_opponents_known_hand_card_is_credited_and_an_unknown_one_is_not() {
         );
     }
 }
+
+// --- Pair 4: the judge's rows on c3a3a59a6 (JR1 to JR4), and an escape or
+// unearth permanent carrying its graveyard credit on the battlefield ------
+//
+// `fork-checks/c3a3a59a6/JUDGE.md` B1: an escape or unearth permanent carried
+// its graveyard credit in hand and lost it when cast, so the leaf charged a
+// card for casting it (JR4). Its graveyard cast follows its hand cast only
+// after it leaves the battlefield (CR 702.138a, CR 702.84a), so holding it and
+// casting it have the same graveyard future. An unearthed creature is exiled
+// when it would leave (CR 702.84a) and carries none. JR1 to JR3 are the
+// judge's permanent rows (S3).
+
+/// JR1 (focus 3, CR 601.2a + CR 601.2h): two Twinned Visions in P0's
+/// graveyard at nine Islands; one is cast by flashback and the prompt stops at
+/// its discard cost, while the card still sits in the graveyard with its Spell
+/// entry on the stack. The card being cast is not credited from the graveyard;
+/// the second copy still is, so the leaf's graveyard term is exactly one copy.
+#[test]
+fn judge_jr1_the_card_being_cast_is_not_credited_but_its_twin_is() {
+    let mut s = table(9, 2);
+    let cast = twinned_vision_in_graveyard(&mut s, P0);
+    let twin = twinned_vision_in_graveyard(&mut s, P0);
+    plain_sorcery_in_hand(&mut s, P0);
+    let prompt = flashback_cost(s, cast, Phase::PreCombatMain);
+    assert_eq!(
+        prompt.objects[&cast].zone,
+        engine::types::zones::Zone::Graveyard,
+        "precondition: still in the graveyard at the cost"
+    );
+    assert!(
+        prompt.stack.iter().any(|e| e.source_id == cast),
+        "precondition: its Spell entry is on the stack"
+    );
+    let cast_credit = crate::card_value::graveyard_cast_credit(&prompt, &prompt.objects[&cast]);
+    let twin_credit = crate::card_value::graveyard_cast_credit(&prompt, &prompt.objects[&twin]);
+    let features = crate::eval::evaluate_features(&prompt, P0).expect("non-terminal");
+    assert_eq!(cast_credit, 0.0);
+    assert!(twin_credit > 0.5, "the twin is credited: {twin_credit}");
+    assert!((features.graveyard_casts - twin_credit).abs() < 1e-9);
+}
+
+/// JR2 (focus 2, CR 701.17a mill + CR 702.34a): Twinned Vision on top of P0's
+/// library against the same card milled into P0's graveyard (a plain card
+/// takes its place on top, so library and graveyard sizes match). The leaf
+/// reads the milled flashback card one card higher at both leaves.
+#[test]
+fn judge_jr2_milling_a_flashback_card_reads_its_graveyard_cast() {
+    let in_library = {
+        let mut s = table(9, 2);
+        s.add_spell_to_library_top(P0, "Twinned Vision", true)
+            .with_mana_cost(twinned_vision_cost())
+            .from_oracle_text_with_keywords(&["Flashback"], TWINNED_VISION);
+        plain_sorcery_in_graveyard(&mut s, P0);
+        plain_sorcery_in_hand(&mut s, P0);
+        late(s)
+    };
+    let milled = {
+        let mut s = table(9, 2);
+        s.add_spell_to_library_top(P0, "Plain Sorcery", false)
+            .with_mana_cost(twinned_vision_cost());
+        twinned_vision_in_graveyard(&mut s, P0);
+        plain_sorcery_in_hand(&mut s, P0);
+        late(s)
+    };
+    assert_gap("JR2", leaf_gaps(true, &milled, &in_library), 1.0);
+}
+
+/// JR3 (focus 2, the harvest fold): with a castable flashback card in P0's
+/// graveyard, a surplus land in each hand and plans in the session, the
+/// harvested row weighted by the served weights, plus the serve-time
+/// carve-outs, equals the strategy leaf to 1e-9, with both new terms non-zero.
+#[test]
+fn judge_jr3_harvest_fold_reconstructs_the_leaf_with_both_new_terms_live() {
+    let state = {
+        let mut s = table(9, 9);
+        twinned_vision_in_graveyard(&mut s, P0);
+        s.add_land_to_hand(P0, "Island");
+        s.add_land_to_hand(P0, "Island");
+        s.add_land_to_hand(P1, "Plains");
+        plain_sorcery_in_hand(&mut s, P0);
+        late(s)
+    };
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let policies = crate::policies::PolicyRegistry::shared();
+    let context = context(&config, true);
+    let services = PlannerServices::new(P0, &config, policies, context);
+    let weights = services
+        .context
+        .adjusted_weights
+        .for_turn(state.turn_number);
+    let features =
+        crate::eval::evaluate_features_with_plans(&state, P0, Some(&services.context.session.plan))
+            .expect("non-terminal");
+    assert!(
+        features.graveyard_casts.abs() > 0.5,
+        "non-vacuous: {}",
+        features.graveyard_casts
+    );
+    assert!(
+        features.surplus_lands.abs() > 0.5,
+        "non-vacuous: {}",
+        features.surplus_lands
+    );
+    let row =
+        crate::duel_suite::harvest::FeatureRow::extract(&state, &services.context.session, P0)
+            .expect("non-terminal");
+    let reconstructed = row.weighted_total(weights)
+        + row.energy_offset
+        + row.mana_development_offset
+        + services.threat_adjustment(&state);
+    let served = services.evaluate_with_strategy(&state);
+    assert!(
+        (served - reconstructed).abs() < 1e-9,
+        "served {served} reconstructed {reconstructed}"
+    );
+}
+
+/// JR4 (focus 2, CR 702.138a): an escape creature's graveyard cast follows
+/// its hand cast only after it leaves the battlefield, so casting it does not
+/// spend the escape. The escape credit SHALL be the same in hand and on the
+/// battlefield (each against a plain 3/3 in the same zone, two other cards in
+/// the graveyard to exile). Red at c3a3a59a6: hand 1 card, battlefield 0.
+#[test]
+fn judge_jr4_an_escape_creature_carries_the_same_credit_held_or_cast() {
+    const ESCAPE: &str = "Escape—{2}{B}, Exile two other cards from your graveyard. (You may \
+        cast this card from your graveyard for its escape cost.)";
+    let cost = || ManaCost::Cost {
+        shards: vec![ManaCostShard::Black],
+        generic: 2,
+    };
+    let build = |zone: &str, escape: bool| {
+        let mut s = table(9, 2);
+        s.add_basic_land(P0, ManaColor::Black);
+        plain_sorcery_in_graveyard(&mut s, P0);
+        plain_sorcery_in_graveyard(&mut s, P0);
+        let mut b = if zone == "hand" {
+            s.add_creature_to_hand_from_oracle(P0, "Brute", 3, 3, "")
+        } else {
+            s.add_creature(P0, "Brute", 3, 3)
+        };
+        b.with_mana_cost(cost());
+        if escape {
+            b.from_oracle_text_with_keywords(&["Escape"], ESCAPE);
+        }
+        late(s)
+    };
+    let (hand, _, w) = leaf_gaps(true, &build("hand", true), &build("hand", false));
+    let (field, _, _) = leaf_gaps(
+        true,
+        &build("battlefield", true),
+        &build("battlefield", false),
+    );
+    assert!(
+        (hand - field).abs() < 1e-6,
+        "escape credit held {} cards, cast {} cards",
+        hand / w,
+        field / w
+    );
+}
+
+/// UB1 (CR 702.84a): a creature with unearth and "When this creature enters,
+/// draw a card." carries its unearth credit on the battlefield as in hand (one
+/// card, against a vanilla 2/2 in the same zone); once unearthed, with the
+/// "if it would leave the battlefield, exile it instead" replacement on it,
+/// it carries none.
+#[test]
+fn ub1_an_unearth_creature_carries_its_credit_on_the_battlefield_unless_unearthed() {
+    const UNEARTH_SCOUT: &str = "When this creature enters, draw a card.\nUnearth {U} ({U}: \
+        Return this card from your graveyard to the battlefield. It gains haste. Exile it at \
+        the beginning of the next end step or if it would leave the battlefield. Unearth only \
+        as a sorcery.)";
+    let build = |unearth: bool, unearthed: bool| {
+        let mut s = table(9, 2);
+        let id = if unearth {
+            s.add_creature(P0, "Scout", 2, 2)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 1,
+                })
+                .from_oracle_text_with_keywords(&["Unearth"], UNEARTH_SCOUT)
+                .id()
+        } else {
+            s.add_creature(P0, "Scout", 2, 2)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 1,
+                })
+                .id()
+        };
+        let mut state = late(s);
+        if unearthed {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .replacement_definitions
+                .push(engine::parser::oracle_effect::leave_battlefield_exile_replacement());
+        }
+        state
+    };
+    assert_gap(
+        "UB1 cast normally",
+        leaf_gaps(true, &build(true, false), &build(false, false)),
+        1.0,
+    );
+    assert_gap(
+        "UB1 unearthed",
+        leaf_gaps(true, &build(true, true), &build(false, true)),
+        0.0,
+    );
+}

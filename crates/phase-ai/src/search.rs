@@ -16473,6 +16473,120 @@ mod tests {
         );
     }
 
+    // Judge rows JS1 to JS4 (`fork-checks/c3a3a59a6/JUDGE.md` P1, lead ruling):
+    // past the mana target a pure rock (nothing but its mana ability) is
+    // Surplus; a mana creature keeps the tier its body earns.
+
+    fn judge_pure_rock(state: &mut GameState, owner: PlayerId, zone: Zone) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            owner,
+            "Pure Rock".to_string(),
+            zone,
+        );
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+        set_cost(state, id, Vec::new(), 3);
+        push_mana_ability(state, id);
+        id
+    }
+
+    fn judge_mana_beast(state: &mut GameState, owner: PlayerId, zone: Zone) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            owner,
+            "Mana Beast".to_string(),
+            zone,
+        );
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+        }
+        set_cost(state, id, vec![ManaCostShard::Black], 2);
+        push_mana_ability(state, id);
+        id
+    }
+
+    /// JS1 (cleanup, CR 514.1): nine lands; a surplus land, a pure {3} rock and
+    /// two fatties in hand; discard one. The rock goes (P1: red at c3a3a59a6).
+    #[test]
+    fn judge_js1_cleanup_surplus_land_against_a_pure_rock() {
+        let mut state = state_with_lands(9);
+        let ai = PlayerId(0);
+        let _land = land_in_hand(&mut state, ai);
+        let rock = judge_pure_rock(&mut state, ai, Zone::Hand);
+        for _ in 0..2 {
+            fatty_in_hand(&mut state, ai);
+        }
+        state.waiting_for = discard_waiting_for(&state, ai, 1);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let chosen = selected_card(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+        assert_eq!(
+            chosen, rock,
+            "JS1: the pure rock goes, the surplus land is kept"
+        );
+    }
+
+    /// JS2 (scry, CR 701.22a): nine lands; scry 1 reveals a 4/4 mana creature: kept.
+    #[test]
+    fn judge_js2_scry_keeps_a_mana_creature_past_the_mana_target() {
+        let mut state = state_with_lands(9);
+        let ai = PlayerId(0);
+        let beast = judge_mana_beast(&mut state, ai, Zone::Library);
+        state.waiting_for = scry_prompt(ai, vec![beast]);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+        assert_eq!(kept, vec![beast]);
+    }
+
+    /// JS3 (surveil, CR 701.25a): nine lands; surveil 1 reveals a pure rock: binned
+    /// (P1: red at c3a3a59a6).
+    #[test]
+    fn judge_js3_surveil_bins_a_pure_rock_past_the_mana_target() {
+        let mut state = state_with_lands(9);
+        let ai = PlayerId(0);
+        let rock = judge_pure_rock(&mut state, ai, Zone::Library);
+        state.waiting_for = surveil_prompt(ai, vec![rock]);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let ctx = context_with_plans(&state, ai, &config, &[(ai, default_deck_plan())]);
+        let kept = kept_on_top(deterministic_choice(&state, ai, &config, &[], Some(&ctx)));
+        assert!(kept.is_empty(), "JS3: kept {kept:?}");
+    }
+
+    /// JS4 (expected draw, CR 121.1): nine lands; library = a 4/4 mana creature and
+    /// a land. The draw is the mean of the creature's intrinsic value and 0.
+    #[test]
+    fn judge_js4_expected_draw_prices_a_mana_creature_at_its_body() {
+        let mut state = state_with_lands(9);
+        let ai = PlayerId(0);
+        state.players[0].library.clear();
+        let beast = judge_mana_beast(&mut state, ai, Zone::Library);
+        let _land = library_land(&mut state, ai);
+        let plan = Some(crate::plan::PlanState::realize(
+            &state,
+            ai,
+            &default_deck_plan(),
+        ));
+        let want =
+            (intrinsic_value(&state, beast) / 2.0).max(crate::card_value::EXPECTED_DRAW_FLOOR);
+        let got = crate::card_value::expected_draw_value(&state, ai, plan).unwrap();
+        assert!(
+            (got - want).abs() < 1e-9,
+            "JS4: expected draw {got}, want {want}"
+        );
+    }
+
     /// Scry and surveil read one keep test: the same pile gets the same
     /// partition from both arms (top set for scry = top set for surveil).
     #[test]
