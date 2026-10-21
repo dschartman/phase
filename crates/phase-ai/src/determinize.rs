@@ -139,23 +139,27 @@ pub fn determinize_opponents(
 /// `sync_continuous_reveals`). Membership-only — never iterated for output order
 /// (the #4878 determinism discipline).
 fn pinned_known_ids(state: &GameState, ai_player: PlayerId) -> HashSet<ObjectId> {
-    let mut ids: HashSet<ObjectId> = HashSet::new();
-    // Continuous + momentary reveals (post-sync).
-    ids.extend(state.revealed_cards.iter().copied());
-    // One-shot reveals, never cleared.
-    ids.extend(state.public_revealed_cards.iter().copied());
-    // CR 701.20e: a looked-at card is known only to the looking player.
-    if state.private_look_player == Some(ai_player) {
-        ids.extend(state.private_look_ids.iter().copied());
-    }
-    ids.extend(
-        state
-            .objects
-            .keys()
-            .copied()
-            .filter(|&id| state.viewer_knows_card_identity(ai_player, id)),
-    );
-    ids
+    state
+        .objects
+        .keys()
+        .copied()
+        .filter(|&id| viewer_knows_card(state, ai_player, id))
+        .collect()
+}
+
+/// CR 400.2 / CR 701.20a / CR 701.20e: whether `viewer` legitimately knows
+/// the identity of object `id`, the per-card reading [`pinned_known_ids`]
+/// collects: a continuous or momentary reveal (`revealed_cards`, after
+/// `sync_continuous_reveals`), a one-shot reveal (`public_revealed_cards`), a
+/// card `viewer` looked at (a looked-at card is known only to the looking
+/// player), or the engine's knowledge facts
+/// (`GameState::viewer_knows_card_identity`). The search's leaf reads an
+/// opponent's hand card only when this holds.
+pub(crate) fn viewer_knows_card(state: &GameState, viewer: PlayerId, id: ObjectId) -> bool {
+    state.revealed_cards.contains(&id)
+        || state.public_revealed_cards.contains(&id)
+        || (state.private_look_player == Some(viewer) && state.private_look_ids.contains(&id))
+        || state.viewer_knows_card_identity(viewer, id)
 }
 
 /// Ordered unknown hidden-zone slots for `opponent`: its `hand` (in order) then

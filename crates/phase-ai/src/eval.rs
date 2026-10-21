@@ -299,10 +299,13 @@ pub struct EvalFeatures {
     /// harvested; the opponent's 0 stays four cards here.
     pub library_floor: f64,
     /// CR 702.34a + CR 702.138a + CR 702.84a: the (self - opponent)
-    /// differential of what each side's graveyard can still cast or unearth,
-    /// in cards (`card_value::graveyard_cast_credit`: the cast's payoff in
-    /// expected draws, less the cards its cost discards, while its mana is
-    /// within reach), opponents aggregated like `card_advantage_breakdown`.
+    /// differential of what each side can still cast or unearth from its
+    /// graveyard, in cards (`card_value::graveyard_cast_credit`: the cast's
+    /// payoff in expected draws, less the cards its cost discards, while its
+    /// mana is within reach), for the cards in its graveyard and in its hand
+    /// (a hand card carries its graveyard cast beside its one hand card; of
+    /// an opponent's hand only the cards the player knows, CR 701.20a),
+    /// opponents aggregated like `card_advantage_breakdown`.
     /// Priced at the **hand-size weight**, so a flashback card whose
     /// graveyard cast nets a card reads as that card whether the line has
     /// spent the cast or kept it. Not a 17Lands column: `FeatureRow::extract`
@@ -330,13 +333,21 @@ fn library_shortfall(state: &GameState, player: PlayerId) -> f64 {
     LIBRARY_FLOOR.saturating_sub(state.players[player.0 as usize].library.len()) as f64
 }
 
-/// What `player`'s graveyard can still cast or unearth, in cards
-/// (`card_value::graveyard_cast_credit`). CR 404.1 + CR 400.1: the graveyard
-/// `graveyard_of` resolves, so a shared graveyard reads alike for every seat.
-fn graveyard_cast_cards(state: &GameState, player: PlayerId) -> f64 {
-    state
-        .graveyard_of(player)
+/// What `seat`'s graveyard and hand can still cast or unearth from the
+/// graveyard, in cards (`card_value::graveyard_cast_credit`), as `viewer`
+/// reads them: every graveyard card (CR 404.1 + CR 400.1, the graveyard
+/// `graveyard_of` resolves, so a shared graveyard reads alike for every
+/// seat), `viewer`'s own hand, and of another seat's hand only the cards
+/// `viewer` knows (CR 701.20a, `determinize::viewer_knows_card`).
+fn graveyard_cast_cards(state: &GameState, seat: PlayerId, viewer: PlayerId) -> f64 {
+    let hand = state.players[seat.0 as usize]
+        .hand
         .iter()
+        .filter(|&&id| seat == viewer || crate::determinize::viewer_knows_card(state, viewer, id));
+    state
+        .graveyard_of(seat)
+        .iter()
+        .chain(hand)
         .filter_map(|id| state.objects.get(id))
         .filter(|obj| zone_eval::has_recursion_keyword(obj))
         .map(|obj| crate::card_value::graveyard_cast_credit(state, obj))
@@ -662,7 +673,7 @@ pub fn evaluate_features_with_plans(
             weighted_opp_nc += opp_stats.non_creatures as f64 * w;
             weighted_opp_sources += opp_stats.mana_sources as f64 * w;
             weighted_opp_shortfall += library_shortfall(state, opp) * w;
-            weighted_opp_graveyard_casts += graveyard_cast_cards(state, opp) * w;
+            weighted_opp_graveyard_casts += graveyard_cast_cards(state, opp, player) * w;
             weighted_opp_surplus_lands += surplus_land_count(state, opp, plans) * w;
             weighted_opp_credit.add_scaled(&structural_credit(state, opp, &after_cleanup), w);
         }
@@ -683,7 +694,7 @@ pub fn evaluate_features_with_plans(
         );
         features.library_floor = weighted_opp_shortfall - library_shortfall(state, player);
         features.graveyard_casts =
-            graveyard_cast_cards(state, player) - weighted_opp_graveyard_casts;
+            graveyard_cast_cards(state, player, player) - weighted_opp_graveyard_casts;
         features.surplus_lands =
             weighted_opp_surplus_lands - surplus_land_count(state, player, plans);
 
@@ -714,7 +725,7 @@ pub fn evaluate_features_with_plans(
             total_opp_nc += opp_stats.non_creatures;
             total_opp_sources += opp_stats.mana_sources;
             total_opp_shortfall += library_shortfall(state, opp);
-            total_opp_graveyard_casts += graveyard_cast_cards(state, opp);
+            total_opp_graveyard_casts += graveyard_cast_cards(state, opp, player);
             total_opp_surplus_lands += surplus_land_count(state, opp, plans);
             opp_credit.add_scaled(
                 &structural_credit(state, opp, &after_cleanup),
@@ -742,7 +753,7 @@ pub fn evaluate_features_with_plans(
         );
         features.library_floor = total_opp_shortfall / opp_count - library_shortfall(state, player);
         features.graveyard_casts =
-            graveyard_cast_cards(state, player) - total_opp_graveyard_casts / opp_count;
+            graveyard_cast_cards(state, player, player) - total_opp_graveyard_casts / opp_count;
         features.surplus_lands =
             total_opp_surplus_lands / opp_count - surplus_land_count(state, player, plans);
 
