@@ -27,4 +27,5 @@ pub mod removal_lethality;
 pub mod sac_outlet_drain_repro;
 pub mod score_contract_lint;
 pub mod self_bounce_target;
+pub mod trigger_shape_value;
 pub mod vehicle_deployment;
