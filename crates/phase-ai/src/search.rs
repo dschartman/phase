@@ -14313,26 +14313,24 @@ mod tests {
         }
     }
 
-    // V6 hostile (saturation): a tiny node cap saturates the deepest searched rung
-    // while it is still ACCEPTED (node-budget exhaustion does not discard). The
+    // V6 hostile (saturation): a tiny node cap saturates a searched rung before
+    // its last root sibling finishes, so that rung does not count (re-pinned by
+    // spec-ai-search-partial-rung-2026-10-20, which reverses "node-budget
+    // exhaustion does not discard"): it is the last rung run, every rung before
+    // it completed, and the scores are those of a run stopped before it. The
     // saturation predicate is `nodes_used >= max_nodes` (not `==`): `tick()`
-    // increments unconditionally at `search_value` entry while `exhausted()` checks
-    // `>=`, so the counter can overshoot the cap by one.
+    // increments unconditionally at `search_value` entry while `exhausted()`
+    // checks `>=`, so the counter can overshoot the cap by one.
     #[test]
-    fn rung_stats_saturated_rung_is_still_accepted() {
+    fn rung_stats_saturated_rung_does_not_count() {
         let state = searchable_state();
         let policies = PolicyRegistry::shared();
         let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
-        config.search.max_nodes = 4; // tiny -> deepest searched rung saturates
+        config.search.max_nodes = 4; // tiny -> a searched rung saturates
         let mut services = PlannerServices::new_default(PlayerId(0), &config, policies);
         let ranked = build_root_beam(&state, &services);
-        let _ = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        let out = run_iterative_deepening(&state, ranked.clone(), 0.1, &config, &mut services);
 
-        let deepest = services.rung_stats.last().expect("at least rung 0 ran");
-        assert!(
-            deepest.completed,
-            "node-budget exhaustion must NOT discard a rung"
-        );
         assert!(
             services
                 .rung_stats
@@ -14340,6 +14338,170 @@ mod tests {
                 .any(|r| r.depth >= 1 && r.nodes_used >= r.max_nodes),
             "a searched rung must saturate the tiny node pool (nodes_used >= max_nodes)"
         );
+        let deepest = services.rung_stats.last().expect("at least rung 0 ran");
+        assert!(
+            deepest.depth >= 1 && !deepest.completed,
+            "the saturated rung does not count: {:?}",
+            services.rung_stats
+        );
+        let earlier = &services.rung_stats[..services.rung_stats.len() - 1];
+        assert!(earlier.iter().all(|r| r.completed), "{earlier:?}");
+        let (shallower, _) = run_to_ceiling(&state, &ranked, &config, deepest.depth - 1);
+        assert_eq!(out, shallower, "the deepest completed rung decides");
+    }
+
+    /// Partial-rung rows (spec-ai-search-partial-rung-2026-10-20; judge focus 3
+    /// and S2 on 754e28a81). A cast and a pass on `starvation_state`, in the
+    /// root's cost-price order: the sibling priced highest (the pass, tactical
+    /// 20.0 here) is searched last, as Kindred Judgment was at 1010 T22 L2903.
+    /// Returns the beam and the measurement config at `max_nodes`, ceiling 2.
+    fn partial_rung_fixture(
+        max_nodes: u32,
+    ) -> (
+        GameState,
+        Vec<RankedCandidate>,
+        AiConfig,
+        GameAction,
+        GameAction,
+    ) {
+        let mut state = starvation_state();
+        crate::test_support::stock_libraries(&mut state, 20);
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.max_depth = 3; // ceiling 2
+        config.search.max_nodes = max_nodes;
+        let (pass, cast) = pass_and_first_cast(&state);
+        let ranked = vec![
+            RankedCandidate::new(cast.clone(), 0.0),
+            RankedCandidate::new(pass.clone(), 20.0),
+        ];
+        (state, ranked, config, cast.action, pass.action)
+    }
+
+    /// `run_iterative_deepening` on fresh services with `config` capped at
+    /// `ceiling` (`max_depth` = ceiling + 1); the scores and the rung witnesses.
+    fn run_to_ceiling(
+        state: &GameState,
+        ranked: &[RankedCandidate],
+        config: &AiConfig,
+        ceiling: u32,
+    ) -> (Vec<(GameAction, f64)>, Vec<crate::planner::RungStat>) {
+        let mut cfg = config.clone();
+        if ceiling == 0 {
+            cfg.search.planner_mode = PlannerMode::BeamOnly;
+        } else {
+            cfg.search.max_depth = ceiling + 1;
+        }
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &cfg, PolicyRegistry::shared());
+        let out = run_iterative_deepening(state, ranked.to_vec(), 0.1, &cfg, &mut services);
+        (out, services.rung_stats.clone())
+    }
+
+    // PR1, the 1010 T22 L2903 shape: at rung 2 the cast spends 3 of the 4
+    // nodes, so the pass's first node is cut off and it returns its quiesced
+    // static value (rung 0's), 5.71, against the cast searched to 6.43; with
+    // its tactical 20.0 x 0.1 the static pass outscores the cast and is picked.
+    // Rung 1 searched both: the pass to -3.02, the cast to 6.43. The rung that
+    // ran out does not count; the decision reads rung 1 and casts.
+    #[test]
+    fn partial_rung_last_sibling_scored_at_its_static_value_does_not_count() {
+        let (state, ranked, config, cast, pass) = partial_rung_fixture(4);
+
+        // Reach-guard: the cast alone leaves the pass at most one node at
+        // rung 2, and the pass's first searched node ticks before it is cut.
+        let (_, cast_alone) = run_to_ceiling(&state, &ranked[..1], &config, 2);
+        assert!(
+            cast_alone[2].nodes_used + 1 >= config.search.max_nodes,
+            "the cast alone spends {} of rung 2's {} nodes",
+            cast_alone[2].nodes_used,
+            config.search.max_nodes
+        );
+        let (rung0, _) = run_to_ceiling(&state, &ranked, &config, 0);
+        let (rung1, rung1_stats) = run_to_ceiling(&state, &ranked, &config, 1);
+        assert!(
+            rung1_stats.iter().all(|stat| stat.completed),
+            "rung 1 completes for both siblings: {rung1_stats:?}"
+        );
+        // Reach-guard: the pass's static value outscores the searched cast,
+        // and its searched value does not, so the truncation decides the pick.
+        assert!(score_of(&rung0, &pass) > score_of(&rung1, &cast));
+        assert!(score_of(&rung1, &pass) < score_of(&rung1, &cast));
+
+        let (out, stats) = run_to_ceiling(&state, &ranked, &config, 2);
+        assert_eq!(
+            out, rung1,
+            "the decision reads rung 1, the deepest rung every sibling completed"
+        );
+        assert_eq!(
+            pv_argmax(&out),
+            Some(&cast),
+            "the cast is picked, not the static pass"
+        );
+        assert!(
+            !stats[2].completed,
+            "rung 2 ran out of nodes before its last sibling and does not count: {stats:?}"
+        );
+    }
+
+    // PR2: the budget runs out inside the last sibling. At max_nodes 5 rung 2
+    // enters the pass with two nodes left; part of its subtree is cut off and
+    // it scores 5.35, neither its searched -3.02 nor its static 5.71, and with
+    // its tactical 20.0 x 0.1 outscores the cast. The rung does not count
+    // either (the judge's count on 754e28a81 treated this case as complete).
+    #[test]
+    fn partial_rung_budget_running_out_inside_the_last_sibling_does_not_count() {
+        let (state, ranked, config, cast, _pass) = partial_rung_fixture(5);
+        let (rung1, rung1_stats) = run_to_ceiling(&state, &ranked, &config, 1);
+        assert!(
+            rung1_stats
+                .iter()
+                .all(|stat| stat.completed && stat.nodes_used < stat.max_nodes),
+            "rung 1 completes inside its budget: {rung1_stats:?}"
+        );
+        let (out, stats) = run_to_ceiling(&state, &ranked, &config, 2);
+        assert!(
+            stats[2].nodes_used >= config.search.max_nodes,
+            "reach-guard: rung 2 spends its budget: {stats:?}"
+        );
+        assert_eq!(out, rung1, "the decision reads rung 1");
+        assert_eq!(pv_argmax(&out), Some(&cast));
+        assert!(!stats[2].completed, "rung 2 does not count: {stats:?}");
+    }
+
+    // PR3 guard: when every rung completes, the scores are the deepest rung's,
+    // each sibling's own full-depth search plus its tactical term, unchanged.
+    #[test]
+    fn partial_rung_guard_every_rung_complete_keeps_the_deepest_scores() {
+        let (state, ranked, config, _cast, _pass) = partial_rung_fixture(64);
+        let (out, stats) = run_to_ceiling(&state, &ranked, &config, 2);
+        assert_eq!(stats.len(), 3);
+        assert!(stats.iter().all(|stat| stat.completed), "{stats:?}");
+        assert!(stats.iter().all(|stat| stat.nodes_used < stat.max_nodes));
+        for r in &ranked {
+            let sim = apply_candidate(&state, &r.candidate).expect("the sibling applies");
+            let mut fresh =
+                PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+            let mut budget = SearchBudget::new(config.search.max_nodes);
+            let planner = BeamContinuationPlanner {
+                depth: 2,
+                rollout_depth: config.search.rollout_depth,
+            };
+            let control = planner.search_value(
+                &sim,
+                2,
+                0,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                &mut fresh,
+                &mut budget,
+            ) + r.score * 0.1;
+            assert!(
+                (score_of(&out, &r.candidate.action) - control).abs() < 1e-9,
+                "{:?}: {} against its own depth-2 search {control}",
+                r.candidate.action,
+                score_of(&out, &r.candidate.action)
+            );
+        }
     }
 
     // V6 hostile (pre-expired): an already-expired interactive deadline breaks at
@@ -14500,15 +14662,16 @@ mod tests {
         );
     }
 
-    // V4: the rung-0 rotate is skipped (the `iter_depth >= 1` gate), so rung 1
-    // provably sees today's ordering. Two ceiling-1 runs on fresh services: one on
-    // the natural beam, one on a beam pre-rotated to put rung-0's argmax first.
-    // With the gate present, run 1's rung-0 does NOT rotate, so its rung-1 order
-    // differs from the pre-rotated run under starvation => outputs differ. Removing
-    // the gate makes run 1 also rotate rung-0's argmax to the front, collapsing the
-    // two outputs to equality — so `assert_ne!` is revert-failing for the gate.
+    // V4 (re-pinned by spec-ai-search-partial-rung-2026-10-20): the rung-0
+    // rotate is skipped (the `iter_depth >= 1` gate), so rung 1 searches the
+    // beam in today's order. This row used to tell the two orders apart by a
+    // starved rung 1, whose second sibling collapsed to its quiesced value and
+    // made the scores order-dependent. A rung that runs out of nodes before its
+    // last sibling finishes no longer counts, so under starvation both orders
+    // discard rung 1 and return rung 0's scores: the order rung 1 searched in
+    // changes no score, and the gate is not observable through scores here.
     #[test]
-    fn rung_zero_rotate_is_gated_off() {
+    fn starved_rung_one_scores_do_not_depend_on_its_order() {
         let mut state = starvation_state();
         crate::test_support::stock_libraries(&mut state, 20);
         let policies = PolicyRegistry::shared();
@@ -14557,11 +14720,14 @@ mod tests {
             run_iterative_deepening(&state, pre, tw, &config, &mut s)
         };
 
-        assert_ne!(
+        let (rung0, _) = run_to_ceiling(&state, &ranked, &config, 0);
+        assert_eq!(
+            out_natural, rung0,
+            "the starved rung 1 does not count; rung 0 decides"
+        );
+        assert_eq!(
             out_natural, out_prerotated,
-            "with the rung-0 gate, rung 1 keeps today's order; the pre-rotated \
-             (un-gated) order diverges under starvation. Removing the gate makes \
-             these equal."
+            "with rung 1 discarded, its search order changes no score"
         );
     }
 
