@@ -805,3 +805,192 @@ fn gc7_unearth_reads_what_the_creature_does_on_entering() {
     let (with, without) = graveyard_pair(0, unearth(false));
     assert_gap("GC7 vanilla", leaf_gaps(true, &with, &without), 0.0);
 }
+
+// --- Pair 2: a flashback card in hand carries its graveyard cast -----------
+//
+// The first pair credited a graveyard cast only once the card was in the
+// graveyard; in hand the card was one card. A card whose graveyard credit
+// exceeds one card was then cheaper to pitch than to hold: in the 40 games at
+// dd79de333, 1010 T20 L2608 gave up Recursive Recruitment (27.145) over a
+// surplus Plains (26.653) at nine sources, and flashback cards discarded from
+// hand rose from 17 to 23 (`deck-builder/sims/fra-phase/
+// 2026-10-20-leaf-graveyard/NOTE.md`). The 96d0bfd2a B1 reading: kept, a
+// flashback card gives its hand cast and its graveyard cast; discarded, it
+// keeps the graveyard cast, so a discard loses the hand card alone. So a card
+// in hand carries the same credit, under the same reach test, beside its one
+// hand card. A consequence the rows pin: the leaf reads a flashback card in
+// hand above a plain card of the same hand value.
+
+fn recursive_recruitment_in(s: &mut GameScenario, player: PlayerId, zone: &str) -> ObjectId {
+    let cost = ManaCost::Cost {
+        shards: vec![ManaCostShard::Blue, ManaCostShard::Black],
+        generic: 3,
+    };
+    let mut builder = match zone {
+        "hand" => s.add_spell_to_hand_from_oracle(player, "Recursive Recruitment", false, ""),
+        _ => s.add_spell_to_graveyard(player, "Recursive Recruitment", false),
+    };
+    builder
+        .with_mana_cost(cost)
+        .from_oracle_text_with_keywords(&["Flashback"], RECURSIVE_RECRUITMENT)
+        .id()
+}
+
+/// HR1, the 1010 T20 L2608 shape: nine lands (four Islands, four Plains, a
+/// Swamp), Twinned Vision cast from the graveyard by flashback at upkeep, its
+/// "Discard a card" paid from a hand of Recursive Recruitment (its flashback
+/// {6}{U}{B} in reach) and a Plains past the land target. A land SHALL be
+/// given up.
+#[test]
+fn hr1_flashback_cost_gives_up_a_surplus_plains_before_recursive_recruitment() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::Upkeep);
+    stock_libraries(&mut s);
+    s.add_creature(P1, "Opposing Bear", 2, 2);
+    for _ in 0..4 {
+        s.add_basic_land(P0, ManaColor::Blue);
+        s.add_basic_land(P0, ManaColor::White);
+    }
+    s.add_basic_land(P0, ManaColor::Black);
+    let in_graveyard = twinned_vision_in_graveyard(&mut s, P0);
+    recursive_recruitment_in(&mut s, P0, "hand");
+    s.add_land_to_hand(P0, "Plains");
+    let prompt = flashback_cost(s, in_graveyard, Phase::Upkeep);
+
+    let session = Arc::new(planned_session());
+    let scores = named_scores(&prompt, &session);
+    eprintln!("HR1 cost scores {scores:?}");
+    let pick = chosen(&prompt, &session);
+    assert!(is_land(&pick), "discarded {pick}, scores {scores:?}");
+}
+
+/// HR2, the 1010 T22 L2922 shape: nine Islands, Twinned Vision cast from the
+/// graveyard by flashback, its discard paid from a hand of a second Twinned
+/// Vision and a surplus Plains. A land SHALL be given up.
+#[test]
+fn hr2_flashback_cost_gives_up_a_surplus_land_before_a_second_twinned_vision() {
+    let (mut s, _volume) = board(9);
+    let in_graveyard = twinned_vision_in_graveyard(&mut s, P0);
+    twinned_vision_in_hand(&mut s);
+    s.add_land_to_hand(P0, "Plains");
+    let prompt = flashback_cost(s, in_graveyard, Phase::Upkeep);
+
+    let session = Arc::new(planned_session());
+    let scores = named_scores(&prompt, &session);
+    eprintln!("HR2 cost scores {scores:?}");
+    let pick = chosen(&prompt, &session);
+    assert!(is_land(&pick), "discarded {pick}, scores {scores:?}");
+}
+
+/// HR3, guard: the hand credit lifts Twinned Vision above a plain card, not a
+/// surplus land above either. Volume's loot at nine lands, a hand of a plain
+/// cantrip ("Draw a card.", {1}{U} instant), Twinned Vision and an Island:
+/// the land SHALL be given up.
+#[test]
+fn hr3_guard_a_cantrip_and_twinned_vision_with_a_surplus_land_give_up_the_land() {
+    let (mut s, volume) = board(9);
+    s.add_spell_to_hand_from_oracle(P0, "Plain Cantrip", true, "Draw a card.")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 1,
+        });
+    twinned_vision_in_hand(&mut s);
+    s.add_land_to_hand(P0, "Island");
+    let prompt = volume_loot_cost(s, volume);
+
+    let session = Arc::new(planned_session());
+    let scores = named_scores(&prompt, &session);
+    eprintln!("HR3 cost scores {scores:?}");
+    let pick = chosen(&prompt, &session);
+    assert!(is_land(&pick), "discarded {pick}, scores {scores:?}");
+}
+
+/// HC1: Twinned Vision in hand at nine Islands reads its flashback's card
+/// beside its hand card: one card above a plain sorcery in hand, at both
+/// leaves. HC2, guard: at one Island and no land in hand the flashback is out
+/// of reach and the two read the same.
+#[test]
+fn hc1_hc2_a_flashback_card_in_hand_carries_its_graveyard_cast_in_reach() {
+    for (lands, cards) in [(9, 1.0), (1, 0.0)] {
+        let with = {
+            let mut s = table(lands, 2);
+            twinned_vision_in_hand(&mut s);
+            plain_sorcery_in_hand(&mut s, P0);
+            late(s)
+        };
+        let without = {
+            let mut s = table(lands, 2);
+            plain_sorcery_in_hand(&mut s, P0);
+            plain_sorcery_in_hand(&mut s, P0);
+            late(s)
+        };
+        assert_gap(
+            &format!("HC1/HC2 at {lands} lands"),
+            leaf_gaps(true, &with, &without),
+            cards,
+        );
+    }
+}
+
+/// HC3: discarding a flashback card loses its hand card alone. Recursive
+/// Recruitment in hand (with a Swamp among nine lands, its flashback in
+/// reach) reads the same as the same card in the graveyard beside a plain
+/// card of its mana cost in hand: holding it keeps both its casts, pitching
+/// it keeps the graveyard cast and loses one hand card.
+#[test]
+fn hc3_discarding_a_flashback_card_loses_only_its_hand_card() {
+    let build = |zone: &str| {
+        let mut s = table(8, 2);
+        s.add_basic_land(P0, ManaColor::Black);
+        recursive_recruitment_in(&mut s, P0, zone);
+        if zone == "hand" {
+            // The same graveyard size in both states (graveyard_base).
+            plain_sorcery_in_graveyard(&mut s, P0);
+        } else {
+            s.add_spell_to_hand(P0, "Plain Sorcery", false)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue, ManaCostShard::Black],
+                    generic: 3,
+                });
+        }
+        late(s)
+    };
+    assert_gap(
+        "HC3",
+        leaf_gaps(true, &build("hand"), &build("graveyard")),
+        0.0,
+    );
+}
+
+/// HC4: the opponent's hand is read for a card P0 knows (CR 701.20a, a
+/// revealed card), not for one it does not: Twinned Vision revealed in P1's
+/// hand at nine of P1's Islands is one card less for P0 than a revealed
+/// plain sorcery; unrevealed, the same.
+#[test]
+fn hc4_the_opponents_known_hand_card_is_credited_and_an_unknown_one_is_not() {
+    for (revealed, cards) in [(true, -1.0), (false, 0.0)] {
+        let build = |flashback: bool| {
+            let mut s = table(4, 9);
+            let id = if flashback {
+                s.add_spell_to_hand_from_oracle(P1, "Twinned Vision", true, "")
+                    .with_mana_cost(twinned_vision_cost())
+                    .from_oracle_text_with_keywords(&["Flashback"], TWINNED_VISION)
+                    .id()
+            } else {
+                s.add_spell_to_hand(P1, "Plain Sorcery", false)
+                    .with_mana_cost(twinned_vision_cost())
+                    .id()
+            };
+            let mut state = late(s);
+            if revealed {
+                state.public_revealed_cards.insert(id);
+            }
+            state
+        };
+        assert_gap(
+            &format!("HC4 revealed {revealed}"),
+            leaf_gaps(true, &build(true), &build(false)),
+            cards,
+        );
+    }
+}
