@@ -1259,11 +1259,16 @@ pub(crate) fn permanent_card_credit(state: &GameState, obj: &GameObject) -> f64 
     1.0 + payoff / draw_unit(state, obj.controller)
 }
 
-/// What a card in a graveyard can still do from there, in cards: the scale
+/// What a card can still do from its owner's graveyard, in cards: the scale
 /// of the hand-size weight that values a card in hand
 /// (`eval::EvalFeatures::graveyard_casts`), so the line that keeps a flashback
 /// card's graveyard cast and the line that spends it are read on the same
-/// cards.
+/// cards. Read for a card in the graveyard, and for a card in hand, which
+/// carries the same credit beside its one hand card: kept, a flashback card
+/// gives its hand cast and then its graveyard cast (CR 702.34a); discarded,
+/// it keeps the graveyard cast, so a discard loses the hand card alone (the
+/// `fork-checks/96d0bfd2a/JUDGE.md` B1 reading). The leaf therefore reads a
+/// flashback card in hand above a plain card of the same hand value.
 ///
 /// - CR 702.34a + CR 702.138a: a card with flashback or escape can be cast
 ///   from its owner's graveyard. An instant or sorcery is what its spell
@@ -1282,10 +1287,14 @@ pub(crate) fn permanent_card_credit(state: &GameState, obj: &GameObject) -> f64 
 /// owner's sources (`mana_colors::cost_within_land_drops`, CR 305.2), the
 /// reading an activated ability's reach takes, and as many other cards in
 /// that graveyard as its cost exiles (escape's "Exile N other cards", CR
-/// 702.138a). Any other card in a graveyard, and a token or a copy (CR
-/// 111.1 + CR 707.10: not a card), is 0.
+/// 702.138a). Any card in another zone or without such a keyword, and a
+/// token or a copy (CR 111.1 + CR 707.10: not a card), is 0.
 pub(crate) fn graveyard_cast_credit(state: &GameState, obj: &GameObject) -> f64 {
-    if obj.zone != Zone::Graveyard || obj.is_token || obj.is_copy || being_cast(state, obj.id) {
+    if !matches!(obj.zone, Zone::Graveyard | Zone::Hand)
+        || obj.is_token
+        || obj.is_copy
+        || being_cast(state, obj.id)
+    {
         return 0.0;
     }
     let Some(cast) = GraveyardCast::of(state, obj) else {
@@ -1296,7 +1305,12 @@ pub(crate) fn graveyard_cast_credit(state: &GameState, obj: &GameObject) -> f64 
         .mana
         .as_ref()
         .is_none_or(|mana| cost_within_land_drops(state, caster, mana, ABILITY_REACH_LAND_DROPS));
-    let others_in_graveyard = state.graveyard_of(caster).len().saturating_sub(1);
+    let in_graveyard = state.graveyard_of(caster).len();
+    let others_in_graveyard = if obj.zone == Zone::Graveyard {
+        in_graveyard.saturating_sub(1)
+    } else {
+        in_graveyard
+    };
     if !mana_in_reach || others_in_graveyard < cast.graveyard_exiles {
         return 0.0;
     }
