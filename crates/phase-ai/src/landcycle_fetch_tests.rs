@@ -361,3 +361,225 @@ fn lf6_guard_no_demand_keeps_the_first_listed_basic_whatever_its_colour() {
     );
     assert_eq!(fetched(&st), "Forest");
 }
+
+// ---- Judge rows on 497a162b8 (JUDGE.md, fork-checks/497a162b8) ----
+//
+// Rulings: JR1 (S1, a land in hand is colour supply for the search) and JR2
+// (B1, a hand card beyond the one-drop window still asks for its colour, at
+// the cards-left-to-draw weight) are red rows; JR3 to JR5 are guards.
+
+const ANY_LAND_AMULET: &str = "{1}, Sacrifice this artifact: Search your library for a land card, reveal it, put it into your hand, then shuffle.";
+const VALE: &str =
+    "This land enters tapped unless you control two or more other lands.\n{T}: Add {R} or {G}.";
+
+fn jr_hand_creature(s: &mut GameScenario, name: &str, shards: Vec<ManaCostShard>, generic: u32) {
+    s.add_creature_to_hand(P0, name, 3, 3)
+        .with_mana_cost(cost(shards, generic));
+}
+
+/// Build a prompt from an explicit board, a library builder returning the ids
+/// to mark basic, and a hand/source setup.
+fn jr_prompt(
+    board: &[ManaColor],
+    lib: impl FnOnce(&mut GameScenario) -> Vec<ObjectId>,
+    setup: impl FnOnce(&mut GameScenario) -> ObjectId,
+    pool: Option<Vec<DeckEntry>>,
+) -> GameState {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    for c in board {
+        s.add_basic_land(P0, *c);
+    }
+    for _ in 0..10 {
+        s.add_land_to_library_top(P1, "Plains");
+    }
+    let basics = lib(&mut s);
+    let source = setup(&mut s);
+    let mut st = s.build().state().clone();
+    st.phase = Phase::PreCombatMain;
+    make_basic(&mut st, &basics);
+    if let Some(entries) = pool {
+        set_deck_pool(&mut st, entries);
+    }
+    to_search(st, source)
+}
+
+fn jr_basics(s: &mut GameScenario, names: &[&str]) -> Vec<ObjectId> {
+    names
+        .iter()
+        .map(|n| s.add_land_to_library_top(P0, n).with_subtypes(vec![n]).id())
+        .collect()
+}
+
+/// JR1 (focus 4): a Forest already in hand meets the {G} of a castable green
+/// card next turn; the {U} card has no source anywhere. A basic-land search
+/// with Forest listed first should take the Island.
+#[test]
+fn jr1_forest_in_hand_search_takes_the_missing_island() {
+    let st = jr_prompt(
+        &[ManaColor::Black, ManaColor::Black, ManaColor::Black],
+        |s| jr_basics(s, &["Forest", "Island", "Swamp"]),
+        |s| {
+            s.add_land_to_hand(P0, "Forest")
+                .with_subtypes(vec!["Forest"]);
+            jr_hand_creature(s, "Green Bear", vec![ManaCostShard::Green], 3);
+            jr_hand_creature(s, "Blue Bear", vec![ManaCostShard::Blue], 3);
+            add_amulet(s)
+        },
+        None,
+    );
+    assert_eq!(fetched(&st), "Island");
+}
+
+/// JR2 (focus 3, spec Done-when 1's GIVEN): no green source in play, a green
+/// card in hand (Mind Meanderer, MV 6 at three lands, so outside one land
+/// drop), and no green card left to draw (deck list: its only green card is
+/// the one in hand). Island listed first. The Forest should be fetched.
+#[test]
+fn jr2_green_card_in_hand_beyond_one_drop_still_asks_for_the_forest() {
+    let pool = vec![
+        entry(
+            "Mind Meanderer",
+            cost(
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Blue,
+                ],
+                3,
+            ),
+            CoreType::Creature,
+            1,
+        ),
+        entry(
+            "Extended Absence",
+            cost(vec![ManaCostShard::Black], 3),
+            CoreType::Instant,
+            3,
+        ),
+        entry(
+            "Vinelasher Adept",
+            cost(vec![ManaCostShard::Green, ManaCostShard::Green], 4),
+            CoreType::Creature,
+            1,
+        ),
+        entry("Island", ManaCost::NoCost, CoreType::Land, 7),
+        entry("Swamp", ManaCost::NoCost, CoreType::Land, 7),
+        entry("Forest", ManaCost::NoCost, CoreType::Land, 2),
+    ];
+    let st = jr_prompt(
+        &[ManaColor::Blue, ManaColor::Black, ManaColor::Black],
+        |s| jr_basics(s, &["Island", "Forest", "Swamp"]),
+        |s| {
+            jr_hand_creature(
+                s,
+                "Mind Meanderer",
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Blue,
+                ],
+                3,
+            );
+            add_vinelasher(s)
+        },
+        Some(pool),
+    );
+    assert_eq!(fetched(&st), "Forest");
+}
+
+/// JR3 (focus 5): "search for a land card" with Island, Forest and a typed
+/// nonbasic Forest Island dual offered (dual listed last); hand needs {G} and
+/// {U}, three Swamps in play. The dual covers both and should be fetched.
+#[test]
+fn jr3_any_land_search_takes_the_dual_for_two_missing_colours() {
+    let st = jr_prompt(
+        &[ManaColor::Black, ManaColor::Black, ManaColor::Black],
+        |s| {
+            let mut ids = jr_basics(s, &["Island", "Forest"]);
+            s.add_land_to_library_top(P0, "Watery Grove")
+                .with_subtypes(vec!["Forest", "Island"]);
+            ids.push(
+                s.add_land_to_library_top(P0, "Swamp")
+                    .with_subtypes(vec!["Swamp"])
+                    .id(),
+            );
+            ids
+        },
+        |s| {
+            jr_hand_creature(s, "Green Bear", vec![ManaCostShard::Green], 3);
+            jr_hand_creature(s, "Blue Bear", vec![ManaCostShard::Blue], 3);
+            s.add_artifact_from_oracle(P0, "Land Amulet", ANY_LAND_AMULET)
+                .with_mana_cost(cost(Vec::new(), 1))
+                .id()
+        },
+        None,
+    );
+    assert_eq!(fetched(&st), "Watery Grove");
+}
+
+/// JR4 (focus 5): "search for a land card" offering Island first, then
+/// Rockfall Vale (nonbasic, {T}: Add {R} or {G}, colours from its ability),
+/// Forest. Hand needs {G}; three Swamps. Anything but the Island.
+#[test]
+fn jr4_any_land_search_prices_rockfall_vale_by_its_ability_colours() {
+    let st = jr_prompt(
+        &[ManaColor::Black, ManaColor::Black, ManaColor::Black],
+        |s| {
+            let mut ids = jr_basics(s, &["Island"]);
+            s.add_land_to_library_top(P0, "Rockfall Vale")
+                .from_oracle_text(VALE);
+            ids.extend(jr_basics(s, &["Forest"]));
+            ids
+        },
+        |s| {
+            jr_hand_creature(s, "Green Bear", vec![ManaCostShard::Green], 3);
+            s.add_artifact_from_oracle(P0, "Land Amulet", ANY_LAND_AMULET)
+                .with_mana_cost(cost(Vec::new(), 1))
+                .id()
+        },
+        None,
+    );
+    let pick = fetched(&st);
+    assert!(pick == "Rockfall Vale" || pick == "Forest", "got {pick}");
+}
+
+/// JR5 (focus 3): a land the hand needs now against a land two off-colour
+/// library cards need. Hand needs {G} (castable next drop); the deck list's
+/// cards left to draw need {W} and {R}, neither in play. Offered (any land):
+/// a typed Mountain Plains dual first, then Forest. The Forest (0.12) should
+/// outrank the dual (2 x 0.04).
+#[test]
+fn jr5_hand_need_now_outranks_two_library_colours() {
+    let pool = vec![
+        entry(
+            "White Card",
+            cost(vec![ManaCostShard::White], 2),
+            CoreType::Creature,
+            2,
+        ),
+        entry(
+            "Red Card",
+            cost(vec![ManaCostShard::Red], 2),
+            CoreType::Creature,
+            2,
+        ),
+        entry("Swamp", ManaCost::NoCost, CoreType::Land, 7),
+    ];
+    let st = jr_prompt(
+        &[ManaColor::Black, ManaColor::Black, ManaColor::Black],
+        |s| {
+            s.add_land_to_library_top(P0, "Sunlit Ridge")
+                .with_subtypes(vec!["Mountain", "Plains"]);
+            jr_basics(s, &["Forest"])
+        },
+        |s| {
+            jr_hand_creature(s, "Green Bear", vec![ManaCostShard::Green], 3);
+            s.add_artifact_from_oracle(P0, "Land Amulet", ANY_LAND_AMULET)
+                .with_mana_cost(cost(Vec::new(), 1))
+                .id()
+        },
+        Some(pool),
+    );
+    assert_eq!(fetched(&st), "Forest");
+}
