@@ -60,8 +60,8 @@ pub fn land_produced_color_types(
 /// candidate with the colours it covers, `card_value::keep_tier` uses the
 /// same count to pick which land in hand is the next land drop, so the land
 /// the keep order protects is the land the AI would play, and
-/// `policies::tutor` prices a land a library search would fetch by it
-/// (with [`UnmetColors::for_cards_left_to_draw`] behind it).
+/// `policies::tutor` prices a land a library search would fetch by the
+/// search's own reading of it ([`SearchColorGap`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UnmetColors {
     supply: ColorDemand,
@@ -77,20 +77,6 @@ impl UnmetColors {
         }
     }
 
-    /// The same gap measured against the cards `player` has left to draw
-    /// instead of the hand: per colour, the most sources one nonland card left
-    /// in their library needs ([`remaining_deck_color_demand`]) against how
-    /// many of their lands produce it. The library side of a colour plan, for
-    /// a reader that puts a land into the hand for the turns ahead (a library
-    /// search) rather than playing one this turn.
-    pub(crate) fn for_cards_left_to_draw(state: &GameState, player: PlayerId) -> Self {
-        let (supply, _) = land_color_supply(state, player);
-        Self {
-            supply,
-            demand: remaining_deck_color_demand(state, player),
-        }
-    }
-
     /// How many of the colours in `produced` the hand demands and the
     /// battlefield cannot yet produce. Uncapped; a caller caps it if it needs to.
     pub(crate) fn covered(&self, produced: &[ManaType]) -> usize {
@@ -99,6 +85,66 @@ impl UnmetColors {
             .copied()
             .filter_map(mana_type_to_demand_index)
             .filter(|&index| self.demand[index] > self.supply[index])
+            .count()
+    }
+}
+
+/// The colour gaps a library search answers for `player`. A search puts a
+/// land into the hand for the turns ahead, so it reads the gap differently
+/// from a land drop:
+///
+/// - supply is every land `player` controls plus every land in their hand
+///   (a land already in hand meets its colours for the turns a fetched land
+///   would serve); `policies::land_sequencing` keeps reading lands in play
+///   only, since it chooses among the lands in hand;
+/// - `now` is the demand of hand cards within one land drop of castable
+///   ([`hand_color_demand`]);
+/// - `later` is the demand of hand cards beyond that window and of the cards
+///   left to draw ([`remaining_deck_color_demand`]), element-wise MAX, so a
+///   colour the hand needs on a later turn is never ignored.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SearchColorGap {
+    pub(crate) now: UnmetColors,
+    pub(crate) later: UnmetColors,
+}
+
+impl SearchColorGap {
+    pub(crate) fn for_player(state: &GameState, player: PlayerId) -> Self {
+        let (mut supply, land_count) = land_color_supply(state, player);
+        for (slot, in_hand) in supply.iter_mut().zip(hand_land_color_supply(state, player)) {
+            *slot += in_hand;
+        }
+        let mut later = remaining_deck_color_demand(state, player);
+        let beyond =
+            hand_color_demand_where(state, player, |mana_value| mana_value > land_count + 1);
+        for (slot, needed) in later.iter_mut().zip(beyond) {
+            *slot = (*slot).max(needed);
+        }
+        Self {
+            now: UnmetColors {
+                supply,
+                demand: hand_color_demand(state, player, land_count),
+            },
+            later: UnmetColors {
+                supply,
+                demand: later,
+            },
+        }
+    }
+
+    /// How many of the colours in `produced` some card in hand or left to
+    /// draw needs and no land in play or in hand makes at all. Such a colour
+    /// blocks every card that needs it, where a colour with fewer sources
+    /// than pips blocks only the heavier cards.
+    pub(crate) fn unsourced(&self, produced: &[ManaType]) -> usize {
+        produced
+            .iter()
+            .copied()
+            .filter_map(mana_type_to_demand_index)
+            .filter(|&index| {
+                self.now.supply[index] == 0
+                    && (self.now.demand[index] > 0 || self.later.demand[index] > 0)
+            })
             .count()
     }
 }
@@ -277,6 +323,26 @@ fn land_color_supply(state: &GameState, player: PlayerId) -> (ColorDemand, u32) 
     (supply, lands)
 }
 
+/// How many of the lands in `player`'s hand produce each colour, read as
+/// [`land_color_supply`] reads the battlefield.
+fn hand_land_color_supply(state: &GameState, player: PlayerId) -> ColorDemand {
+    let mut supply = [0u32; 5];
+    let Some(hand) = state.players.get(player.0 as usize).map(|p| &p.hand) else {
+        return supply;
+    };
+    for obj in hand.iter().filter_map(|id| state.objects.get(id)) {
+        if !obj.card_types.core_types.contains(&CoreType::Land) {
+            continue;
+        }
+        for color in land_produced_color_types(&obj.card_types.subtypes, &obj.abilities) {
+            if let Some(index) = mana_type_to_demand_index(color) {
+                supply[index] += 1;
+            }
+        }
+    }
+    supply
+}
+
 /// CR 107.4b: element-wise MAX colored-pip demand over the nonland cards in
 /// `player`'s hand that are within one land drop of being castable.
 ///
@@ -287,13 +353,22 @@ fn land_color_supply(state: &GameState, player: PlayerId) -> (ColorDemand, u32) 
 /// value against lands controlled plus this turn's drop) — deliberately never an
 /// affordability sweep, which is far too expensive per candidate.
 fn hand_color_demand(state: &GameState, player: PlayerId, land_count: u32) -> ColorDemand {
+    hand_color_demand_where(state, player, |mana_value| mana_value <= land_count + 1)
+}
+
+/// Element-wise MAX colored-pip demand over the nonland cards in `player`'s
+/// hand whose mana value `keep` accepts.
+fn hand_color_demand_where(
+    state: &GameState,
+    player: PlayerId,
+    keep: impl Fn(u32) -> bool,
+) -> ColorDemand {
     let mut demand = [0u32; 5];
     let Some(hand) = state.players.get(player.0 as usize).map(|p| &p.hand) else {
         return demand;
     };
     for obj in hand.iter().filter_map(|id| state.objects.get(id)) {
-        if obj.card_types.core_types.contains(&CoreType::Land)
-            || obj.mana_cost.mana_value() > land_count + 1
+        if obj.card_types.core_types.contains(&CoreType::Land) || !keep(obj.mana_cost.mana_value())
         {
             continue;
         }
