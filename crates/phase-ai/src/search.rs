@@ -6302,7 +6302,28 @@ mod tests {
             }),
             "the same session redeems the reducer-certified Island choice"
         );
+        // The pick came from the armed plan, not the ordinary ordering: the
+        // prompt certificate is spent and its cast follow-up armed.
+        assert!(
+            !session
+                .prospective_fetch_prompt
+                .read()
+                .unwrap()
+                .contains_key(&P0)
+                && session
+                    .prospective_fetch_follow_up
+                    .read()
+                    .unwrap()
+                    .contains_key(&P0),
+            "the armed prompt is redeemed and its follow-up armed"
+        );
 
+        // A new session has no armed fetch plan and uses ordinary tutor
+        // ordering. That ordering prices a land by the colours the hand needs
+        // and the lands in play do not make (`policies::tutor`,
+        // spec-ai-landcycle-fetch-by-colour-2026-10-22): Phantom Monster's {U}
+        // is unmet beside three Mountains, so it too takes the Island over the
+        // first-listed Forest.
         let fresh_session = AiSession::arc_from_game(runner.state());
         let fresh_pick = choose_action_with_session(
             runner.state(),
@@ -6314,14 +6335,27 @@ mod tests {
         assert_eq!(
             fresh_pick,
             Some(GameAction::SelectCards {
-                cards: vec![forest]
+                cards: vec![island]
             }),
-            "a new session has no armed fetch plan and uses ordinary tutor ordering"
+            "a new session's ordinary tutor ordering takes the basic whose colour is unmet"
+        );
+        assert!(
+            fresh_session
+                .prospective_fetch_follow_up
+                .read()
+                .unwrap()
+                .is_empty(),
+            "the ordinary ordering arms no follow-up"
         );
 
         runner
             .act(fetch_pick.expect("Island selection"))
             .expect("selection applies");
+        assert_eq!(
+            runner.state().objects[&forest].zone,
+            Zone::Library,
+            "the first-listed Forest stays in the library"
+        );
         let cast = choose_action_with_session(runner.state(), P0, &config, &mut rng, &session)
             .expect("Island unlocks Phantom Monster cast");
         assert!(matches!(cast, GameAction::CastSpell { object_id, .. } if object_id == phantom));

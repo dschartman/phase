@@ -56,10 +56,12 @@ pub fn land_produced_color_types(
 /// lands: per colour, how many sources one castable hand card needs
 /// ([`hand_color_demand`]) against how many of their lands produce it.
 ///
-/// One measure, two readers: `policies::land_sequencing` credits a `PlayLand`
-/// candidate with the colours it covers, and `card_value::keep_tier` uses the
+/// One measure, three readers: `policies::land_sequencing` credits a `PlayLand`
+/// candidate with the colours it covers, `card_value::keep_tier` uses the
 /// same count to pick which land in hand is the next land drop, so the land
-/// the keep order protects is the land the AI would play.
+/// the keep order protects is the land the AI would play, and
+/// `policies::tutor` prices a land a library search would fetch by it
+/// (with [`UnmetColors::for_cards_left_to_draw`] behind it).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UnmetColors {
     supply: ColorDemand,
@@ -72,6 +74,20 @@ impl UnmetColors {
         Self {
             supply,
             demand: hand_color_demand(state, player, land_count),
+        }
+    }
+
+    /// The same gap measured against the cards `player` has left to draw
+    /// instead of the hand: per colour, the most sources one nonland card left
+    /// in their library needs ([`remaining_deck_color_demand`]) against how
+    /// many of their lands produce it. The library side of a colour plan, for
+    /// a reader that puts a land into the hand for the turns ahead (a library
+    /// search) rather than playing one this turn.
+    pub(crate) fn for_cards_left_to_draw(state: &GameState, player: PlayerId) -> Self {
+        let (supply, _) = land_color_supply(state, player);
+        Self {
+            supply,
+            demand: remaining_deck_color_demand(state, player),
         }
     }
 
@@ -284,6 +300,32 @@ fn hand_color_demand(state: &GameState, player: PlayerId, land_count: u32) -> Co
         for (slot, needed) in demand
             .iter_mut()
             .zip(outer_cost_color_demand(&obj.mana_cost))
+        {
+            *slot = (*slot).max(needed);
+        }
+    }
+    demand
+}
+
+/// CR 107.4a + CR 107.4b: element-wise MAX colored-pip demand (a colored
+/// symbol asks for its color, a generic one for none) over the nonland cards
+/// `player` has left to draw, read from their deck list less every card
+/// already seen (`deck_knowledge::remaining_deck_view`, the same view the
+/// tutor's follow-up uses), never from the hidden library order.
+///
+/// MAX, as in [`hand_color_demand`]: how many sources of a colour one card
+/// needs. No castability window: a card still in the library is a plan for
+/// later turns, so its colours count whatever its mana value. Empty without a
+/// registered deck list.
+fn remaining_deck_color_demand(state: &GameState, player: PlayerId) -> ColorDemand {
+    let mut demand = [0u32; 5];
+    for entry in crate::deck_knowledge::remaining_deck_view(state, player).entries {
+        if entry.card.card_type.core_types.contains(&CoreType::Land) {
+            continue;
+        }
+        for (slot, needed) in demand
+            .iter_mut()
+            .zip(outer_cost_color_demand(&entry.card.mana_cost))
         {
             *slot = (*slot).max(needed);
         }

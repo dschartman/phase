@@ -11,6 +11,7 @@ use engine::types::player::PlayerId;
 use crate::deck_knowledge::remaining_deck_view;
 use crate::eval::StrategicIntent;
 use crate::features::DeckFeatures;
+use crate::mana_colors::{land_produced_color_types, UnmetColors};
 
 use super::activation::turn_only;
 use super::context::PolicyContext;
@@ -100,6 +101,13 @@ pub(crate) fn score_search_choice_selection(
     let intent = crate::eval::strategic_intent(state, ai_player);
     let mana_constrained = materially_mana_constrained_state(state, ai_player);
     let combo_targets = combo_missing_piece_names(state, ai_player);
+    // Read only for a selection holding a land: the gap walks the battlefield,
+    // the hand and the deck list.
+    let colour_gap = chosen
+        .iter()
+        .filter_map(|object_id| state.objects.get(object_id))
+        .any(|object| object.card_types.core_types.contains(&CoreType::Land))
+        .then(|| LandColourGap::for_player(state, ai_player));
 
     let mut scored: Vec<(&str, f64)> = chosen
         .iter()
@@ -108,6 +116,9 @@ pub(crate) fn score_search_choice_selection(
             let mut score = tutor_object_score(object, available_mana, intent, mana_constrained);
             if combo_targets.contains(&object.name.as_str()) {
                 score += COMBO_PIECE_TUTOR_BONUS;
+            }
+            if let Some(gap) = &colour_gap {
+                score += gap.value(object);
             }
             (object.name.as_str(), score)
         })
@@ -136,6 +147,49 @@ pub(crate) fn score_search_choice_selection(
         .enumerate()
         .map(|(rank, score)| score * 0.88_f64.powi(rank as i32))
         .sum()
+}
+
+/// Value of one colour a searched-for land produces that a card in hand within
+/// a land drop of castable needs and no land in play makes
+/// ([`UnmetColors::for_player`]). Sized to separate lands, not to outrank
+/// spells: a basic scores 0.26 before it (0.52 when mana-constrained), so one
+/// covered colour leaves it below a castable 2/2 (0.59).
+const HAND_UNMET_COLOUR_TUTOR_VALUE: f64 = 0.12;
+
+/// Value of one colour a searched-for land produces that a nonland card left
+/// to draw needs and no land in play makes
+/// ([`UnmetColors::for_cards_left_to_draw`]). A third of the hand's: the card
+/// is a later turn's, and it breaks ties among lands the hand cannot.
+const LIBRARY_UNMET_COLOUR_TUTOR_VALUE: f64 = 0.04;
+
+/// CR 701.23a + CR 305.6: the colour plan a land fetched by a library search
+/// answers. The colours the hand needs and the lands in play do not make, and
+/// the same for the cards left to draw, from the shared `mana_colors` measure,
+/// so a basic-land search takes the basic whose colour is missing instead of
+/// the first one the engine lists. With no unmet colour every land scores as
+/// before, and the enumerator's order stands.
+struct LandColourGap {
+    hand: UnmetColors,
+    cards_left_to_draw: UnmetColors,
+}
+
+impl LandColourGap {
+    fn for_player(state: &GameState, player: PlayerId) -> Self {
+        Self {
+            hand: UnmetColors::for_player(state, player),
+            cards_left_to_draw: UnmetColors::for_cards_left_to_draw(state, player),
+        }
+    }
+
+    /// Zero for a nonland card and for a land whose colours are all met.
+    fn value(&self, object: &GameObject) -> f64 {
+        if !object.card_types.core_types.contains(&CoreType::Land) {
+            return 0.0;
+        }
+        let produced = land_produced_color_types(&object.card_types.subtypes, &object.abilities);
+        self.hand.covered(&produced) as f64 * HAND_UNMET_COLOUR_TUTOR_VALUE
+            + self.cards_left_to_draw.covered(&produced) as f64 * LIBRARY_UNMET_COLOUR_TUTOR_VALUE
+    }
 }
 
 /// Score bump applied to a tutor target that closes a near-reachable combo
